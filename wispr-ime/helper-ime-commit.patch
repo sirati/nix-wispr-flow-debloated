@@ -1,0 +1,87 @@
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 6afffad..fc739ca 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -13,6 +13,7 @@ pub mod kwin;
+ pub mod stub;
+ pub mod uinput;
+ pub mod wayland;
++pub mod wispr_ime;
+ pub mod wl_clipboard;
+ pub mod x11;
+ 
+diff --git a/src/backend/wayland.rs b/src/backend/wayland.rs
+index 5abf4ad..538e7cf 100644
+--- a/src/backend/wayland.rs
++++ b/src/backend/wayland.rs
+@@ -99,6 +99,11 @@ impl WaylandBackend {
+ 
+ impl Backend for WaylandBackend {
+     fn paste_text(&mut self, text: &str, html: Option<&str>) -> Result<()> {
++        // Typing through the session's input method keeps the clipboard intact
++        // and needs no helper window; fall back to pasting if it cannot.
++        if super::wispr_ime::commit(text) {
++            return Ok(());
++        }
+         // Offer text/plain (+ text/html when supplied), like the Windows helper's
+         // dual-format clipboard, then synthesize Ctrl+V.
+         self.clipboard_set_rich(text, html)?;
+diff --git a/src/backend/wispr_ime.rs b/src/backend/wispr_ime.rs
+new file mode 100644
+index 0000000..da94218
+--- /dev/null
++++ b/src/backend/wispr_ime.rs
+@@ -0,0 +1,53 @@
++//! Commit dictated text through `wispr-ime`, an input method for the session.
++//!
++//! `wispr-ime` (org.wisprime.WisprIme on the session bus) puts text into the
++//! focused field the way typed text arrives, so the clipboard is left alone
++//! and no helper window takes focus. It answers `false` when no field it
++//! serves has focus; the caller then pastes as before. Set
++//! `WISPR_IME_COMMIT=0` to skip it.
++
++use std::sync::mpsc;
++use std::time::Duration;
++
++const BUS_NAME: &str = "org.wisprime.WisprIme";
++const PATH: &str = "/org/wisprime/WisprIme";
++const INTERFACE: &str = "org.wisprime.WisprIme1";
++/// Longer than a healthy call; short enough that a hung service does not
++/// stall dictation.
++const TIMEOUT: Duration = Duration::from_millis(1500);
++
++fn call(text: &str) -> zbus::Result<bool> {
++    let conn = zbus::blocking::Connection::session()?;
++    let reply = conn.call_method(Some(BUS_NAME), PATH, Some(INTERFACE), "Commit", &(text,))?;
++    Ok(reply.body().deserialize::<bool>()?)
++}
++
++/// True if `text` was committed and nothing more needs to be done.
++pub fn commit(text: &str) -> bool {
++    if std::env::var_os("WISPR_IME_COMMIT").is_some_and(|v| v == "0") || text.is_empty() {
++        return false;
++    }
++    let text = text.to_owned();
++    let (tx, rx) = mpsc::channel();
++    std::thread::spawn(move || {
++        let _ = tx.send(call(&text));
++    });
++    match rx.recv_timeout(TIMEOUT) {
++        Ok(Ok(true)) => {
++            log::info!("PasteText: committed through wispr-ime");
++            true
++        }
++        Ok(Ok(false)) => {
++            log::info!("PasteText: wispr-ime has no focused field; pasting");
++            false
++        }
++        Ok(Err(e)) => {
++            log::debug!("PasteText: wispr-ime unavailable ({e}); pasting");
++            false
++        }
++        Err(_) => {
++            log::warn!("PasteText: wispr-ime timed out; pasting");
++            false
++        }
++    }
++}

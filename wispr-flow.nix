@@ -76,12 +76,17 @@ let
 
   patchDir = "${wispr-flow-linux}/scripts/patches";
 
-  base = (pkgs.callPackage "${wispr-flow-linux}/nix/wispr-flow.nix" { }).overrideAttrs (old: {
-    # Replaces the recipe's `src`, which would otherwise import a local .exe.
-    src = installer;
+  # With wispr-ime, the helper's PasteText commits text through the input
+  # method (see ./wispr-ime/helper-ime-commit.patch) and only pastes when no
+  # field can take it. Same source the port builds, so the patch has to match
+  # the pinned version; a new helper release fails here until the patch and
+  # hash are updated.
+  imeEnabled = config.programs.wisprIme.enable;
+  helperIme = pkgs.callPackage ./wispr-ime/helper.nix { inherit wispr-flow-linux; };
 
-    buildPhase =
-      replaceOnce ''if [[ -d "$resources_src/app.asar.unpacked" ]]; then'' ''
+  withLinuxPatches =
+    buildPhase:
+    replaceOnce ''if [[ -d "$resources_src/app.asar.unpacked" ]]; then'' ''
         # Everything upstream's recipe skips, in scripts/build-linux.sh order.
         # Each script fails by name.
         for p in helper-env linux-window-frame linux-hub-focusable \
@@ -115,7 +120,25 @@ let
         # The patch scripts leave <bundle>.orig copies; do not pack them.
         find asar-contents -type f -name '*.orig' -delete
 
-        if [[ -d "$resources_src/app.asar.unpacked" ]]; then'' old.buildPhase;
+        if [[ -d "$resources_src/app.asar.unpacked" ]]; then'' buildPhase;
+
+  # Upstream copies its helper to stage/Release and then makes it executable;
+  # put ours there instead (install replaces the read-only copy).
+  withImeHelper =
+    buildPhase:
+    replaceOnce "chmod 0755 stage/Release/wispr-flow-linux-helper" ''
+      install -m755 ${helperIme}/bin/wispr-flow-linux-helper stage/Release/wispr-flow-linux-helper
+      chmod 0755 stage/Release/wispr-flow-linux-helper'' buildPhase;
+
+  base = (pkgs.callPackage "${wispr-flow-linux}/nix/wispr-flow.nix" { }).overrideAttrs (old: {
+    # Replaces the recipe's `src`, which would otherwise import a local .exe.
+    src = installer;
+
+    buildPhase =
+      let
+        patched = withLinuxPatches old.buildPhase;
+      in
+      if imeEnabled then withImeHelper patched else patched;
 
     # After asar pack: the unpacked tree must hold the Linux addons too.
     postBuild = ''
