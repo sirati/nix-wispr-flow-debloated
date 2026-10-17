@@ -76,6 +76,13 @@ let
 
   patchDir = "${wispr-flow-linux}/scripts/patches";
 
+  headlessDaemon = pkgs.callPackage ./wispr-headless/daemon { };
+  headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
+    daemon = "${headlessDaemon}/bin/wispr-headless";
+    pwcat = "${pkgs.pipewire}/bin/pw-cat";
+    micTarget = cfg.headless.micTarget;
+  };
+
   # With wispr-ime, the helper's PasteText commits text through the input
   # method (see ./wispr-ime/helper-ime-commit.patch) and only pastes when no
   # field can take it. Same source the port builds, so the patch has to match
@@ -172,9 +179,28 @@ in
   options.programs.wisprFlow = {
     enable = lib.mkEnableOption "Wispr Flow dictation (unofficial Linux port)";
 
+    headless = {
+      enable = lib.mkEnableOption ''
+        running Wispr without its windows' renderers until their UI is needed:
+        wispr-headless records dictation and draws the speech indicator, and
+        the Electron shim (wispr-headless/shim.js) loads Wispr's own pages
+        only for settings, notifications and other UI''
+      ;
+      micTarget = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "alsa_input.usb-0b0e_Jabra_SPEAK_410_USB-00.mono-fallback";
+        description = ''
+          PipeWire node to record dictation from; empty for the default
+          input. Wispr's own microphone setting does not apply here.
+        '';
+      };
+    };
+
     shim = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
-      default = null;
+      default = if cfg.headless.enable then headlessShim else null;
+      defaultText = lib.literalMD "the headless shim when `headless.enable` is set";
       description = ''
         JavaScript file that runs in Electron's main process before the app's
         own code: package.json's main points at it, and it must load the
