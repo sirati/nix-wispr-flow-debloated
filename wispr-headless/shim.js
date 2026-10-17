@@ -88,7 +88,7 @@ const HUB_SOUNDS = {
   "media:playDictationStopSound": "stop",
   "media:playAchievementSound": "achievement",
 };
-const STATUS_DROP = new Set(["status:micActive", "status:monitorChanged", "notification:clear", "zubridge:dispatch-ack"]);
+const STATUS_DROP = new Set(["status:monitorChanged", "notification:clear", "zubridge:dispatch-ack"]);
 // Store changes that may make the status window show something.
 const STATUS_WAKE_KEYS = [/^remoteNotifications\.new/, /^remoteNotifications\.unreadCount/, /^subscription\.(tier|daysLeft|gracePeriodEndsAt)/, /[Ll]imit|[Qq]uota|[Nn]udge|[Rr]eminder/];
 
@@ -377,6 +377,10 @@ function build(electron) {
         }
         if (ch === "status:audioLevel") {
           daemon.send({ op: "level", value: typeof a === "number" ? a : Number(a?.level ?? a?.value ?? 0) });
+          return true;
+        }
+        if (ch === "status:micActive") {
+          daemon.send({ op: "mic", active: Boolean(a) });
           return true;
         }
         if (ch === "status:playPasteSound") {

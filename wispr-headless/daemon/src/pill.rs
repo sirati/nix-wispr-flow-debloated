@@ -1,15 +1,19 @@
 //! Wispr's flow bar, drawn without Chromium: the small resting bar at the
-//! bottom of the screen, level bars while recording, and pulsing dots while
-//! Wispr finishes. A click on the resting bar starts a dictation and a click
-//! while recording stops it, as on Wispr's own bar.
+//! bottom of the screen, Wispr's waveform while recording (see wave.rs), and
+//! pulsing dots while Wispr finishes. A click on the resting bar starts a
+//! dictation and a click while recording stops it, as on Wispr's own bar.
 //!
 //! It is an X11 window (XWayland on GNOME and KDE): GNOME keeps no native
 //! Wayland window above others, and an override-redirect X11 window is never
 //! managed, focused or listed. Its input region is the drawn bar only, so
 //! clicks next to it go through. A separate thread waits for X events, so a
 //! resting bar costs no wakeups. If there is no X display, the bar is off.
+//!
+//! Sizes are Wispr's CSS pixels, multiplied by the display scale (Xft.dpi /
+//! 96, so 2 on a 200 % screen). Measured from Wispr's own page at 200 %: the
+//! resting bar is 80x16 device pixels, a black fill at 50 % inside a 2 px
+//! #aaaaaa outline at 75 %.
 
-use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc as Shared;
 use std::time::{Duration, Instant};
@@ -18,25 +22,23 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    Arc, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CreateGCAux,
+    Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CreateGCAux,
     CreateWindowAux, EventMask, Rectangle, Window, WindowClass,
 };
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
-/// The window: large enough for the recording bar.
-pub const WIDTH: u16 = 132;
-pub const HEIGHT: u16 = 36;
-/// The resting bar, as Wispr draws it.
-pub const REST_WIDTH: u16 = 78;
-pub const REST_HEIGHT: u16 = 18;
-const REST_BORDER: u16 = 2;
-pub const BARS: usize = 13;
-const BAR_WIDTH: i16 = 4;
-const BAR_GAP: i16 = 4;
-/// Gap between the bottom of the bars and the bottom of the screen.
-const BOTTOM_MARGIN: i16 = 20;
-const FRAME: Duration = Duration::from_millis(33);
+use crate::wave;
+
+/// All sizes below are CSS pixels.
+const WINDOW: (f64, f64) = (66.0, 18.0);
+const REST: (f64, f64) = (40.0, 8.0);
+const ACTIVE: (f64, f64) = (54.0, 18.0);
+const BORDER: f64 = 1.0;
+const BAR_GAP: f64 = 2.0;
+/// Gap between the bottom of the bar and the bottom of the screen.
+const BOTTOM_MARGIN: f64 = 10.0;
+const FRAME: Duration = Duration::from_millis(16);
 
 /// What the bar shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,43 +84,59 @@ pub fn normalize_level(v: f64) -> f64 {
     }
 }
 
-/// Bar heights in pixels, newest level in the middle, older ones spreading out.
-pub fn bar_heights(levels: &VecDeque<f64>, max: i16) -> [i16; BARS] {
-    let mut out = [3i16; BARS];
-    let mid = BARS / 2;
-    for (age, level) in levels.iter().rev().take(mid + 1).enumerate() {
-        let h = (3.0 + level * f64::from(max - 3)).round() as i16;
-        let fade = 1.0 - age as f64 * 0.12;
-        let h = ((f64::from(h) * fade).round() as i16).max(3);
-        out[mid + age] = h;
-        out[mid - age] = h;
-    }
-    out
+/// Display scale from an X resource string (`Xft.dpi: 192` gives 2).
+pub fn scale_from_resources(resources: &str) -> f64 {
+    resources
+        .lines()
+        .find_map(|l| l.strip_prefix("Xft.dpi:"))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .map(|dpi| (dpi / 96.0).clamp(1.0, 4.0))
+        .unwrap_or(1.0)
 }
 
-/// The part of the window a mode draws on, in window coordinates. Both bars
-/// sit on the same bottom line, centred.
-pub fn body(mode: Mode) -> Rectangle {
-    match mode {
-        Mode::Resting => Rectangle {
-            x: ((WIDTH - REST_WIDTH) / 2) as i16,
-            y: (HEIGHT - REST_HEIGHT) as i16,
-            width: REST_WIDTH,
-            height: REST_HEIGHT,
-        },
-        _ => Rectangle {
-            x: 0,
-            y: 0,
-            width: WIDTH,
-            height: HEIGHT,
-        },
+/// Device-pixel geometry for one display scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Geometry {
+    pub scale: f64,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl Geometry {
+    pub fn new(scale: f64) -> Geometry {
+        Geometry {
+            scale,
+            width: px(WINDOW.0, scale),
+            height: px(WINDOW.1, scale),
+        }
     }
+
+    /// The part of the window a mode draws on, centred on the bottom line.
+    pub fn body(&self, mode: Mode) -> Rectangle {
+        let (w, h) = match mode {
+            Mode::Resting => REST,
+            _ => ACTIVE,
+        };
+        let (w, h) = (px(w, self.scale), px(h, self.scale));
+        Rectangle {
+            x: ((self.width - w) / 2) as i16,
+            y: (self.height - h) as i16,
+            width: w,
+            height: h,
+        }
+    }
+}
+
+fn px(css: f64, scale: f64) -> u16 {
+    (css * scale).round().max(1.0) as u16
 }
 
 /// Commands for the bar thread.
 pub enum PillCommand {
     Status(String),
     Level(f64),
+    /// `status:micActive`: bars are white while the mic is active.
+    Mic(bool),
     /// Wispr's own status page is up and draws the bar itself.
     Enabled(bool),
     /// Whether Wispr shows its resting bar (its hideFlowBarPermanently and
@@ -132,6 +150,7 @@ struct Surface {
     gc: u32,
     mapped: bool,
     input: Option<(i16, i16, u16, u16)>,
+    geo: Geometry,
 }
 
 /// Premultiplied ARGB, as a 32-bit visual expects.
@@ -170,6 +189,21 @@ fn capsule(r: Rectangle) -> (Vec<Arc>, Rectangle) {
     (arcs, mid)
 }
 
+fn read_scale(conn: &RustConnection, root: Window) -> f64 {
+    conn.get_property(
+        false,
+        root,
+        AtomEnum::RESOURCE_MANAGER,
+        AtomEnum::STRING,
+        0,
+        1 << 16,
+    )
+    .ok()
+    .and_then(|c| c.reply().ok())
+    .map(|r| scale_from_resources(&String::from_utf8_lossy(&r.value)))
+    .unwrap_or(1.0)
+}
+
 impl Surface {
     fn open() -> Result<Surface, String> {
         let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("no X display: {e}"))?;
@@ -182,6 +216,7 @@ impl Surface {
             .find(|v| v.class == x11rb::protocol::xproto::VisualClass::TRUE_COLOR)
             .map(|v| v.visual_id)
             .ok_or("no 32-bit visual")?;
+        let geo = Geometry::new(read_scale(&conn, screen.root));
 
         // Bottom centre of the primary monitor, or of the whole screen.
         let (mx, my, mw, mh) = conn
@@ -197,8 +232,8 @@ impl Surface {
                 Some((m.x, m.y, m.width, m.height))
             })
             .unwrap_or((0, 0, screen.width_in_pixels, screen.height_in_pixels));
-        let x = mx + (mw as i16 - WIDTH as i16) / 2;
-        let y = my + mh as i16 - HEIGHT as i16 - BOTTOM_MARGIN;
+        let x = mx + (mw as i16 - geo.width as i16) / 2;
+        let y = my + mh as i16 - geo.height as i16 - px(BOTTOM_MARGIN, geo.scale) as i16;
 
         let colormap = conn.generate_id().map_err(|e| e.to_string())?;
         conn.create_colormap(ColormapAlloc::NONE, colormap, screen.root, visual)
@@ -210,8 +245,8 @@ impl Surface {
             screen.root,
             x,
             y,
-            WIDTH,
-            HEIGHT,
+            geo.width,
+            geo.height,
             0,
             WindowClass::INPUT_OUTPUT,
             visual,
@@ -233,6 +268,7 @@ impl Surface {
             gc,
             mapped: false,
             input: None,
+            geo,
         };
         s.set_input(None);
         Ok(s)
@@ -290,70 +326,82 @@ impl Surface {
         self.fill(color, &[mid]);
     }
 
-    fn draw(&mut self, mode: Mode, heights: &[i16; BARS], phase: f64) {
-        let (w, h) = (WIDTH as i16, HEIGHT as i16);
+    /// Wispr's outlined, translucent body. X writes pixels without blending,
+    /// so the inner fill replaces the outline colour inside it.
+    fn body(&self, area: Rectangle) {
+        self.fill_capsule(argb(0xc0, 0xaa, 0xaa, 0xaa), area);
+        let b = px(BORDER, self.geo.scale);
+        let inner = Rectangle {
+            x: area.x + b as i16,
+            y: area.y + b as i16,
+            width: area.width.saturating_sub(2 * b),
+            height: area.height.saturating_sub(2 * b),
+        };
+        self.fill_capsule(argb(0x80, 0, 0, 0), inner);
+    }
+
+    fn draw(&mut self, mode: Mode, heights: &[f64; wave::BARS], mic_active: bool, phase: f64) {
+        let g = self.geo;
         self.fill(
             0,
             &[Rectangle {
                 x: 0,
                 y: 0,
-                width: WIDTH,
-                height: HEIGHT,
+                width: g.width,
+                height: g.height,
             }],
         );
-        let area = body(mode);
+        let area = g.body(mode);
         self.set_input(Some(area));
+        if mode == Mode::Hidden {
+            let _ = self.conn.flush();
+            return;
+        }
+        self.body(area);
+        let cy = f64::from(area.y) + f64::from(area.height) / 2.0;
         match mode {
-            Mode::Resting => {
-                // Light outline, then the dark inside.
-                self.fill_capsule(argb(0xff, 0xa8, 0xa8, 0xae), area);
-                let b = REST_BORDER;
-                let inner = Rectangle {
-                    x: area.x + b as i16,
-                    y: area.y + b as i16,
-                    width: area.width - 2 * b,
-                    height: area.height - 2 * b,
-                };
-                self.fill_capsule(argb(0xff, 0x0e, 0x0e, 0x11), inner);
+            Mode::Recording => {
+                let bar_w = px(wave::BAR_WIDTH, g.scale);
+                let gap = px(BAR_GAP, g.scale);
+                let total = wave::BARS as u16 * bar_w + (wave::BARS as u16 - 1) * gap;
+                let left = area.x + ((area.width - total) / 2) as i16;
+                let alpha = if mic_active { 0xff } else { 0x66 };
+                let rects: Vec<Rectangle> = heights
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &h)| {
+                        let hp =
+                            px(h.max(wave::BAR_WIDTH), g.scale).min(area.height.saturating_sub(4));
+                        Rectangle {
+                            x: left + (i as u16 * (bar_w + gap)) as i16,
+                            y: (cy - f64::from(hp) / 2.0).round() as i16,
+                            width: bar_w,
+                            height: hp,
+                        }
+                    })
+                    .collect();
+                self.fill(argb(alpha, 0xff, 0xff, 0xff), &rects);
             }
-            Mode::Recording | Mode::Working => {
-                self.fill_capsule(argb(0xf0, 0x0e, 0x0e, 0x11), area);
-                let fg = argb(0xff, 0xf2, 0xf2, 0xf2);
-                if mode == Mode::Recording {
-                    let total = BARS as i16 * BAR_WIDTH + (BARS as i16 - 1) * BAR_GAP;
-                    let left = (w - total) / 2;
-                    let rects: Vec<Rectangle> = heights
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &bh)| Rectangle {
-                            x: left + i as i16 * (BAR_WIDTH + BAR_GAP),
-                            y: (h - bh) / 2,
-                            width: BAR_WIDTH as u16,
-                            height: bh as u16,
-                        })
-                        .collect();
-                    self.fill(fg, &rects);
-                } else {
-                    for i in 0..3 {
-                        let pulse =
-                            ((phase * 6.0 - f64::from(i) * 0.9).sin() * 0.5 + 0.5) * 0.8 + 0.2;
-                        let a = (pulse * 255.0) as u8;
-                        let x = w / 2 - 14 + i * 12;
-                        self.fill_arcs(
-                            argb(a, 0xf2, 0xf2, 0xf2),
-                            &[Arc {
-                                x,
-                                y: h / 2 - 3,
-                                width: 6,
-                                height: 6,
-                                angle1: 0,
-                                angle2: 360 * 64,
-                            }],
-                        );
-                    }
+            Mode::Working => {
+                let d = px(3.0, g.scale);
+                let step = px(6.0, g.scale) as i16;
+                let cx = area.x + (area.width / 2) as i16;
+                for i in 0..3i16 {
+                    let pulse = ((phase * 6.0 - f64::from(i) * 0.9).sin() * 0.5 + 0.5) * 0.8 + 0.2;
+                    self.fill_arcs(
+                        argb((pulse * 255.0) as u8, 0xff, 0xff, 0xff),
+                        &[Arc {
+                            x: cx + (i - 1) * step - (d / 2) as i16,
+                            y: (cy - f64::from(d) / 2.0) as i16,
+                            width: d,
+                            height: d,
+                            angle1: 0,
+                            angle2: 360 * 64,
+                        }],
+                    );
                 }
             }
-            Mode::Hidden => {}
+            Mode::Resting | Mode::Hidden => {}
         }
         let _ = self.conn.flush();
     }
@@ -397,7 +445,10 @@ pub fn run(
     let mut status = String::from("idle");
     let mut resting_bar = false;
     let mut enabled = true;
-    let mut levels: VecDeque<f64> = VecDeque::with_capacity(16);
+    let mut mic_active = false;
+    let mut target = 0.0f64;
+    let mut level = 0.0f64;
+    let mut last_frame = Instant::now();
     let mut last_drawn: Option<Mode> = None;
     let start = Instant::now();
     loop {
@@ -413,20 +464,24 @@ pub fn run(
             Ok(PillCommand::Status(s)) => {
                 status = s;
                 if status != "recording" {
-                    levels.clear();
+                    target = 0.0;
                 }
             }
-            Ok(PillCommand::Level(v)) => {
-                if levels.len() == 16 {
-                    levels.pop_front();
-                }
-                levels.push_back(normalize_level(v));
-            }
+            Ok(PillCommand::Level(v)) => target = normalize_level(v),
+            Ok(PillCommand::Mic(m)) => mic_active = m,
             Ok(PillCommand::Enabled(e)) => enabled = e,
             Ok(PillCommand::RestingBar(r)) => resting_bar = r,
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
+        let now = Instant::now();
+        level = wave::smooth(
+            level,
+            target,
+            now.duration_since(last_frame).as_secs_f64() * 1000.0,
+        );
+        last_frame = now;
+
         let mode = mode_for(&status, resting_bar);
         let show = enabled && mode != Mode::Hidden;
         *shown.lock().expect("mode lock poisoned") = if show { mode } else { Mode::Hidden };
@@ -434,11 +489,8 @@ pub fn run(
             s.set_visible(show);
             let animated = matches!(mode, Mode::Recording | Mode::Working);
             if show && (animated || last_drawn != Some(mode)) {
-                s.draw(
-                    mode,
-                    &bar_heights(&levels, HEIGHT as i16 - 12),
-                    start.elapsed().as_secs_f64(),
-                );
+                let t = start.elapsed().as_secs_f64();
+                s.draw(mode, &wave::heights(t, level), mic_active, t);
                 last_drawn = Some(mode);
             }
             if !show {
@@ -472,12 +524,24 @@ mod tests {
     }
 
     #[test]
-    fn resting_bar_sits_on_the_bottom_line_centred() {
-        let r = body(Mode::Resting);
-        assert_eq!((r.width, r.height), (REST_WIDTH, REST_HEIGHT));
-        assert_eq!(r.y as u16 + r.height, HEIGHT);
-        assert_eq!(r.x as u16 * 2 + r.width, WIDTH);
-        assert_eq!(body(Mode::Recording).height, HEIGHT);
+    fn resting_bar_matches_wispr_at_200_percent() {
+        let g = Geometry::new(2.0);
+        let r = g.body(Mode::Resting);
+        assert_eq!((r.width, r.height), (80, 16), "measured from Wispr's page");
+        assert_eq!(r.y as u16 + r.height, g.height, "sits on the bottom line");
+        assert_eq!(r.x as u16 * 2 + r.width, g.width, "centred");
+        assert!(g.body(Mode::Recording).height > r.height);
+    }
+
+    #[test]
+    fn display_scale_comes_from_xft_dpi() {
+        assert_eq!(
+            scale_from_resources("Xft.antialias:\t1\nXft.dpi:\t192\n"),
+            2.0
+        );
+        assert_eq!(scale_from_resources("Xft.dpi: 96"), 1.0);
+        assert_eq!(scale_from_resources(""), 1.0);
+        assert_eq!(scale_from_resources("Xft.dpi: 9999"), 4.0);
     }
 
     #[test]
@@ -487,20 +551,6 @@ mod tests {
         assert_eq!(normalize_level(f64::NAN), 0.0);
         assert!((normalize_level(-30.0) - 0.5).abs() < 1e-9);
         assert_eq!(normalize_level(-200.0), 0.0);
-    }
-
-    #[test]
-    fn bars_are_symmetric_and_loudest_in_the_middle() {
-        let levels: VecDeque<f64> = [0.2, 0.4, 1.0].into_iter().collect();
-        let h = bar_heights(&levels, 24);
-        let mid = BARS / 2;
-        assert_eq!(h[mid], 24);
-        for i in 0..BARS {
-            assert_eq!(h[i], h[BARS - 1 - i]);
-            assert!(h[i] >= 3);
-        }
-        assert!(h[mid] > h[mid + 1] && h[mid + 1] > h[mid + 2]);
-        assert_eq!(h[0], 3);
     }
 
     #[test]

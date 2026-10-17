@@ -7,6 +7,7 @@
 mod pill;
 mod protocol;
 mod recorder;
+mod wave;
 
 use std::io::{BufRead, Write};
 use std::process::{Command as Process, Stdio};
@@ -219,6 +220,9 @@ fn main() {
                 let _ = pill_tx.send(PillCommand::Enabled(enabled));
             }
             Ok(Some(Command::Sound { name })) => play(&cfg, &name, &out),
+            Ok(Some(Command::Mic { active })) => {
+                let _ = pill_tx.send(PillCommand::Mic(active));
+            }
             Ok(Some(Command::Bar { visible })) => {
                 let _ = pill_tx.send(PillCommand::RestingBar(visible));
             }

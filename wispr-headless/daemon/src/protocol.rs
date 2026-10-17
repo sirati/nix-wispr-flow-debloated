@@ -23,6 +23,8 @@ pub enum Command {
     Sound { name: String },
     /// Whether Wispr shows its resting bar when idle.
     Bar { visible: bool },
+    /// `status:micActive`.
+    Mic { active: bool },
 }
 
 /// Timing figures Wispr's Hub reports with `dictation:recordingDone`, in

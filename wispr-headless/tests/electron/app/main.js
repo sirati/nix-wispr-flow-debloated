@@ -91,7 +91,7 @@ app.whenReady().then(async () => {
   let xdotool = null;
   try { xdotool = execSync("command -v xdotool").toString().trim(); } catch {}
   if (xdotool) {
-    execSync(`${xdotool} mousemove 640 771 click 1`);
+    execSync(`${xdotool} mousemove 640 786 click 1`); // the resting bar: 40x8 at 10 px above the bottom of the 1280x800 screen
     await until("click", () => startClicks > 0, 3_000);
     check(startClicks === 1, `a click on the resting bar arrives as status:startClicked (${startClicks})`);
   } else {
