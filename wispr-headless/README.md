@@ -17,8 +17,10 @@ renderer runs while Wispr is in the background:
   microphone with `pw-cat` and sends Wispr the same `dictation:*` messages
   the Hub would: 640-sample 16 kHz WAV chunks, then `recordingDone`. It also
   draws Wispr's flow bar as an XWayland window: the resting bar (shown by
-  Wispr's own rule, `prefs.user.hideFlowBarPermanently` and its snooze), level
-  bars while recording and dots while finishing. A click on it starts or
+  Wispr's own rule, `prefs.user.hideFlowBarPermanently` and its snooze),
+  Wispr's ten-bar waveform while recording (same sizes, animation and level
+  smoothing as its status page, dimmed while the mic is not active; see
+  `daemon/src/wave.rs`) and dots while finishing. Sizes follow `Xft.dpi`. A click on it starts or
   stops a dictation like a click on Wispr's bar. It also plays Wispr's sounds.
   The status page loads only for notifications, reminders and tips, and stops
   again once it draws nothing larger than the resting bar.
