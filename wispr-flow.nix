@@ -125,6 +125,16 @@ let
 
         # The patch scripts leave <bundle>.orig copies; do not pack them.
         find asar-contents -type f -name '*.orig' -delete
+${lib.optionalString (cfg.shim != null) ''
+        # Our Electron shim runs first: package.json's main points at it, and
+        # it loads the app's own entry, kept in wisprOriginalMain.
+        install -Dm644 ${cfg.shim} asar-contents/wispr-shim/index.js
+        node -e '
+          const f = "asar-contents/package.json", p = JSON.parse(require("fs").readFileSync(f, "utf8"));
+          if (p.wisprOriginalMain) throw new Error("package.json already shimmed");
+          p.wisprOriginalMain = p.main; p.main = "wispr-shim/index.js";
+          require("fs").writeFileSync(f, JSON.stringify(p, null, 2));'
+      ''}
 
         if [[ -d "$resources_src/app.asar.unpacked" ]]; then'' buildPhase;
 
@@ -161,6 +171,16 @@ in
 {
   options.programs.wisprFlow = {
     enable = lib.mkEnableOption "Wispr Flow dictation (unofficial Linux port)";
+
+    shim = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        JavaScript file that runs in Electron's main process before the app's
+        own code: package.json's main points at it, and it must load the
+        app's entry from package.json's wisprOriginalMain.
+      '';
+    };
 
     package = lib.mkOption {
       type = lib.types.package;
