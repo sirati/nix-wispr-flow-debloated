@@ -92,7 +92,8 @@ const STATUS_DROP = new Set(["status:micActive", "status:monitorChanged", "notif
 // Store changes that may make the status window show something.
 const STATUS_WAKE_KEYS = [/^remoteNotifications\.new/, /^remoteNotifications\.unreadCount/, /^subscription\.(tier|daysLeft|gracePeriodEndsAt)/, /[Ll]imit|[Qq]uota|[Nn]udge|[Rr]eminder/];
 
-// The value at a dotted path, or undefined.
+// The value at a dotted path, or undefined. A value that was null or missing
+// before is arriving for the first time (Wispr fills placeholders at login).
 const valueAt = (obj, p) => p.split(".").reduce((o, k) => (o !== null && typeof o === "object" ? o[k] : undefined), obj);
 
 // The status page reports the areas it draws. The resting bar is about
@@ -345,7 +346,7 @@ function build(electron) {
           this.lastState = a.state;
           updateBar(a.state);
           const prev = this.prevState;
-          if (changed.some((p) => STATUS_WAKE_KEYS.some((re) => re.test(p)) && valueAt(prev, p) !== undefined)) {
+          if (changed.some((p) => STATUS_WAKE_KEYS.some((re) => re.test(p)) && valueAt(prev, p) != null)) {
             trace({ ev: "wake.state", win: "status", keys: changed.slice(0, 10) });
             this.materialize("store change");
           }

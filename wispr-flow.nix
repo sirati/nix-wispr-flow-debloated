@@ -245,13 +245,38 @@ in
     # on fractional-scale displays.
     environment.sessionVariables.WISPR_USE_X11 = "1";
 
-    # Start it hidden at login so the pill is up in every session.
-    environment.etc."xdg/autostart/wispr-flow.desktop".text = ''
-      [Desktop Entry]
-      Type=Application
-      Name=Wispr Flow
-      Exec=${cfg.package}/bin/wispr-flow --hidden
-      X-GNOME-Autostart-enabled=true
-    '';
+    # Start it hidden at login, as a user service rather than XDG autostart:
+    # home-manager restarts a user service whose unit changed on every switch,
+    # and the unit names the package, so a new Wispr build replaces the running
+    # one by itself. Restart=on-failure: quitting Wispr from its tray (a clean
+    # exit) leaves it stopped. Stopping the unit stops Electron's whole process
+    # tree, wispr-headless included.
+    home-manager.users = lib.genAttrs cfg.users (_: {
+      systemd.user.services.wispr-flow = {
+        Unit = {
+          Description = "Wispr Flow dictation";
+          PartOf = [ "graphical-session.target" ];
+          After = [ "graphical-session.target" ];
+        };
+        Service = {
+          ExecStart = "${cfg.package}/bin/wispr-flow --hidden";
+          Restart = "on-failure";
+          RestartSec = 3;
+          TimeoutStopSec = 15;
+        };
+        Install.WantedBy = [ "graphical-session.target" ];
+      };
+      # Wispr's own "Open at login" writes this file; a second instance at
+      # login would only open its settings window. The service starts it.
+      xdg.configFile."autostart/wispr-flow.desktop" = {
+        force = true;
+        text = ''
+          [Desktop Entry]
+          Type=Application
+          Name=Wispr Flow
+          Hidden=true
+        '';
+      };
+    });
   };
 }
