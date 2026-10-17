@@ -92,6 +92,16 @@ const STATUS_DROP = new Set(["status:micActive", "status:monitorChanged", "notif
 // Store changes that may make the status window show something.
 const STATUS_WAKE_KEYS = [/^remoteNotifications\.new/, /^remoteNotifications\.unreadCount/, /^subscription\.(tier|daysLeft|gracePeriodEndsAt)/, /[Ll]imit|[Qq]uota|[Nn]udge|[Rr]eminder/];
 
+// The value at a dotted path, or undefined.
+const valueAt = (obj, p) => p.split(".").reduce((o, k) => (o !== null && typeof o === "object" ? o[k] : undefined), obj);
+
+// The status page reports the areas it draws. The resting bar is about
+// 78x18; anything clearly bigger is a notification, tip or similar.
+function drawsMoreThanBar(rects) {
+  if (!Array.isArray(rects)) return false;
+  return rects.some((r) => Number(r?.width ?? r?.w ?? 0) > 140 || Number(r?.height ?? r?.h ?? 0) > 48);
+}
+
 function changedPaths(a, b, prefix = "", depth = 3, out = []) {
   if (out.length > 60 || a === b) return out;
   const objA = a !== null && typeof a === "object" && !Array.isArray(a);
@@ -177,6 +187,25 @@ function build(electron) {
     trace({ ev: "fallback", why: "no daemon" });
   }
 
+  // Wispr's resting bar is shown unless hidden for good or snoozed (its own
+  // rule: prefs.user.hideFlowBarPermanently, clickableBubbleSnoozeUntil).
+  let barVisible = null;
+  let barTimer = null;
+  function updateBar(state) {
+    const user = state?.prefs?.user;
+    if (!user) return;
+    const until = Number(user.clickableBubbleSnoozeUntil) || 0;
+    const now = Date.now();
+    const visible = !user.hideFlowBarPermanently && now >= until;
+    if (barTimer) clearTimeout(barTimer);
+    barTimer = null;
+    if (!user.hideFlowBarPermanently && until > now) barTimer = setTimeout(() => updateBar(state), Math.min(until - now + 50, 2 ** 31 - 1));
+    if (visible !== barVisible) {
+      barVisible = visible;
+      daemon?.send({ op: "bar", visible });
+    }
+  }
+
   function onDaemonEvent(msg) {
     const hub = byRole.get("hub");
     const uuid = msg.uuid;
@@ -197,6 +226,12 @@ function build(electron) {
         emitFrom(hub, "dictation:recordingDone", { ...msg.timing, transcriptionEntityUuid: uuid });
         if (session === uuid) session = null;
         break;
+      case "click": {
+        const status = byRole.get("status");
+        if (msg.action === "start") emitFrom(status, "status:startClicked", undefined);
+        else if (msg.action === "stop") emitFrom(status, "status:stopClicked", undefined);
+        break;
+      }
       case "micFailed":
         trace({ ev: "daemon.micFailed", error: String(msg.error).slice(0, 200) });
         emitFrom(hub, "dictation:micAcquisitionFailed", { transcriptionEntityUuid: uuid });
@@ -222,7 +257,7 @@ function build(electron) {
       this.notificationActive = false;
       this.remindersActive = false;
       this.barHidden = true;
-      this.rectsEmpty = true;
+      this.drawsMoreThanBar = false;
       this.meeting = false;
     }
 
@@ -289,7 +324,7 @@ function build(electron) {
     // Status window: back to showing nothing?
     checkStatusIdle() {
       if (this.role !== "status" || !this.materialized) return;
-      if (!this.notificationActive && !this.remindersActive && (this.barHidden || this.rectsEmpty) && !session) this.scheduleIdle(STATUS_IDLE_MS, "nothing shown");
+      if (!this.notificationActive && !this.remindersActive && !this.drawsMoreThanBar && !session) this.scheduleIdle(STATUS_IDLE_MS, "only the bar");
       else this.cancelIdle();
     }
 
@@ -306,8 +341,11 @@ function build(electron) {
         this.ack(a);
         if (this.role === "status" && a?.state) {
           const changed = this.lastState ? changedPaths(this.lastState, a.state) : [];
+          this.prevState = this.lastState;
           this.lastState = a.state;
-          if (changed.some((p) => STATUS_WAKE_KEYS.some((re) => re.test(p)))) {
+          updateBar(a.state);
+          const prev = this.prevState;
+          if (changed.some((p) => STATUS_WAKE_KEYS.some((re) => re.test(p)) && valueAt(prev, p) !== undefined)) {
             trace({ ev: "wake.state", win: "status", keys: changed.slice(0, 10) });
             this.materialize("store change");
           }
@@ -362,6 +400,11 @@ function build(electron) {
     if (lazy.role === "hub" && headless) {
       if (ch === "dictation:audioStart" || ch === "dictation:audioStop" || HUB_SOUNDS[ch] || ch === "dictation:audioSetup") return lazy.route(ch, args);
       if (/^media:(start|stop)Meeting/.test(ch)) lazy.meeting = ch.startsWith("media:start");
+    }
+    if (lazy.role === "status" && ch === "zubridge:state-update" && args[0]?.state) {
+      lazy.prevState = lazy.lastState;
+      lazy.lastState = args[0].state;
+      updateBar(args[0].state);
     }
     if (lazy.role === "status") {
       if (ch === "status:dictationStatus") daemon?.send({ op: "status", value: String(args[0]) });
@@ -467,7 +510,7 @@ function build(electron) {
       if (lazy.role === "status") {
         if (ch === "status:barHidden") { lazy.barHidden = true; lazy.checkStatusIdle(); }
         if (ch === "status:barVisible") { lazy.barHidden = false; lazy.checkStatusIdle(); }
-        if (ch === "status:reportAlphaCatchRects") { lazy.rectsEmpty = !(args[0]?.rects?.length > 0); lazy.checkStatusIdle(); }
+        if (ch === "status:reportAlphaCatchRects") { lazy.drawsMoreThanBar = drawsMoreThanBar(args[0]?.rects); lazy.checkStatusIdle(); }
       }
       if (lazy.role === "hub" && ch === "hub:close") lazy.scheduleIdle(HIDDEN_IDLE_MS, "closed");
     }

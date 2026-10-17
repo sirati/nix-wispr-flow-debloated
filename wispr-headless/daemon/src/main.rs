@@ -134,12 +134,21 @@ fn main() {
     let clock = Instant::now();
     let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
 
-    // The indicator runs on its own thread.
+    // The flow bar runs on its own thread; its clicks go straight to the shim.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
     {
         let log_out = Out(out.0.clone());
+        let click_out = Out(out.0.clone());
         std::thread::spawn(move || {
-            pill::run(pill_rx, move |msg| log_out.send(&Event::Log { msg }))
+            pill::run(
+                pill_rx,
+                move |msg| log_out.send(&Event::Log { msg }),
+                move |action| {
+                    click_out.send(&Event::Click {
+                        action: action.to_string(),
+                    })
+                },
+            )
         });
     }
 
@@ -210,6 +219,9 @@ fn main() {
                 let _ = pill_tx.send(PillCommand::Enabled(enabled));
             }
             Ok(Some(Command::Sound { name })) => play(&cfg, &name, &out),
+            Ok(Some(Command::Bar { visible })) => {
+                let _ = pill_tx.send(PillCommand::RestingBar(visible));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if let Some(r) = recording.as_mut() {

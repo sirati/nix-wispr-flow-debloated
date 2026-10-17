@@ -21,6 +21,8 @@ pub enum Command {
     Pill { enabled: bool },
     /// Play one of Wispr's sounds: start, stop, paste, achievement.
     Sound { name: String },
+    /// Whether Wispr shows its resting bar when idle.
+    Bar { visible: bool },
 }
 
 /// Timing figures Wispr's Hub reports with `dictation:recordingDone`, in
@@ -66,6 +68,10 @@ pub enum Event {
         uuid: String,
         error: String,
     },
+    /// The bar was clicked: "start" from rest, "stop" while recording.
+    Click {
+        action: String,
+    },
     Log {
         msg: String,
     },
@@ -97,6 +103,10 @@ mod tests {
         assert_eq!(
             parse(r#"{"op":"pill","enabled":false}"#).unwrap(),
             Command::Pill { enabled: false }
+        );
+        assert_eq!(
+            parse(r#"{"op":"bar","visible":true}"#).unwrap(),
+            Command::Bar { visible: true }
         );
         assert!(parse(r#"{"op":"nonsense"}"#).is_err());
     }

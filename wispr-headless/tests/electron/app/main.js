@@ -51,6 +51,8 @@ ipcMain.on("dictation:recordingStarted", (_e, a) => { started = a; });
 ipcMain.on("dictation:audioChunk", (_e, a) => chunks.push(a));
 ipcMain.on("dictation:recordingDone", (_e, a) => { done = a; });
 ipcMain.on("status:reportAlphaCatchRects", () => {});
+let startClicks = 0;
+ipcMain.on("status:startClicked", () => startClicks++);
 
 const page = (role) => path.join(__dirname, "renderer", role, "index.html");
 const make = (role, title) =>
@@ -74,6 +76,27 @@ app.whenReady().then(async () => {
   for (let i = 0; i < 3; i++) for (const w of [status, hub, menu]) w.webContents.send("zubridge:state-update", { updateId: `u${i}-${w.id}`, state: { prefs: { n: i } } });
   await wait(300);
   check([status, hub, menu].every((w) => acks.get(w.webContents.id) === 3), `every virtual window acknowledged 3 updates (${[...acks.values()]})`);
+
+  // First-time store data does not load the status page, and the resting
+  // bar is on by Wispr's rule.
+  const withSubscription = (id, daysLeft) => ({
+    updateId: id,
+    state: { prefs: { user: { hideFlowBarPermanently: false } }, subscription: { daysLeft } },
+  });
+  status.webContents.send("zubridge:state-update", withSubscription("s1", 5));
+  await wait(800);
+  check(renderers() === 0, "first-time store data does not load the status page");
+
+  // A click on the Rust bar reaches the app as Wispr's own start click.
+  let xdotool = null;
+  try { xdotool = execSync("command -v xdotool").toString().trim(); } catch {}
+  if (xdotool) {
+    execSync(`${xdotool} mousemove 640 771 click 1`);
+    await until("click", () => startClicks > 0, 3_000);
+    check(startClicks === 1, `a click on the resting bar arrives as status:startClicked (${startClicks})`);
+  } else {
+    console.log("SKIP bar click (no xdotool)");
+  }
 
   // Dictation through the recorder.
   hub.webContents.send("dictation:audioStart", { useOpus: false, transcriptionEntityUuid: "dict-1" });
@@ -127,6 +150,17 @@ app.whenReady().then(async () => {
   check(loaded.includes("status"), "status page loads again after being stopped");
 
   check(gone === 0, `still no render-process-gone seen by the app (${gone})`);
+
+  // A changed value on the wake list loads the status page: stop it first.
+  status.webContents.send("notification:clear", { reason: "test" });
+  ipcMain.emit("status:reportAlphaCatchRects", { sender: status.webContents }, { rects: [{ x: 0, y: 0, width: 78, height: 18 }], shapeRects: [], viewport: {} });
+  // (The hub is still up from the meeting step, so look at the status window only.)
+  await until("status stopped again", () => status.webContents.isCrashed(), Number(process.env.WISPR_HEADLESS_TEST_IDLE_MS) + 4_000);
+  check(status.webContents.isCrashed(), "status stops when only the resting bar is drawn");
+  loaded.length = 0;
+  status.webContents.send("zubridge:state-update", withSubscription("s2", 4));
+  await until("woken by store", () => loaded.includes("status"), 5_000);
+  check(loaded.includes("status"), "a changed subscription value loads the status page");
   console.log(failures === 0 ? "ALL PASSED" : `${failures} FAILED`);
   app.exit(failures === 0 ? 0 : 1);
 });

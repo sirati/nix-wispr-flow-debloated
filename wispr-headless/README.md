@@ -16,7 +16,12 @@ renderer runs while Wispr is in the background:
 - `daemon/` (Rust, `wispr-headless`) is spawned by the shim. It records the
   microphone with `pw-cat` and sends Wispr the same `dictation:*` messages
   the Hub would: 640-sample 16 kHz WAV chunks, then `recordingDone`. It also
-  draws the speech indicator as an XWayland window and plays Wispr's sounds.
+  draws Wispr's flow bar as an XWayland window: the resting bar (shown by
+  Wispr's own rule, `prefs.user.hideFlowBarPermanently` and its snooze), level
+  bars while recording and dots while finishing. A click on it starts or
+  stops a dictation like a click on Wispr's bar. It also plays Wispr's sounds.
+  The status page loads only for notifications, reminders and tips, and stops
+  again once it draws nothing larger than the resting bar.
 
 If the daemon cannot run or exits, every window loads as usual. Nothing
 depends on Wispr's minified code: only IPC channel names and the preload

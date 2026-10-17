@@ -28,4 +28,4 @@ export WISPR_HEADLESS_TEST_CAPTURE="cat $work/tone.raw"
 export WISPR_HEADLESS_TEST_IDLE_MS=1500
 export XDG_CACHE_HOME="$work/cache"
 unset DISPLAY WAYLAND_DISPLAY
-xvfb-run -a electron "$work/app"
+xvfb-run -a --server-args="-screen 0 1280x800x24" electron "$work/app"
