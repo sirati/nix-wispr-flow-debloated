@@ -131,6 +131,27 @@ with subtest("an open terminal keeps working after fcitx5 (and so wispr-ime) res
     log("after restart:", repr(text))
     assert text.startswith("á"), f"typing did not recover after the restart: {text!r}"
 
+with subtest("fcitx5 quitting on its own: it comes back, wispr-ime follows, an open terminal keeps typing"):
+    # What happened on the laptop: fcitx5 exited with status 0 and stayed dead.
+    out, unit = start_terminal("kgx", "selfquit")
+    old = run_in_session("systemctl --user show -p MainPID --value fcitx5.service").strip()
+    run_in_session(f"kill -TERM {old}")
+    # fcitx5 comes back (Restart=always); its new bus owner makes wispr-ime exit and be restarted
+    machine.wait_until_succeeds(
+        "runuser -u alice -- env " + SESSION_ENV
+        + f" sh -c 'p=$(systemctl --user show -p MainPID --value fcitx5.service); [ \"$p\" != 0 ] && [ \"$p\" != {old} ]'",
+        timeout=60,
+    )
+    machine.wait_until_succeeds(
+        "runuser -u alice -- env " + SESSION_ENV + f" busctl --user list | grep -q {BUS}", timeout=90
+    )
+    machine.sleep(10)  # mozc loading, mutter reconnecting
+    log("wispr-ime journal after fcitx5 quit:\n" + wispr_ime_log(80))
+    send_keys("apostrophe", "a")
+    text = finish_terminal(out, unit)
+    log("after fcitx5 quit on its own:", repr(text))
+    assert text.startswith("á"), f"typing did not recover after fcitx5 quit: {text!r}"
+
 with subtest("a clean stop leaves GNOME with no address instead of a dead one"):
     run_in_session("systemctl --user stop wispr-ime.service")
     machine.sleep(2)

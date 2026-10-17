@@ -73,6 +73,9 @@ async fn start(env: &Env) -> Session {
         line.trim().to_string()
     };
     assert!(address.starts_with("unix:"), "bus address: {address:?}");
+    // Without the broker's GUID, like the plain `unix:path=/run/user/N/bus`
+    // that sessions use; with it, a replacement broker would be refused.
+    let address = address.split(',').next().unwrap_or_default().to_string();
     let bus = Guard(bus);
 
     let common = |cmd: &mut Command| {
@@ -358,4 +361,101 @@ async fn mutter_like_client_gets_dead_keys_and_dictation() {
             .unwrap_or(false)
     })
     .await;
+}
+
+/// Waits for the daemon to exit by itself and returns its exit status.
+async fn exit_status_within(daemon: &mut Guard, seconds: u64) -> Option<std::process::ExitStatus> {
+    for _ in 0..seconds * 10 {
+        if let Ok(Some(status)) = daemon.0.try_wait() {
+            return Some(status);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+/// A daemon whose bus is replaced must not stay alive pretending: it exits
+/// with a failure, so systemd starts a fresh one on the new bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_exits_when_the_session_bus_dies() {
+    let Some(env) = env() else {
+        eprintln!("skipped: set WISPR_E2E_DBUS_DAEMON and WISPR_E2E_FCITX5");
+        return;
+    };
+    let mut session = start(&env).await;
+    let conn = client(&session.address).await;
+    wait_for_name(&conn, "org.wisprime.WisprIme").await;
+    drop(conn);
+
+    session._bus.0.kill().expect("kill the bus");
+    let status = exit_status_within(&mut session.daemon, 30).await;
+    let status = status.expect("the daemon is still running on a dead bus");
+    assert!(
+        !status.success(),
+        "it must exit with a failure so systemd restarts it: {status:?}"
+    );
+}
+
+/// A restarted fcitx5 knows none of the daemon's input contexts; the daemon
+/// must start over instead of forwarding into the void.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_exits_when_fcitx5_goes_away() {
+    let Some(env) = env() else {
+        eprintln!("skipped: set WISPR_E2E_DBUS_DAEMON and WISPR_E2E_FCITX5");
+        return;
+    };
+    let mut session = start(&env).await;
+    let conn = client(&session.address).await;
+    wait_for_name(&conn, "org.wisprime.WisprIme").await;
+    drop(conn);
+
+    session._fcitx.0.kill().expect("kill fcitx5");
+    let status = exit_status_within(&mut session.daemon, 15).await;
+    let status = status.expect("the daemon kept running after fcitx5 vanished");
+    assert!(!status.success(), "{status:?}");
+}
+
+/// The failure seen on the laptop: the session bus is replaced, but the old
+/// broker lives on, so the daemon's connection stays open and error-free while
+/// nobody else can reach it. Only comparing bus ids notices.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_exits_when_the_bus_is_replaced_but_its_connection_stays_up() {
+    let Some(env) = env() else {
+        eprintln!("skipped: set WISPR_E2E_DBUS_DAEMON and WISPR_E2E_FCITX5");
+        return;
+    };
+    let mut session = start(&env).await;
+    let conn = client(&session.address).await;
+    wait_for_name(&conn, "org.wisprime.WisprIme").await;
+    drop(conn);
+
+    // Take over the old broker's socket path with a new broker. The old one
+    // keeps running and keeps its existing connections.
+    let path = session
+        .address
+        .strip_prefix("unix:path=")
+        .and_then(|rest| rest.split(',').next())
+        .expect("a path address")
+        .to_string();
+    std::fs::remove_file(&path).expect("unlink the old socket");
+    let replacement = Command::new(&env.dbus_daemon)
+        .args([
+            "--session",
+            "--nofork",
+            "--nopidfile",
+            &format!("--address=unix:path={path}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("second dbus-daemon starts");
+    let _replacement = Guard(replacement);
+    wait_until("the replacement bus", || {
+        std::path::Path::new(&path).exists()
+    })
+    .await;
+
+    let status = exit_status_within(&mut session.daemon, 40).await;
+    let status = status.expect("the daemon stayed attached to the replaced bus");
+    assert!(!status.success(), "{status:?}");
 }

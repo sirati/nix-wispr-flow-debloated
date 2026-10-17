@@ -10,8 +10,11 @@ import ./default.nix {
   inherit pkgs;
   name = "ime-vm-wispr-ime";
   imVariant = "wayland-text-input";
-  # wispr-ime answers GNOME's IBus; fcitx5's own frontend must stay out of its way.
-  fcitxArgs = "-r --disable ibusfrontend";
+  # Same as the laptop (wispr-ime.nix at the repo root): wispr-ime answers GNOME's
+  # IBus, so fcitx5's own frontend stays out of its way; --keep and Restart=always
+  # bring fcitx5 back after the clean exits it makes on its own.
+  fcitxArgs = "-r --keep --disable ibusfrontend";
+  fcitxUnitExtra.serviceConfig.Restart = pkgs.lib.mkForce "always";
 
   extraModules = [
     (

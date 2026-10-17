@@ -111,6 +111,12 @@ let
         [[ "$renderers" -gt 0 ]] \
           || { echo "wispr-flow: no renderer reads platform.isWindows" >&2; exit 1; }
 
+        # Our own patch, not the port's: the Hub window, started hidden, would
+        # otherwise keep playing its onboarding videos (25-95% of a core, all
+        # day). See the script for the measurements.
+        bash ${./wispr-patches/hub-paint-when-hidden.sh} "$main_bundle" \
+          || { echo "wispr-flow: patch hub-paint-when-hidden failed" >&2; exit 1; }
+
         # Linux sqlite addons in place of the Windows PE ones.
         nm_rel=.webpack/main/native_modules/build/Release
         mkdir -p "asar-contents/$nm_rel"
