@@ -79,12 +79,40 @@ fn epoch_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Where a recording's audio comes from.
+enum Source {
+    /// A capture command and the thread reading its stdout.
+    Process {
+        child: Child,
+        reader: Option<JoinHandle<()>>,
+    },
+    /// macOS: this process's own capture session.
+    #[cfg(target_os = "macos")]
+    Native(crate::mic_mac::Capture),
+}
+
+impl Source {
+    /// Stops capture; the byte channel closes once the rest is delivered.
+    fn stop(&mut self) {
+        match self {
+            Source::Process { child, reader } => {
+                let _ = child.kill();
+                let _ = child.wait();
+                if let Some(reader) = reader.take() {
+                    let _ = reader.join();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Source::Native(capture) => capture.stop(),
+        }
+    }
+}
+
 /// One recording in progress.
 pub struct Recording {
     uuid: String,
-    child: Child,
+    source: Source,
     bytes: Receiver<Vec<u8>>,
-    reader: Option<JoinHandle<()>>,
     chunker: Chunker,
     index: u64,
     started: Instant,
@@ -134,9 +162,35 @@ impl Recording {
         });
         Ok(Recording {
             uuid,
-            child,
+            source: Source::Process {
+                child,
+                reader: Some(reader),
+            },
             bytes: rx,
-            reader: Some(reader),
+            chunker: Chunker::default(),
+            index: 0,
+            started: Instant::now(),
+            started_at: clock_ms,
+            first_chunk: None,
+            device,
+        })
+    }
+
+    /// macOS: captures the microphone called `input` (or the default) in this
+    /// process, which starts sooner than a capture command.
+    #[cfg(target_os = "macos")]
+    pub fn start_native(
+        uuid: String,
+        input: Option<&str>,
+        device: String,
+        clock_ms: f64,
+    ) -> Result<Recording, String> {
+        let (tx, rx) = mpsc::channel();
+        let capture = crate::mic_mac::Capture::start(input, tx)?;
+        Ok(Recording {
+            uuid,
+            source: Source::Native(capture),
+            bytes: rx,
             chunker: Chunker::default(),
             index: 0,
             started: Instant::now(),
@@ -194,8 +248,7 @@ impl Recording {
     }
 
     fn failure(&mut self, why: &str) -> Event {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.source.stop();
         Event::MicFailed {
             uuid: self.uuid.clone(),
             error: why.to_string(),
@@ -205,11 +258,7 @@ impl Recording {
     /// Ends the recording: stops capture, sends what is left, then reports.
     pub fn stop(mut self, clock_ms: f64) -> Vec<Event> {
         let stop_at = Instant::now();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        self.source.stop();
         let mut events = Vec::new();
         let mut rest = Vec::new();
         while let Ok(more) = self.bytes.try_recv() {
@@ -249,8 +298,7 @@ impl Recording {
 
 impl Drop for Recording {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.source.stop();
     }
 }
 

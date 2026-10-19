@@ -1,10 +1,14 @@
-#![forbid(unsafe_code)]
+// Safe Rust, except mic_mac.rs: objc2 marks AVFoundation calls unsafe until
+// they are reviewed upstream, so that module allows it (see its header).
+#![deny(unsafe_code)]
 //! Stands in for Wispr Flow's hidden windows while they are not rendered:
 //! records the microphone for its dictation and draws the speech indicator.
 //! Spawned by the Electron shim (wispr-headless/shim.js), which speaks to it
 //! in JSON lines on stdin/stdout. Exits when stdin closes.
 
 mod bar;
+#[cfg(target_os = "macos")]
+mod mic_mac;
 mod mics;
 #[cfg(target_os = "macos")]
 mod pill_mac;
@@ -146,6 +150,32 @@ fn capture_for(cfg: &Config, chosen: Option<&mics::Native>) -> (Vec<String>, Str
         mics::Backend::Fixed => {}
     }
     (capture, device)
+}
+
+/// Starts a recording of `chosen` (see `capture_for`). On macOS the daemon
+/// captures the microphone itself, which starts sooner; the capture command
+/// (ffmpeg) is the fallback.
+fn start_recording(
+    cfg: &Config,
+    uuid: &str,
+    chosen: Option<&mics::Native>,
+    clock_ms: f64,
+    out: &Out,
+) -> Result<Recording, String> {
+    let (capture, device) = capture_for(cfg, chosen);
+    #[cfg(target_os = "macos")]
+    if mics::Backend::of(&capture) == mics::Backend::AvFoundation {
+        let input = cfg.target.as_deref().or(chosen.map(|n| n.id.as_str()));
+        match Recording::start_native(uuid.to_string(), input, device.clone(), clock_ms) {
+            Ok(r) => return Ok(r),
+            Err(_) => out.send(&Event::Log {
+                msg: "native capture failed; using the capture command".into(),
+            }),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = out;
+    Recording::start(uuid.to_string(), &capture, device, clock_ms)
 }
 
 struct Out(Arc<Mutex<std::io::Stdout>>);
@@ -293,11 +323,11 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                         out.send(&e);
                     }
                 }
-                let (capture, device) = {
+                let chosen = {
                     let inputs = inputs.lock().expect("inputs lock poisoned");
-                    capture_for(cfg, mics::choose(&ranked, &inputs))
+                    mics::choose(&ranked, &inputs).cloned()
                 };
-                match Recording::start(uuid.clone(), &capture, device, clock_ms()) {
+                match start_recording(cfg, &uuid, chosen.as_ref(), clock_ms(), out) {
                     Ok(r) => {
                         out.send(&Event::Started { uuid });
                         recording = Some(r);

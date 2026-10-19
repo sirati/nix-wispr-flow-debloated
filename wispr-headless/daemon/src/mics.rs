@@ -214,6 +214,9 @@ pub fn list(backend: Backend, program: &str) -> Vec<Native> {
                 .stderr(Stdio::null())
                 .output()
         }
+        #[cfg(target_os = "macos")]
+        Backend::AvFoundation => return crate::mic_mac::inputs(),
+        #[cfg(not(target_os = "macos"))]
         Backend::AvFoundation => Command::new(program)
             .args([
                 "-hide_banner",
