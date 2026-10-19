@@ -1,0 +1,49 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1792094642,
+        "narHash": "sha256-zp8ToDMnqZcu4o4IH9pdwXFXGp7yLm/M0dEnNWnyd7I=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "fe13242281a67641c0102cdb1087f0ebe586c7df",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "wispr-flow-linux": "wispr-flow-linux"
+      }
+    },
+    "wispr-flow-linux": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1791957388,
+        "narHash": "sha256-3pNxLUSQgUKEcsAxjfVlHogDm0aQJhoUyKwaxS8zDp0=",
+        "owner": "wispr-flow-linux",
+        "repo": "wispr-flow-linux",
+        "rev": "c7b53b995c2c09e71c6e972bdd62ac19a7557551",
+        "type": "github"
+      },
+      "original": {
+        "owner": "wispr-flow-linux",
+        "repo": "wispr-flow-linux",
+        "rev": "c7b53b995c2c09e71c6e972bdd62ac19a7557551",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

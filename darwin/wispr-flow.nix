@@ -27,15 +27,19 @@
 # https://dl.wisprflow.com/wispr-flow/darwin/arm64/RELEASES.json (currentRelease),
 # update `version` and `hash`, and check the shim's IPC names still exist in
 # the new app.asar (see the README).
-{ inputs, packages }:
+#
+# Arguments (see flake.nix, lib.macWisprFlow):
+#   native   nixpkgs for the build machine (x86_64-linux)
+#   builders trivial builders (runCommand) whose output is for aarch64-darwin
+#   darwin   nixpkgs for aarch64-darwin, for ffmpeg from the binary cache
+#   daemon   wispr-headless cross-built for aarch64-darwin
+{
+  native,
+  builders,
+  darwin,
+  daemon,
+}:
 let
-  t = import ./cross-toolchain.nix { inherit inputs; };
-  native = t.pkgs;
-  darwin = import inputs.nixpkgs {
-    system = "aarch64-darwin";
-    config.allowUnfree = true;
-  };
-
   version = "1.6.1174";
   release = native.fetchurl {
     name = "wispr-flow-darwin-arm64-${version}.zip";
@@ -43,7 +47,6 @@ let
     hash = "sha256-uNNqXjUkOS7DCHoI7/cUdzfqAAys6QUD7IjVfkiDUC0=";
   };
 
-  daemon = packages.wispr-headless-macos;
   # From the binary cache; the build machine only downloads it.
   ffmpeg = darwin.ffmpeg-headless.bin;
 
@@ -121,7 +124,7 @@ let
         ' "$res/app/package.json"
       '';
 in
-t.builders.runCommand "mac-wispr-flow"
+builders.runCommand "mac-wispr-flow"
   {
     dontPatchShebangs = true;
     meta.platforms = [ "aarch64-darwin" ];

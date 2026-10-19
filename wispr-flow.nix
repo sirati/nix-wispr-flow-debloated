@@ -18,11 +18,14 @@
 # below fail to match; fetch the new SHA256SUMS, check the lock's patch_sha256
 # against scripts/patches/v8-14.8-better-sqlite3-multiple-ciphers.patch, and
 # update them.
+#
+# flake.nix applies this to the pinned wispr-flow-linux source; the result is
+# the NixOS module.
+{ wispr-flow-linux }:
 {
   config,
   lib,
   pkgs,
-  wispr-flow-linux,
   ...
 }:
 
