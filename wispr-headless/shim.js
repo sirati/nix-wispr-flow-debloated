@@ -217,10 +217,13 @@ function watchHelper() {
   childProcess.spawn = function (command, ...rest) {
     const child = realSpawn.call(this, command, ...rest);
     try {
-      if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command)) && child.stdout) {
-        child.stdout.on("data", (chunk) => {
-          if (chunk.includes("KeypressEvent")) lastKeyAt = Date.now();
-        });
+      if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command))) {
+        // Its messages come on an extra pipe (fd 3); stdout only carries logs.
+        for (const stream of [child.stdio?.[3], child.stdout]) {
+          stream?.on("data", (chunk) => {
+            if (chunk.includes("KeypressEvent")) lastKeyAt = Date.now();
+          });
+        }
       }
     } catch {}
     return child;
