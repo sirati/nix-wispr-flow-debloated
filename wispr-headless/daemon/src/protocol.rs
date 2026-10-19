@@ -33,6 +33,11 @@ pub enum Command {
     NotifyClear,
     /// Wispr's microphone ranking (`prefs.user.rankedAudioDevices`).
     Mics { ranked: Vec<crate::mics::Ranked> },
+    /// The dictation shortcut went down: start recording ahead of Wispr.
+    Early,
+    /// Another key joined the shortcut before Wispr asked to record: drop
+    /// the early recording.
+    EarlyCancel,
     /// Internal, never from the shim: the system's inputs were listed again.
     #[serde(skip)]
     Relisted,

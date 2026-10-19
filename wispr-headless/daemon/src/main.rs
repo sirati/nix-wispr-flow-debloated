@@ -425,6 +425,19 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                     prepare(&mut ready, &ranked);
                 }
             }
+            // The shortcut went down, or Wispr's dictation began without it
+            // (a click on the bar): start ahead of Wispr's request.
+            Ok(Some(Command::Early)) => {
+                if recording.is_none() && early.is_none() {
+                    let mic = chosen(&ranked);
+                    if let Ok(r) =
+                        start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
+                    {
+                        early = Some((r, Instant::now()));
+                    }
+                }
+            }
+            Ok(Some(Command::EarlyCancel)) => early = None,
             Ok(Some(Command::Status { value })) => {
                 match value.as_str() {
                     "initializing" if recording.is_none() && early.is_none() => {

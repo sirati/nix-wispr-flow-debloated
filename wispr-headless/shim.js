@@ -207,23 +207,44 @@ function startDaemon(resourcesPath, onEvent, onExit) {
 
 // ---------------------------------------------------------------- the hook
 
-// When Wispr's helper last reported a key. The helper reports every key, so
-// nothing per key is kept or logged: only how long before a dictation starts
-// the last one came (rec.initializing's sinceKey), to measure Wispr's delay.
+// Wispr's helper reports every key to the main process; the shim reads the
+// same messages so it can start recording on the dictation shortcut itself
+// (see keyChanged in build()). Nothing per key is logged or kept beyond the
+// keys held right now; the trace only gets how long before a dictation
+// starts the last key came (rec.initializing's sinceKey).
 let lastKeyAt = 0;
+let onKey = null; // (pressed: boolean, key: number) => void, set by build()
+
+// The helper's framing: messages separated by "|", with "|" escaped as "+2"
+// and "+" as "+1" (Wispr's IPC reader).
+function helperMessages() {
+  let pending = "";
+  return (chunk) => {
+    pending += chunk.toString("utf8");
+    const parts = pending.split("|");
+    pending = parts.pop();
+    return parts.map((p) => p.replaceAll("+2", "|").replaceAll("+1", "+"));
+  };
+}
 
 function watchHelper() {
   const realSpawn = childProcess.spawn;
   childProcess.spawn = function (command, ...rest) {
     const child = realSpawn.call(this, command, ...rest);
     try {
-      if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command))) {
+      if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command)) && child.stdio?.[3]) {
         // Its messages come on an extra pipe (fd 3); stdout only carries logs.
-        for (const stream of [child.stdio?.[3], child.stdout]) {
-          stream?.on("data", (chunk) => {
-            if (chunk.includes("KeypressEvent")) lastKeyAt = Date.now();
-          });
-        }
+        const split = helperMessages();
+        child.stdio[3].on("data", (chunk) => {
+          for (const message of split(chunk)) {
+            if (!message.includes("KeypressEvent")) continue;
+            lastKeyAt = Date.now();
+            try {
+              const p = JSON.parse(message)?.HelperAPIRequest?.KeypressEvent?.payload;
+              if (p && typeof p.key === "number") onKey?.(!/release/.test(String(p.eventType)), p.key);
+            } catch {}
+          }
+        });
       }
     } catch {}
     return child;
@@ -279,6 +300,45 @@ function build(electron) {
   // would (daemon/src/mics.rs). Device IDs are Chromium's, so names go along,
   // with the raw label of each device Wispr's page last listed.
   let sentMics = null;
+  // Start recording on the dictation shortcut itself, as Wispr starts its
+  // dictation on it: Wispr keys its shortcuts (prefs.user.shortcuts) by the
+  // key codes held, sorted as strings and joined with "+". If another key
+  // joins before Wispr asks to record, the combination is no longer a
+  // dictation (fn+F-key, say) and the early recording is dropped; once Wispr
+  // has asked, only Wispr stops it.
+  const DICTATION_ACTIONS = new Set(["ptt", "popo", "command"]);
+  let dictationKeys = new Set();
+  const held = new Set();
+  let early = false;
+  let earlyAt = 0;
+  function updateShortcuts(state) {
+    const shortcuts = state?.prefs?.user?.shortcuts;
+    if (!shortcuts || typeof shortcuts !== "object") return;
+    dictationKeys = new Set(Object.entries(shortcuts).filter(([, action]) => DICTATION_ACTIONS.has(action)).map(([keys]) => keys));
+  }
+  onKey = (pressed, key) => {
+    if (!daemon || !headless) return;
+    if (!pressed) {
+      held.delete(key);
+      return;
+    }
+    held.add(key);
+    const combo = [...held].map(String).sort().join("+");
+    // An early start counts until Wispr asks to record or the daemon gives
+    // up on it (EARLY_START_PATIENCE there).
+    const pending = early && !session && Date.now() - earlyAt < 500;
+    if (dictationKeys.has(combo)) {
+      if (!pending && !session) {
+        early = true;
+        earlyAt = Date.now();
+        daemon.send({ op: "early" });
+      }
+    } else if (pending) {
+      early = false;
+      daemon.send({ op: "earlyCancel" });
+    }
+  };
+
   function updateMics(state) {
     const user = state?.prefs?.user;
     if (!Array.isArray(user?.rankedAudioDevices)) return;
@@ -464,6 +524,7 @@ function build(electron) {
       if (ch === "zubridge:state-update") {
         this.ack(a);
         updateMics(a?.state);
+        updateShortcuts(a?.state);
         if (this.role === "status" && a?.state) {
           const changed = this.lastState ? changedPaths(this.lastState, a.state) : [];
           this.prevState = this.lastState;
@@ -539,7 +600,10 @@ function build(electron) {
       if (ch === "dictation:audioStart" || ch === "dictation:audioStop" || HUB_SOUNDS[ch] || ch === "dictation:audioSetup") return lazy.route(ch, args);
       if (/^media:(start|stop)Meeting/.test(ch)) lazy.meeting = ch.startsWith("media:start");
     }
-    if (ch === "zubridge:state-update") updateMics(args[0]?.state);
+    if (ch === "zubridge:state-update") {
+      updateMics(args[0]?.state);
+      updateShortcuts(args[0]?.state);
+    }
     if (lazy.role === "status" && ch === "zubridge:state-update" && args[0]?.state) {
       lazy.prevState = lazy.lastState;
       lazy.lastState = args[0].state;
