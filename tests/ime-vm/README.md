@@ -1,6 +1,6 @@
 # GNOME input-method VM tests
 
-A NixOS VM with GNOME on Wayland, fcitx5 configured like the laptop, and
+A NixOS VM with GNOME on Wayland, fcitx5 configured as wispr-ime.nix does, and
 terminals whose input is captured to a file. `default.nix` is the harness,
 `prelude.py` its Python helpers; `wispr-ime.nix` plus `wispr-ime-test.py` test
 wispr-ime and the patched Wispr helper on top of it.
@@ -19,7 +19,7 @@ apostrophe then `a` on the gb-intl layout, which must give `á`:
 
 | Setup | Result |
 |---|---|
-| `GTK_IM_MODULE=fcitx` (the laptop before wispr-ime) | works, but apps bypass GNOME's own input path |
+| `GTK_IM_MODULE=fcitx` (the usual NixOS setup) | works, but apps bypass GNOME's own input path |
 | text-input-v3 path, `SKIP_FCITX_USER_PATH=1` | `'a`: dead |
 | same, fcitx5 allowed to write the address file | works |
 | same, a static address file written before gnome-shell starts | dead (see below) |

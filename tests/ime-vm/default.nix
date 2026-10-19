@@ -8,7 +8,7 @@
 # Arguments
 #   imVariant        "gtk-module" | "wayland-text-input"
 #                      gtk-module: GTK_IM_MODULE=fcitx QT_IM_MODULE=fcitx XMODIFIERS=@im=fcitx
-#                                  session-wide (what the laptop does today).
+#                                  session-wide (the usual NixOS setup).
 #                      wayland-text-input: only XMODIFIERS=@im=fcitx; apps talk text-input-v3 to
 #                                  mutter, mutter talks the IBus protocol to fcitx5.
 #   extraModules     extra NixOS modules appended to the machine's modules.
@@ -16,7 +16,7 @@
 #   name             test name (also used for the derivation name).
 #   fcitxUnitExtra   attrset merged into systemd.user.services.fcitx5 (convenience for experiments;
 #                    anything else can go through extraModules).
-#   fcitxArgs        arguments of the fcitx5 ExecStart (default "-r", as on the laptop; e.g.
+#   fcitxArgs        arguments of the fcitx5 ExecStart (default "-r", as in wispr-ime.nix; e.g.
 #                    "-r --verbose ibus=5" for the IBus frontend's debug log).
 {
   pkgs,
@@ -59,7 +59,7 @@ let
         };
       };
 
-      # Session-wide environment, like the laptop (pam_env => GDM session => systemd user manager).
+      # Session-wide environment, as NixOS sets it (pam_env => GDM session => systemd user manager).
       environment.sessionVariables =
         {
           XMODIFIERS = "@im=fcitx";
@@ -69,7 +69,7 @@ let
           QT_IM_MODULE = "fcitx";
         };
 
-      # Same as the laptop: fcitx5 runs as a user service ...
+      # As in wispr-ime.nix: fcitx5 runs as a user service ...
       systemd.user.services.fcitx5 = lib.mkMerge [
         {
           description = "Fcitx5 input method";

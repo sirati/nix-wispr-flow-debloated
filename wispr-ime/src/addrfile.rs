@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn names_match_the_files_on_the_laptop() {
+    fn names_match_real_address_files() {
         let p = paths(&env());
         assert_eq!(
             p,
@@ -280,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_file_from_the_laptop_parses() {
+    fn a_real_stale_file_parses() {
         let text = "# This file is created by ibus-daemon, please do not modify it.\n\
                     IBUS_ADDRESS=unix:abstract=/home/alice/.cache/ibus/dbus-AbCdEfGh,guid=0123abcd\n\
                     IBUS_DAEMON_PID=3333\n";

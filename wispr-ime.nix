@@ -55,7 +55,7 @@ in
       # Restart=always and --keep: fcitx5 exits with status 0 when its display
       # connection goes away or it is asked to quit, and Restart=on-failure
       # treats that as success and leaves it dead, which took input methods
-      # down on the laptop until someone started it by hand. --keep stops the
+      # down until someone started it by hand. --keep stops the
       # display-loss exit; Restart=always covers every other clean exit.
       systemd.user.services.fcitx5 = {
         Unit = {

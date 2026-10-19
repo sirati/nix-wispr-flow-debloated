@@ -10,7 +10,7 @@ import ./default.nix {
   inherit pkgs;
   name = "ime-vm-wispr-ime";
   imVariant = "wayland-text-input";
-  # Same as the laptop (wispr-ime.nix at the repo root): wispr-ime answers GNOME's
+  # As in wispr-ime.nix at the repo root: wispr-ime answers GNOME's
   # IBus, so fcitx5's own frontend stays out of its way; --keep and Restart=always
   # bring fcitx5 back after the clean exits it makes on its own.
   fcitxArgs = "-r --keep --disable ibusfrontend";
@@ -20,7 +20,7 @@ import ./default.nix {
     (
       { ... }:
       {
-        # The same shape as the laptop's home-manager services (wispr-ime.nix).
+        # The same shape as the home-manager services in wispr-ime.nix.
         systemd.user.services.wispr-ime = {
           description = "IBus front for GNOME that hands input to fcitx5";
           wantedBy = [ "graphical-session.target" ];

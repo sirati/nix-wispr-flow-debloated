@@ -132,7 +132,7 @@ with subtest("an open terminal keeps working after fcitx5 (and so wispr-ime) res
     assert text.startswith("á"), f"typing did not recover after the restart: {text!r}"
 
 with subtest("fcitx5 quitting on its own: it comes back, wispr-ime follows, an open terminal keeps typing"):
-    # What happened on the laptop: fcitx5 exited with status 0 and stayed dead.
+    # What happened in practice: fcitx5 exited with status 0 and stayed dead.
     out, unit = start_terminal("kgx", "selfquit")
     old = run_in_session("systemctl --user show -p MainPID --value fcitx5.service").strip()
     run_in_session(f"kill -TERM {old}")

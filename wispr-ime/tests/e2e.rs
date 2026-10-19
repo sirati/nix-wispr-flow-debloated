@@ -415,7 +415,7 @@ async fn daemon_exits_when_fcitx5_goes_away() {
     assert!(!status.success(), "{status:?}");
 }
 
-/// The failure seen on the laptop: the session bus is replaced, but the old
+/// A failure seen in practice: the session bus is replaced, but the old
 /// broker lives on, so the daemon's connection stays open and error-free while
 /// nobody else can reach it. Only comparing bus ids notices.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -6,7 +6,7 @@
 # (`document.visibilityState === "visible"`) because `paintWhenInitiallyHidden`
 # defaults to true, so the Hub keeps rendering: its onboarding pages play a
 # looping, muted, autoplay 1080x1080 video (waveform.mp4 and others) that is
-# decoded in software. Measured on the laptop: one renderer at 25-38% of a
+# decoded in software. Measured on a laptop: one renderer at 25-38% of a
 # core, 1200 wakeups/s, all day, with nothing on screen.
 #
 # With `paintWhenInitiallyHidden: false` the page starts out hidden, Chromium
