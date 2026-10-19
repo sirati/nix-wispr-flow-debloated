@@ -204,3 +204,62 @@ fn closing_stdin_ends_the_process() {
     }
     panic!("daemon kept running after stdin closed");
 }
+
+/// Everything decoded from the chunks of one session, until its report.
+fn collect_session(d: &mut Daemon, uuid: &str) -> (Vec<u8>, Vec<u64>) {
+    let mut got = Vec::new();
+    let mut indices = Vec::new();
+    loop {
+        let v = d.next();
+        match v["op"].as_str() {
+            Some("chunk") => {
+                assert_eq!(v["uuid"], uuid);
+                indices.push(v["index"].as_u64().unwrap());
+                got.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(v["pcm"].as_str().unwrap())
+                        .unwrap(),
+                );
+            }
+            Some("done") => return (got, indices),
+            Some("log") => {}
+            other => panic!("unexpected message {other:?}: {v}"),
+        }
+    }
+}
+
+#[test]
+fn recording_starts_when_the_dictation_does_and_keeps_that_audio() {
+    let (_dir, path, pcm) = tone_file(2_000);
+    let mut d = Daemon::start(&format!("cat {path}"));
+    // Wispr's dictation begins; its request to record comes a bit later.
+    d.send(r#"{"op":"status","value":"initializing"}"#);
+    std::thread::sleep(Duration::from_millis(150));
+    d.send(r#"{"op":"start","uuid":"early-1"}"#);
+    assert_eq!(d.next_op("started")["uuid"], "early-1");
+    std::thread::sleep(Duration::from_millis(100));
+    d.send(r#"{"op":"stop"}"#);
+    let (got, indices) = collect_session(&mut d, "early-1");
+    assert_eq!(got, pcm, "the audio from before the request is all there");
+    assert_eq!(indices, (0..indices.len() as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn an_early_start_without_a_request_is_dropped() {
+    let (_dir, path, pcm) = tone_file(2_000);
+    let mut d = Daemon::start(&format!("cat {path}"));
+    d.send(r#"{"op":"status","value":"initializing"}"#);
+    // Longer than the daemon waits for the request: nothing may come out.
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        d.lines.try_recv().is_err(),
+        "an unclaimed early start sends nothing"
+    );
+    // A later dictation records afresh.
+    d.send(r#"{"op":"start","uuid":"late-1"}"#);
+    assert_eq!(d.next_op("started")["uuid"], "late-1");
+    std::thread::sleep(Duration::from_millis(100));
+    d.send(r#"{"op":"stop"}"#);
+    let (got, _) = collect_session(&mut d, "late-1");
+    assert_eq!(got, pcm);
+}

@@ -200,6 +200,12 @@ impl Recording {
         })
     }
 
+    /// Gives a recording started ahead of Wispr's request its session; the
+    /// audio since its start stays and goes out as the first chunks.
+    pub fn adopt(&mut self, uuid: String) {
+        self.uuid = uuid;
+    }
+
     pub fn uuid(&self) -> &str {
         &self.uuid
     }

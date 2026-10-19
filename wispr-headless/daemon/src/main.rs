@@ -220,6 +220,9 @@ impl Ready {
     }
 }
 
+/// How long an early start waits for Wispr's request to record.
+const EARLY_START_PATIENCE: Duration = Duration::from_millis(500);
+
 struct Out(Arc<Mutex<std::io::Stdout>>);
 
 impl Out {
@@ -362,9 +365,19 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
 
     out.send(&Event::Ready);
     let mut recording: Option<Recording> = None;
+    // Started early, when Wispr's dictation begins ("initializing"), before
+    // it asks to record (about 25 ms later): handed over with everything it
+    // heard, or dropped if no request comes.
+    let mut early: Option<(Recording, Instant)> = None;
+    let chosen = |ranked: &[mics::Ranked]| {
+        let inputs = inputs.lock().expect("inputs lock poisoned");
+        mics::choose(ranked, &inputs).cloned()
+    };
     loop {
         let wait = if recording.is_some() {
             Duration::from_millis(5)
+        } else if early.is_some() {
+            Duration::from_millis(25)
         } else {
             Duration::from_secs(3600)
         };
@@ -377,11 +390,17 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                         out.send(&e);
                     }
                 }
-                let chosen = {
-                    let inputs = inputs.lock().expect("inputs lock poisoned");
-                    mics::choose(&ranked, &inputs).cloned()
+                let started = match early.take() {
+                    Some((mut r, _)) => {
+                        r.adopt(uuid.clone());
+                        Ok(r)
+                    }
+                    None => {
+                        let mic = chosen(&ranked);
+                        start_recording(cfg, &uuid, mic.as_ref(), clock_ms(), out, &mut ready)
+                    }
                 };
-                match start_recording(cfg, &uuid, chosen.as_ref(), clock_ms(), out, &mut ready) {
+                match started {
                     Ok(r) => {
                         out.send(&Event::Started { uuid });
                         recording = Some(r);
@@ -407,6 +426,18 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 }
             }
             Ok(Some(Command::Status { value })) => {
+                match value.as_str() {
+                    "initializing" if recording.is_none() && early.is_none() => {
+                        let mic = chosen(&ranked);
+                        if let Ok(r) =
+                            start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
+                        {
+                            early = Some((r, Instant::now()));
+                        }
+                    }
+                    "idle" | "dismissed" | "error" => early = None,
+                    _ => {}
+                }
                 let _ = pill_tx.send(PillCommand::Status(value));
             }
             Ok(Some(Command::Level { value })) => {
@@ -449,6 +480,14 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 let _ = pill_tx.send(PillCommand::NotifyClear);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        // No request to record followed: stop and forget what it heard.
+        if early
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > EARLY_START_PATIENCE)
+        {
+            early = None;
+            let _ = relist.send(());
         }
         if let Some(r) = recording.as_mut() {
             match r.poll(Duration::from_millis(15)) {
