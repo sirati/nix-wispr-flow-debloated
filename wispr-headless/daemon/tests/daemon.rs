@@ -17,7 +17,8 @@ struct Daemon {
 /// The binary under test. Cross-built tests run on another machine than the
 /// build, so its path can be given there.
 fn binary() -> String {
-    std::env::var("WISPR_HEADLESS_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_wispr-headless").into())
+    std::env::var("WISPR_HEADLESS_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_wispr-headless").into())
 }
 
 impl Daemon {

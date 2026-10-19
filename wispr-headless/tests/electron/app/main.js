@@ -53,6 +53,8 @@ ipcMain.on("dictation:recordingDone", (_e, a) => { done = a; });
 ipcMain.on("status:reportAlphaCatchRects", () => {});
 let startClicks = 0;
 ipcMain.on("status:startClicked", () => startClicks++);
+let cancelled = null;
+ipcMain.on("status:cancelClicked", (_e, a) => { cancelled = a; });
 
 const page = (role) => path.join(__dirname, "renderer", role, "index.html");
 const make = (role, title) =>
@@ -110,12 +112,26 @@ app.whenReady().then(async () => {
 
   // Dictation through the recorder.
   hub.webContents.send("dictation:audioStart", { useOpus: false, transcriptionEntityUuid: "dict-1" });
-  status.webContents.send("status:dictationStatus", "recording");
+  // Wispr's sequence for a hands-free dictation (double tap).
+  status.webContents.send("status:dictationStatus", "initializing");
+  status.webContents.send("status:popo");
+  status.webContents.send("status:dictationStatus", "listening");
+  status.webContents.send("status:micActive", true);
+  status.webContents.send("status:micSilence", false);
+  status.webContents.send("status:commandModeStatus", false);
+  status.webContents.send("status:audioLevel", 0.5);
   await until("started", () => started);
   check(started?.transcriptionEntityUuid === "dict-1", "recordingStarted came back for the session");
   await until("chunks", () => chunks.length >= 10);
+  check(renderers() === 0, "hands-free dictation draws in Rust, no status page");
+  if (xdotool) {
+    // The hands-free pill: 103x30 at the bottom centre; cancel is its left button.
+    execSync(`${xdotool} mousemove 603 775 click 1`);
+    await until("cancel", () => cancelled !== null, 3_000);
+    check(cancelled === "user_action_cancel_button", `the cancel button sends status:cancelClicked (${cancelled})`);
+  }
   hub.webContents.send("dictation:audioStop");
-  status.webContents.send("status:dictationStatus", "flushing");
+  status.webContents.send("status:dictationStatus", "processing");
   await until("done", () => done);
   check(done?.transcriptionEntityUuid === "dict-1" && done?.micAcquisitionSucceeded === true, "recordingDone came back with timing");
   check(chunks.length >= 10 && chunks.every((c, i) => c.index === i), `chunks in order from 0 (${chunks.length})`);

@@ -130,6 +130,7 @@ fn play(cfg: &Config, name: &str, out: &Out) {
         "stop" => "dictation-stop.wav",
         "paste" => "paste.wav",
         "achievement" => "achievement.wav",
+        "popo" => "popo-lock.wav",
         _ => return,
     };
     let path = format!("{dir}/{file}");
@@ -259,6 +260,18 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             }
             Ok(Some(Command::Bar { visible })) => {
                 let _ = pill_tx.send(PillCommand::RestingBar(visible));
+            }
+            Ok(Some(Command::Popo)) => {
+                let _ = pill_tx.send(PillCommand::Popo);
+            }
+            Ok(Some(Command::Silence { value })) => {
+                let _ = pill_tx.send(PillCommand::Silence(value));
+            }
+            Ok(Some(Command::Commanding { active })) => {
+                let _ = pill_tx.send(PillCommand::CommandMode(active));
+            }
+            Ok(Some(Command::Indicator { state })) => {
+                let _ = pill_tx.send(PillCommand::Indicator(state));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }

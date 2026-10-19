@@ -103,6 +103,25 @@ const STATUS_DROP = new Set(["status:monitorChanged", "notification:clear", "zub
 // Store changes that may make the status window show something.
 const STATUS_WAKE_KEYS = [/^remoteNotifications\.new/, /^remoteNotifications\.unreadCount/, /^subscription\.(tier|daysLeft|gracePeriodEndsAt)/, /[Ll]imit|[Qq]uota|[Nn]udge|[Rr]eminder/];
 
+// Status-window messages the Rust bar follows (see daemon/src/bar.rs), as
+// daemon commands; null for anything else.
+function barCommand(ch, a) {
+  switch (ch) {
+    case "status:dictationStatus": return { op: "status", value: String(a) };
+    case "status:popo": return { op: "popo" };
+    case "status:audioLevel": return { op: "level", value: typeof a === "number" ? a : Number(a?.level ?? a?.value ?? 0) };
+    case "status:micActive": return { op: "mic", active: Boolean(a) };
+    case "status:micSilence": return { op: "silence", value: Boolean(a) };
+    case "status:commandModeStatus": return { op: "commanding", active: Boolean(a) };
+    // Other indicator states (polish progress, "Cleaned up!") are the page's.
+    case "status:setIndicatorState": return a?.state === "resting" ? { op: "indicator", state: "resting" } : null;
+  }
+  return null;
+}
+// Dictation statuses only Wispr's page shows: polish results, instruct mode,
+// the hotkey reminder.
+const PAGE_STATUSES = /^(polish_|instruct_chat_|toggle_hotkey_reminder)/;
+
 // The value at a dotted path, or undefined. A value that was null or missing
 // before is arriving for the first time (Wispr fills placeholders at login).
 const valueAt = (obj, p) => p.split(".").reduce((o, k) => (o !== null && typeof o === "object" ? o[k] : undefined), obj);
@@ -246,6 +265,7 @@ function build(electron) {
         const status = byRole.get("status");
         if (msg.action === "start") emitFrom(status, "status:startClicked", undefined);
         else if (msg.action === "stop") emitFrom(status, "status:stopClicked", undefined);
+        else if (msg.action === "cancel") emitFrom(status, "status:cancelClicked", "user_action_cancel_button");
         break;
       }
       case "micFailed":
@@ -388,18 +408,13 @@ function build(electron) {
         return false;
       }
       if (this.role === "status") {
-        if (ch === "status:dictationStatus") {
-          daemon.send({ op: "status", value: String(a) });
-          return true;
-        }
-        if (ch === "status:audioLevel") {
-          daemon.send({ op: "level", value: typeof a === "number" ? a : Number(a?.level ?? a?.value ?? 0) });
-          return true;
-        }
-        if (ch === "status:micActive") {
-          daemon.send({ op: "mic", active: Boolean(a) });
-          return true;
-        }
+        const cmd = barCommand(ch, a);
+        if (cmd) daemon.send(cmd);
+        // The page plays this one itself when it is up.
+        if (ch === "status:popo") daemon.send({ op: "sound", name: "popo" });
+        if (ch === "status:dictationStatus") return !PAGE_STATUSES.test(String(a));
+        if (ch === "status:instructModeStatus") return !a;
+        if (cmd) return true;
         if (ch === "status:playPasteSound") {
           daemon.send({ op: "sound", name: "paste" });
           return true;
@@ -429,7 +444,8 @@ function build(electron) {
       updateBar(args[0].state);
     }
     if (lazy.role === "status") {
-      if (ch === "status:dictationStatus") daemon?.send({ op: "status", value: String(args[0]) });
+      const cmd = barCommand(ch, args[0]);
+      if (cmd) daemon?.send(cmd);
       if (ch === "notification:show") { lazy.notificationActive = true; lazy.checkStatusIdle(); }
       if (ch === "notification:clear") { lazy.notificationActive = false; lazy.checkStatusIdle(); }
       if (ch === "status:setReminders") { lazy.remindersActive = args[0]?.reminders?.length > 0; lazy.checkStatusIdle(); }

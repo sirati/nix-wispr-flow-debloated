@@ -11,15 +11,23 @@ pub enum Command {
     Start { uuid: String },
     /// `dictation:audioStop`.
     Stop,
-    /// `status:dictationStatus`: idle, recording, reconnecting, flushing,
-    /// compressing, or anything newer.
+    /// `status:dictationStatus`: initializing, listening, stopping,
+    /// processing, retrying, idle, dismissed, error (others are ignored).
     Status { value: String },
+    /// `status:popo`: the dictation is hands-free.
+    Popo,
+    /// `status:micSilence`.
+    Silence { value: bool },
+    /// `status:commandModeStatus`.
+    Commanding { active: bool },
+    /// `status:setIndicatorState`; only "resting" reaches us.
+    Indicator { state: String },
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while
     /// Wispr's own status window is rendering.
     Pill { enabled: bool },
-    /// Play one of Wispr's sounds: start, stop, paste, achievement.
+    /// Play one of Wispr's sounds: start, stop, paste, achievement, popo.
     Sound { name: String },
     /// Whether Wispr shows its resting bar when idle.
     Bar { visible: bool },
@@ -70,7 +78,8 @@ pub enum Event {
         uuid: String,
         error: String,
     },
-    /// The bar was clicked: "start" from rest, "stop" while recording.
+    /// The bar was clicked: "start" from rest, "stop" while recording (or
+    /// hands-free accept), "cancel" for the hands-free cancel button.
     Click {
         action: String,
     },
@@ -109,6 +118,22 @@ mod tests {
         assert_eq!(
             parse(r#"{"op":"bar","visible":true}"#).unwrap(),
             Command::Bar { visible: true }
+        );
+        // The shim's barCommand() names.
+        assert_eq!(parse(r#"{"op":"popo"}"#).unwrap(), Command::Popo);
+        assert_eq!(
+            parse(r#"{"op":"silence","value":true}"#).unwrap(),
+            Command::Silence { value: true }
+        );
+        assert_eq!(
+            parse(r#"{"op":"commanding","active":true}"#).unwrap(),
+            Command::Commanding { active: true }
+        );
+        assert_eq!(
+            parse(r#"{"op":"indicator","state":"resting"}"#).unwrap(),
+            Command::Indicator {
+                state: "resting".into()
+            }
         );
         assert!(parse(r#"{"op":"nonsense"}"#).is_err());
     }

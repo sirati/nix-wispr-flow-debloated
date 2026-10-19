@@ -2,32 +2,31 @@
 //!
 //! It is an X11 window (XWayland on GNOME and KDE): GNOME keeps no native
 //! Wayland window above others, and an override-redirect X11 window is never
-//! managed, focused or listed. Its input region is the drawn bar only, so
+//! managed, focused or listed. Its input region is the drawn pill only, so
 //! clicks next to it go through. A separate thread waits for X events, so a
 //! resting bar costs no wakeups. If there is no X display, the bar is off.
 //!
 //! Sizes are multiplied by the display scale (Xft.dpi / 96, so 2 on a 200 %
-//! screen).
+//! screen). X's core drawing writes pixels without blending, so shapes on the
+//! pill are composited over its colour first.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc as Shared;
+use std::sync::{Arc as Shared, Mutex};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CreateGCAux,
-    CreateWindowAux, EventMask, Rectangle, Window, WindowClass,
+    Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CoordMode,
+    CreateGCAux, CreateWindowAux, EventMask, Point, PolyShape, Rectangle, Window, WindowClass,
 };
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
 use crate::bar::{
-    click_action, dot_alpha, BarState, Frame, Mode, PillCommand, BAR_GAP, BORDER, BOTTOM_MARGIN,
-    DOT, DOT_STEP, FRAME, WINDOW,
+    click_action, over, BarState, Frame, Mode, PillCommand, Shape, BOTTOM_MARGIN, FRAME, MAX_SIZE,
 };
-use crate::wave;
 
 /// Display scale from an X resource string (`Xft.dpi: 192` gives 2).
 pub fn scale_from_resources(resources: &str) -> f64 {
@@ -39,7 +38,8 @@ pub fn scale_from_resources(resources: &str) -> f64 {
         .unwrap_or(1.0)
 }
 
-/// Device-pixel geometry for one display scale.
+/// Device-pixel geometry for one display scale: a window as large as the
+/// largest pill, each pill centred on its bottom line.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Geometry {
     pub scale: f64,
@@ -51,14 +51,13 @@ impl Geometry {
     pub fn new(scale: f64) -> Geometry {
         Geometry {
             scale,
-            width: px(WINDOW.0, scale),
-            height: px(WINDOW.1, scale),
+            width: px(MAX_SIZE.0, scale),
+            height: px(MAX_SIZE.1, scale),
         }
     }
 
-    /// The part of the window a mode draws on, centred on the bottom line.
-    pub fn body(&self, mode: Mode) -> Rectangle {
-        let (w, h) = mode.size();
+    /// A pill of `(w, h)` CSS pixels, in window pixels.
+    pub fn body(&self, (w, h): (f64, f64)) -> Rectangle {
         let (w, h) = (px(w, self.scale), px(h, self.scale));
         Rectangle {
             x: ((self.width - w) / 2) as i16,
@@ -83,39 +82,42 @@ struct Surface {
 }
 
 /// Premultiplied ARGB, as a 32-bit visual expects.
-fn argb(a: u8, r: u8, g: u8, b: u8) -> u32 {
+fn argb([r, g, b, a]: [u8; 4]) -> u32 {
     let pm = |c: u8| (u32::from(c) * u32::from(a) / 255) as u8;
     u32::from_be_bytes([a, pm(r), pm(g), pm(b)])
 }
 
-/// A rounded bar: two half circles and the rectangle between them.
+/// A rounded bar along its long side: two half circles and the rectangle
+/// between them (a circle when square).
 fn capsule(r: Rectangle) -> (Vec<Arc>, Rectangle) {
-    let d = r.height;
-    let arcs = vec![
-        Arc {
-            x: r.x,
-            y: r.y,
-            width: d,
-            height: d,
-            angle1: 0,
-            angle2: 360 * 64,
-        },
-        Arc {
-            x: r.x + (r.width - d) as i16,
-            y: r.y,
-            width: d,
-            height: d,
-            angle1: 0,
-            angle2: 360 * 64,
-        },
-    ];
-    let mid = Rectangle {
-        x: r.x + (d / 2) as i16,
-        y: r.y,
-        width: r.width - d,
-        height: r.height,
+    let d = r.width.min(r.height);
+    let circle = |x: i16, y: i16| Arc {
+        x,
+        y,
+        width: d,
+        height: d,
+        angle1: 0,
+        angle2: 360 * 64,
     };
-    (arcs, mid)
+    if r.width >= r.height {
+        let arcs = vec![circle(r.x, r.y), circle(r.x + (r.width - d) as i16, r.y)];
+        let mid = Rectangle {
+            x: r.x + (d / 2) as i16,
+            y: r.y,
+            width: r.width - d,
+            height: r.height,
+        };
+        (arcs, mid)
+    } else {
+        let arcs = vec![circle(r.x, r.y), circle(r.x, r.y + (r.height - d) as i16)];
+        let mid = Rectangle {
+            x: r.x,
+            y: r.y + (d / 2) as i16,
+            width: r.width,
+            height: r.height - d,
+        };
+        (arcs, mid)
+    }
 }
 
 fn read_scale(conn: &RustConnection, root: Window) -> f64 {
@@ -203,7 +205,7 @@ impl Surface {
         Ok(s)
     }
 
-    /// Clicks are taken only on the drawn bar.
+    /// Clicks are taken only on the drawn pill.
     fn set_input(&mut self, area: Option<Rectangle>) {
         let key = area.map(|r| (r.x, r.y, r.width, r.height));
         if key.is_some() && self.input == key {
@@ -235,44 +237,65 @@ impl Surface {
         self.mapped = visible;
     }
 
-    fn fill(&self, color: u32, rects: &[Rectangle]) {
+    fn color(&self, color: [u8; 4]) {
         let _ = self
             .conn
-            .change_gc(self.gc, &ChangeGCAux::new().foreground(color));
-        let _ = self.conn.poly_fill_rectangle(self.window, self.gc, rects);
+            .change_gc(self.gc, &ChangeGCAux::new().foreground(argb(color)));
     }
 
-    fn fill_arcs(&self, color: u32, arcs: &[Arc]) {
-        let _ = self
-            .conn
-            .change_gc(self.gc, &ChangeGCAux::new().foreground(color));
-        let _ = self.conn.poly_fill_arc(self.window, self.gc, arcs);
-    }
-
-    fn fill_capsule(&self, color: u32, r: Rectangle) {
-        let (arcs, mid) = capsule(r);
-        self.fill_arcs(color, &arcs);
-        self.fill(color, &[mid]);
-    }
-
-    /// Wispr's outlined, translucent body. X writes pixels without blending,
-    /// so the inner fill replaces the outline colour inside it.
-    fn body(&self, area: Rectangle) {
-        self.fill_capsule(argb(0xc0, 0xaa, 0xaa, 0xaa), area);
-        let b = px(BORDER, self.geo.scale);
-        let inner = Rectangle {
-            x: area.x + b as i16,
-            y: area.y + b as i16,
-            width: area.width.saturating_sub(2 * b),
-            height: area.height.saturating_sub(2 * b),
+    /// An unrotated shape filled with `color`, inset by `inset` pixels.
+    fn fill_box(&self, s: &Shape, origin: (f64, f64), inset: f64, color: [u8; 4]) {
+        let k = self.geo.scale;
+        let x = origin.0 + (s.cx - s.w / 2.0) * k + inset;
+        let y = origin.1 + (s.cy - s.h / 2.0) * k + inset;
+        let r = Rectangle {
+            x: x.round() as i16,
+            y: y.round() as i16,
+            width: (s.w * k - 2.0 * inset).round().max(1.0) as u16,
+            height: (s.h * k - 2.0 * inset).round().max(1.0) as u16,
         };
-        self.fill_capsule(argb(0x80, 0, 0, 0), inner);
+        self.color(color);
+        if s.radius * 2.0 >= s.w.min(s.h) - 0.01 {
+            let (arcs, mid) = capsule(r);
+            let _ = self.conn.poly_fill_arc(self.window, self.gc, &arcs);
+            let _ = self.conn.poly_fill_rectangle(self.window, self.gc, &[mid]);
+        } else {
+            let _ = self.conn.poly_fill_rectangle(self.window, self.gc, &[r]);
+        }
+    }
+
+    /// A rotated shape as a polygon (its rounding is too small to matter).
+    fn fill_rotated(&self, s: &Shape, origin: (f64, f64), color: [u8; 4]) {
+        let k = self.geo.scale;
+        let (sin, cos) = s.angle.sin_cos();
+        let (hw, hh) = (s.w / 2.0, s.h / 2.0);
+        let points: Vec<Point> = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+            .iter()
+            .map(|&(dx, dy)| {
+                let x = s.cx + dx * cos - dy * sin;
+                let y = s.cy + dx * sin + dy * cos;
+                Point {
+                    x: (origin.0 + x * k).round() as i16,
+                    y: (origin.1 + y * k).round() as i16,
+                }
+            })
+            .collect();
+        self.color(color);
+        let _ = self.conn.fill_poly(
+            self.window,
+            self.gc,
+            PolyShape::CONVEX,
+            CoordMode::ORIGIN,
+            &points,
+        );
     }
 
     fn draw(&mut self, f: &Frame) {
         let g = self.geo;
-        self.fill(
-            0,
+        self.color([0; 4]);
+        let _ = self.conn.poly_fill_rectangle(
+            self.window,
+            self.gc,
             &[Rectangle {
                 x: 0,
                 y: 0,
@@ -280,64 +303,27 @@ impl Surface {
                 height: g.height,
             }],
         );
-        let area = g.body(f.mode);
+        let area = g.body(f.size);
         self.set_input(Some(area));
-        if f.mode == Mode::Hidden {
-            let _ = self.conn.flush();
-            return;
-        }
-        self.body(area);
-        let cy = f64::from(area.y) + f64::from(area.height) / 2.0;
-        match f.mode {
-            Mode::Recording => {
-                let bar_w = px(wave::BAR_WIDTH, g.scale);
-                let gap = px(BAR_GAP, g.scale);
-                let total = wave::BARS as u16 * bar_w + (wave::BARS as u16 - 1) * gap;
-                let left = area.x + ((area.width - total) / 2) as i16;
-                let alpha = if f.mic_active { 0xff } else { 0x66 };
-                let rects: Vec<Rectangle> = f
-                    .heights
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &h)| {
-                        let hp =
-                            px(h.max(wave::BAR_WIDTH), g.scale).min(area.height.saturating_sub(4));
-                        Rectangle {
-                            x: left + (i as u16 * (bar_w + gap)) as i16,
-                            y: (cy - f64::from(hp) / 2.0).round() as i16,
-                            width: bar_w,
-                            height: hp,
-                        }
-                    })
-                    .collect();
-                self.fill(argb(alpha, 0xff, 0xff, 0xff), &rects);
+        let origin = (f64::from(area.x), f64::from(area.y));
+        let pill = f.shapes.first().map(|s| s.fill).unwrap_or([0; 4]);
+        for (i, s) in f.shapes.iter().enumerate() {
+            let fill = if i == 0 { s.fill } else { over(s.fill, pill) };
+            if let Some((outline, width)) = s.border {
+                self.fill_box(s, origin, 0.0, outline);
+                self.fill_box(s, origin, (width * g.scale).round().max(1.0), fill);
+            } else if s.angle.abs() < 1e-6 {
+                self.fill_box(s, origin, 0.0, fill);
+            } else {
+                self.fill_rotated(s, origin, fill);
             }
-            Mode::Working => {
-                let d = px(DOT, g.scale);
-                let step = px(DOT_STEP, g.scale) as i16;
-                let cx = area.x + (area.width / 2) as i16;
-                for i in 0..3usize {
-                    self.fill_arcs(
-                        argb((dot_alpha(f.t, i) * 255.0) as u8, 0xff, 0xff, 0xff),
-                        &[Arc {
-                            x: cx + (i as i16 - 1) * step - (d / 2) as i16,
-                            y: (cy - f64::from(d) / 2.0) as i16,
-                            width: d,
-                            height: d,
-                            angle1: 0,
-                            angle2: 360 * 64,
-                        }],
-                    );
-                }
-            }
-            Mode::Resting | Mode::Hidden => {}
         }
         let _ = self.conn.flush();
     }
 }
 
-/// Runs the bar until the command channel closes. `on_click` gets "start" or
-/// "stop" when the bar is clicked with the left button.
+/// Runs the bar until the command channel closes. `on_click` gets "start",
+/// "stop" or "cancel" when the bar is clicked with the left button.
 pub fn run(
     commands: Receiver<PillCommand>,
     log: impl Fn(String),
@@ -351,10 +337,11 @@ pub fn run(
         }
     };
     // Clicks: a thread that blocks on X events. What a click means depends on
-    // the mode, which it reads from here.
-    let shown = Shared::new(std::sync::Mutex::new(Mode::Hidden));
+    // the mode and where it lands, which it reads from here.
+    let shown = Shared::new(Mutex::new(Mode::Hidden));
     if let Some(s) = &surface {
         let conn = s.conn.clone();
+        let geo = s.geo;
         let shown = shown.clone();
         std::thread::spawn(move || {
             while let Ok(event) = conn.wait_for_event() {
@@ -363,7 +350,10 @@ pub fn run(
                         continue;
                     }
                     let mode = *shown.lock().expect("mode lock poisoned");
-                    if let Some(action) = click_action(mode) {
+                    let body = geo.body(mode.size());
+                    let x = f64::from(press.event_x - body.x) / geo.scale;
+                    let y = f64::from(press.event_y - body.y) / geo.scale;
+                    if let Some(action) = click_action(mode, x, y) {
                         on_click(action);
                     }
                 }
@@ -372,10 +362,10 @@ pub fn run(
     }
 
     let mut state = BarState::default();
-    let mut last_drawn: Option<Mode> = None;
+    let mut animated = false;
     loop {
-        // Only animated modes need frames; a resting or hidden bar sleeps.
-        let timeout = if state.shown().animated() {
+        // Only animations need frames; a resting or hidden bar sleeps.
+        let timeout = if animated {
             FRAME
         } else {
             Duration::from_secs(3600)
@@ -386,16 +376,13 @@ pub fn run(
             Err(RecvTimeoutError::Disconnected) => return,
         }
         let f = state.frame(Instant::now());
+        animated = f.animated;
         *shown.lock().expect("mode lock poisoned") = f.mode;
         if let Some(s) = surface.as_mut() {
             let show = f.mode != Mode::Hidden;
             s.set_visible(show);
-            if show && (f.mode.animated() || last_drawn != Some(f.mode)) {
+            if show {
                 s.draw(&f);
-                last_drawn = Some(f.mode);
-            }
-            if !show {
-                last_drawn = None;
             }
         }
     }
@@ -408,11 +395,12 @@ mod tests {
     #[test]
     fn resting_bar_matches_wispr_at_200_percent() {
         let g = Geometry::new(2.0);
-        let r = g.body(Mode::Resting);
+        let r = g.body(Mode::Resting.size());
         assert_eq!((r.width, r.height), (80, 16), "measured from Wispr's page");
         assert_eq!(r.y as u16 + r.height, g.height, "sits on the bottom line");
-        assert_eq!(r.x as u16 * 2 + r.width, g.width, "centred");
-        assert!(g.body(Mode::Recording).height > r.height);
+        assert!((r.x as u16 * 2 + r.width).abs_diff(g.width) <= 1, "centred");
+        let hands_free = g.body(Mode::HandsFree.size());
+        assert_eq!((hands_free.width, hands_free.height), (g.width, g.height));
     }
 
     #[test]
@@ -428,7 +416,20 @@ mod tests {
 
     #[test]
     fn colours_are_premultiplied() {
-        assert_eq!(argb(0x80, 0xff, 0xff, 0xff), 0x8080_8080);
-        assert_eq!(argb(0, 0xff, 0xff, 0xff), 0);
+        assert_eq!(argb([0xff, 0xff, 0xff, 0x80]), 0x8080_8080);
+        assert_eq!(argb([0xff, 0xff, 0xff, 0]), 0);
+    }
+
+    #[test]
+    fn capsules_follow_their_long_side() {
+        let r = Rectangle {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 10,
+        };
+        let (arcs, mid) = capsule(r);
+        assert_eq!(arcs[1].y, 6);
+        assert_eq!((mid.y, mid.height), (2, 6));
     }
 }

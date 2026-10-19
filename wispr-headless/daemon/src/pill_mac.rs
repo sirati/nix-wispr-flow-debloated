@@ -1,10 +1,11 @@
 //! The flow bar on macOS (see bar.rs for what it shows).
 //!
 //! A borderless, non-activating panel above other windows on every Space,
-//! drawn with Core Animation layers. The panel is exactly the size of the
-//! drawn bar, so clicks next to it go through. AppKit runs on the main thread:
-//! commands are forwarded to it with libdispatch, and a resting or hidden bar
-//! schedules nothing. Sizes are points, which are Wispr's CSS pixels.
+//! drawn with Core Animation layers, one per shape (y down: the root layer's
+//! geometry is flipped). The panel is exactly the size of the pill, so clicks
+//! next to it go through. AppKit runs on the main thread: commands are
+//! forwarded to it with libdispatch, and a resting or hidden bar schedules
+//! nothing. Sizes are points, which are Wispr's CSS pixels.
 //!
 //! Everything here is safe Rust through objc2's generated AppKit bindings.
 //! The one class we define, `BarView`, overrides `mouseDown:` and
@@ -24,15 +25,11 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent, NSPanel,
     NSScreen, NSStatusWindowLevel, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use objc2_quartz_core::{CALayer, CATransaction};
 
-use crate::bar::{
-    click_action, dot_alpha, BarState, Frame, Mode, PillCommand, BAR_GAP, BORDER, BOTTOM_MARGIN,
-    DOT, DOT_STEP, FRAME,
-};
-use crate::wave;
+use crate::bar::{click_action, BarState, Frame, Mode, PillCommand, Shape, BOTTOM_MARGIN, FRAME};
 
 type ClickFn = Box<dyn Fn(&'static str) + Send + Sync>;
 static ON_CLICK: OnceLock<ClickFn> = OnceLock::new();
@@ -49,9 +46,15 @@ define_class!(
 
     impl BarView {
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
-            let mode = BAR.with(|b| b.try_borrow().ok().and_then(|b| b.as_ref().map(|b| b.mode)));
-            if let (Some(action), Some(on_click)) = (mode.and_then(click_action), ON_CLICK.get()) {
+        fn mouse_down(&self, event: &NSEvent) {
+            let p = event.locationInWindow();
+            let action = BAR.with(|b| {
+                let b = b.try_borrow().ok()?;
+                let bar = b.as_ref()?;
+                let (_, h) = bar.mode.size();
+                click_action(bar.mode, p.x, h - p.y)
+            });
+            if let (Some(action), Some(on_click)) = (action, ON_CLICK.get()) {
                 on_click(action);
             }
         }
@@ -71,20 +74,29 @@ impl BarView {
     );
 }
 
-fn color(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
-    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a)
+fn rgba([r, g, b, a]: [u8; 4]) -> Retained<NSColor> {
+    let c = |v: u8| f64::from(v) / 255.0;
+    NSColor::colorWithSRGBRed_green_blue_alpha(c(r), c(g), c(b), c(a))
 }
 
-fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
-    CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+fn rotation(angle: f64) -> CGAffineTransform {
+    let (sin, cos) = angle.sin_cos();
+    CGAffineTransform {
+        a: cos,
+        b: sin,
+        c: -sin,
+        d: cos,
+        tx: 0.0,
+        ty: 0.0,
+    }
 }
 
 struct Bar {
     mtm: MainThreadMarker,
     panel: Retained<NSPanel>,
-    body: Retained<CALayer>,
-    bars: Vec<Retained<CALayer>>,
-    dots: Vec<Retained<CALayer>>,
+    root: Retained<CALayer>,
+    /// One layer per shape, reused from frame to frame.
+    layers: Vec<Retained<CALayer>>,
     state: BarState,
     /// The mode on screen.
     mode: Mode,
@@ -93,7 +105,7 @@ struct Bar {
 }
 
 impl Bar {
-    fn new(mtm: MainThreadMarker) -> Bar {
+    fn new(mtm: MainThreadMarker) -> Option<Bar> {
         let (w, h) = Mode::Resting.size();
         let start = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
         let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -116,44 +128,25 @@ impl Bar {
                 | NSWindowCollectionBehavior::FullScreenAuxiliary
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
-
         let view = BarView::init_with_frame(BarView::alloc(mtm), start);
         view.setWantsLayer(true);
-        let body = CALayer::new();
-        body.setBorderWidth(BORDER);
-        body.setBorderColor(Some(&color(0.667, 0.667, 0.667, 0.75).CGColor()));
-        body.setBackgroundColor(Some(&color(0.0, 0.0, 0.0, 0.5).CGColor()));
-        if let Some(root) = view.layer() {
-            root.addSublayer(&body);
-        }
-        let white = NSColor::whiteColor().CGColor();
-        let child = |radius: f64| {
-            let l = CALayer::new();
-            l.setBackgroundColor(Some(&white));
-            l.setCornerRadius(radius);
-            l.setHidden(true);
-            body.addSublayer(&l);
-            l
-        };
-        let bars = (0..wave::BARS).map(|_| child(wave::BAR_WIDTH / 2.0)).collect();
-        let dots = (0..3).map(|_| child(DOT / 2.0)).collect();
+        let root = view.layer()?;
+        root.setGeometryFlipped(true);
         panel.setContentView(Some(&view));
-        Bar {
+        Some(Bar {
             mtm,
             panel,
-            body,
-            bars,
-            dots,
+            root,
+            layers: Vec::new(),
             state: BarState::default(),
             mode: Mode::Hidden,
             ticking: false,
-        }
+        })
     }
 
     /// Bottom centre of the visible part (above the Dock) of the screen with
     /// the pointer, as Wispr places its bar on the display nearest the cursor.
-    fn place(&self, mode: Mode) {
-        let (w, h) = mode.size();
+    fn place(&self, (w, h): (f64, f64)) {
         let mouse = NSEvent::mouseLocation();
         let screens = NSScreen::screens(self.mtm);
         let screen = screens
@@ -186,60 +179,35 @@ impl Bar {
     fn refresh(&mut self) {
         let f = self.state.frame(Instant::now());
         if f.mode != self.mode {
-            self.layout(f.mode);
+            self.mode = f.mode;
+            if f.mode == Mode::Hidden {
+                self.panel.orderOut(None);
+            } else {
+                self.place(f.size);
+                self.panel.orderFrontRegardless();
+            }
         }
-        if f.mode.animated() {
-            self.animate(&f);
+        if f.mode != Mode::Hidden {
+            self.draw(&f);
+        }
+        if f.animated {
             self.schedule();
         }
     }
 
-    fn layout(&mut self, mode: Mode) {
-        self.mode = mode;
-        if mode == Mode::Hidden {
-            self.panel.orderOut(None);
-            return;
-        }
-        let (w, h) = mode.size();
+    fn draw(&mut self, f: &Frame) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        self.body.setFrame(rect(0.0, 0.0, w, h));
-        self.body.setCornerRadius(h / 2.0);
-        for b in &self.bars {
-            b.setHidden(mode != Mode::Recording);
+        while self.layers.len() < f.shapes.len() {
+            let layer = CALayer::new();
+            self.root.addSublayer(&layer);
+            self.layers.push(layer);
         }
-        for d in &self.dots {
-            d.setHidden(mode != Mode::Working);
+        for (layer, s) in self.layers.iter().zip(&f.shapes) {
+            show(layer, s);
         }
-        CATransaction::commit();
-        self.place(mode);
-        self.panel.orderFrontRegardless();
-    }
-
-    fn animate(&self, f: &Frame) {
-        let (w, h) = f.mode.size();
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        match f.mode {
-            Mode::Recording => {
-                let bw = wave::BAR_WIDTH;
-                let total = wave::BARS as f64 * bw + (wave::BARS as f64 - 1.0) * BAR_GAP;
-                let left = (w - total) / 2.0;
-                let opacity = if f.mic_active { 1.0 } else { 0.4 };
-                for (i, (layer, &bh)) in self.bars.iter().zip(f.heights.iter()).enumerate() {
-                    let bh = bh.max(bw).min(h - 4.0);
-                    layer.setFrame(rect(left + i as f64 * (bw + BAR_GAP), (h - bh) / 2.0, bw, bh));
-                    layer.setOpacity(opacity);
-                }
-            }
-            Mode::Working => {
-                for (i, layer) in self.dots.iter().enumerate() {
-                    let cx = w / 2.0 + (i as f64 - 1.0) * DOT_STEP;
-                    layer.setFrame(rect(cx - DOT / 2.0, (h - DOT) / 2.0, DOT, DOT));
-                    layer.setOpacity(dot_alpha(f.t, i) as f32);
-                }
-            }
-            Mode::Resting | Mode::Hidden => {}
+        for layer in &self.layers[f.shapes.len()..] {
+            layer.setHidden(true);
         }
         CATransaction::commit();
     }
@@ -260,6 +228,22 @@ impl Bar {
     }
 }
 
+fn show(layer: &CALayer, s: &Shape) {
+    layer.setHidden(false);
+    layer.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(s.w, s.h)));
+    layer.setPosition(CGPoint::new(s.cx, s.cy));
+    layer.setAffineTransform(rotation(s.angle));
+    layer.setCornerRadius(s.radius);
+    layer.setBackgroundColor(Some(&rgba(s.fill).CGColor()));
+    match s.border {
+        Some((color, width)) => {
+            layer.setBorderWidth(width);
+            layer.setBorderColor(Some(&rgba(color).CGColor()));
+        }
+        None => layer.setBorderWidth(0.0),
+    }
+}
+
 fn with_bar(f: impl FnOnce(&mut Bar)) {
     BAR.with(|b| {
         if let Ok(mut b) = b.try_borrow_mut() {
@@ -271,8 +255,8 @@ fn with_bar(f: impl FnOnce(&mut Bar)) {
 }
 
 /// Runs the bar; must be called on the main thread, and does not return while
-/// the bar is shown (AppKit's run loop). `on_click` gets "start" or "stop"
-/// when the bar is clicked.
+/// the bar is shown (AppKit's run loop). `on_click` gets "start", "stop" or
+/// "cancel" when the bar is clicked.
 pub fn run(
     commands: Receiver<PillCommand>,
     log: impl Fn(String),
@@ -287,7 +271,12 @@ pub fn run(
     let app = NSApplication::sharedApplication(mtm);
     // No Dock icon and no menu bar: the bar is all there is.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    BAR.with(|b| *b.borrow_mut() = Some(Bar::new(mtm)));
+    let Some(bar) = Bar::new(mtm) else {
+        log("flow bar off: no layer for the panel".into());
+        for _ in commands {}
+        return;
+    };
+    BAR.with(|b| *b.borrow_mut() = Some(bar));
     std::thread::spawn(move || {
         for command in commands {
             DispatchQueue::main().exec_async(move || with_bar(|bar| bar.apply(command)));

@@ -18,14 +18,17 @@ while Wispr is in the background:
 - `daemon/` (Rust, `wispr-headless`) is spawned by the shim. It records the
   microphone (`pw-cat` on Linux, `ffmpeg` on macOS) and sends Wispr the same
   `dictation:*` messages the Hub would: 640-sample 16 kHz WAV chunks, then
-  `recordingDone`. It also draws Wispr's flow bar: the resting bar (shown by
-  Wispr's own rule, `prefs.user.hideFlowBarPermanently` and its snooze),
-  Wispr's ten-bar waveform while recording (same sizes, animation and level
-  smoothing as its status page, dimmed while the mic is not active; see
-  `daemon/src/wave.rs`) and dots while finishing. A click on it starts or
-  stops a dictation like a click on Wispr's bar. It also plays Wispr's sounds.
-  The status page loads only for notifications, reminders and tips, and stops
-  again once it draws nothing larger than the resting bar.
+  `recordingDone`. It also draws Wispr's flow bar, following the status
+  page's own state machine (`daemon/src/bar.rs`): the resting bar (shown by
+  Wispr's own rule, `prefs.user.hideFlowBarPermanently` and its snooze), the
+  push-to-talk pill, the hands-free pill with its cancel and accept buttons,
+  command mode's orange, and the processing spinner, with Wispr's ten-bar
+  waveform (`daemon/src/wave.rs`) once the mic is active. Clicks do what they
+  do on Wispr's bar. It also plays Wispr's sounds. The pill is red instead of
+  Wispr's black, so a black pill on screen means Wispr's own page is drawing.
+  That page loads only for notifications, reminders, tips, polish results and
+  instruct mode, and stops again once it draws nothing larger than the
+  resting bar.
   - Linux (`pill_x11.rs`): an XWayland window; sizes follow `Xft.dpi`.
   - macOS (`pill_mac.rs`): a non-activating AppKit panel drawn with Core
     Animation layers, in safe Rust through objc2's bindings. Sizes are points.
