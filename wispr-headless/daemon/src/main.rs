@@ -5,6 +5,7 @@
 //! in JSON lines on stdin/stdout. Exits when stdin closes.
 
 mod bar;
+mod mics;
 #[cfg(target_os = "macos")]
 mod pill_mac;
 #[cfg(target_os = "linux")]
@@ -31,7 +32,11 @@ use protocol::{Command, Event};
 use recorder::{Progress, Recording};
 
 struct Config {
+    /// The capture command without its device (see `capture_for`).
     capture: Vec<String>,
+    /// The input given on the command line (Nix's micTarget), which wins over
+    /// the one Wispr would pick.
+    target: Option<String>,
     device: String,
     player: Vec<String>,
     sounds: Option<String>,
@@ -101,23 +106,46 @@ fn config() -> Config {
             _ => {}
         }
     }
-    if let Some(t) = target.filter(|t| !t.is_empty()) {
-        if capture.iter().any(|c| c == "--record") {
-            capture.push("--target".into());
-            capture.push(t.clone());
-        }
-        device = t;
-    }
-    if capture.iter().any(|c| c == "--record") {
-        capture.push("-".into());
-    }
     Config {
         capture,
+        target: target.filter(|t| !t.is_empty()),
         device,
         player,
         sounds,
         fonts,
     }
+}
+
+/// The capture command for one recording, and the device name Wispr is told:
+/// the input from the command line if given, else the one Wispr's ranking
+/// picks (`chosen`), else the system default.
+fn capture_for(cfg: &Config, chosen: Option<&mics::Native>) -> (Vec<String>, String) {
+    let mut capture = cfg.capture.clone();
+    let mut device = cfg.device.clone();
+    let input = cfg
+        .target
+        .clone()
+        .map(|t| (t.clone(), t))
+        .or_else(|| chosen.map(|n| (n.id.clone(), n.name.clone())));
+    match mics::Backend::of(&capture) {
+        mics::Backend::PipeWire => {
+            if let Some((id, name)) = input {
+                capture.extend(["--target".into(), id]);
+                device = name;
+            }
+            capture.push("-".into());
+        }
+        mics::Backend::AvFoundation => {
+            if let Some((id, name)) = input {
+                for arg in capture.iter_mut().filter(|a| *a == ":default") {
+                    *arg = format!(":{id}");
+                }
+                device = name;
+            }
+        }
+        mics::Backend::Fixed => {}
+    }
+    (capture, device)
 }
 
 struct Out(Arc<Mutex<std::io::Stdout>>);
@@ -203,6 +231,26 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     let clock = Instant::now();
     let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
 
+    // The system's inputs, listed in the background (ffmpeg takes a moment)
+    // at start, when Wispr's ranking changes and after each recording, so a
+    // start never waits for it.
+    let backend = mics::Backend::of(&cfg.capture);
+    let inputs = Arc::new(Mutex::new(Vec::<mics::Native>::new()));
+    let (relist, relist_rx) = mpsc::channel::<()>();
+    if cfg.target.is_none() && backend != mics::Backend::Fixed {
+        let inputs = inputs.clone();
+        let program = cfg.capture.first().cloned().unwrap_or_default();
+        std::thread::spawn(move || {
+            while relist_rx.recv().is_ok() {
+                while relist_rx.try_recv().is_ok() {}
+                let found = mics::list(backend, &program);
+                *inputs.lock().expect("inputs lock poisoned") = found;
+            }
+        });
+    }
+    let _ = relist.send(());
+    let mut ranked: Vec<mics::Ranked> = Vec::new();
+
     // Commands arrive on their own thread so audio can be polled in between.
     let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
     {
@@ -245,7 +293,11 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                         out.send(&e);
                     }
                 }
-                match Recording::start(uuid.clone(), &cfg.capture, cfg.device.clone(), clock_ms()) {
+                let (capture, device) = {
+                    let inputs = inputs.lock().expect("inputs lock poisoned");
+                    capture_for(cfg, mics::choose(&ranked, &inputs))
+                };
+                match Recording::start(uuid.clone(), &capture, device, clock_ms()) {
                     Ok(r) => {
                         out.send(&Event::Started { uuid });
                         recording = Some(r);
@@ -259,6 +311,11 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                         out.send(&e);
                     }
                 }
+                let _ = relist.send(());
+            }
+            Ok(Some(Command::Mics { ranked: r })) => {
+                ranked = r;
+                let _ = relist.send(());
             }
             Ok(Some(Command::Status { value })) => {
                 let _ = pill_tx.send(PillCommand::Status(value));
@@ -320,5 +377,63 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     }
     if let Some(r) = recording.take() {
         let _ = r.uuid();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(capture: &str, target: Option<&str>) -> Config {
+        Config {
+            capture: capture.split(' ').map(String::from).collect(),
+            target: target.map(String::from),
+            device: "Default".into(),
+            player: Vec::new(),
+            sounds: None,
+            fonts: None,
+        }
+    }
+
+    fn jabra() -> mics::Native {
+        mics::Native {
+            id: "alsa_input.jabra".into(),
+            name: "Jabra Evolve2 65".into(),
+        }
+    }
+
+    #[test]
+    fn pipewire_records_wispr_s_choice_unless_a_target_is_given() {
+        let c = cfg("pw-cat --record --raw", None);
+        assert_eq!(capture_for(&c, None).0.join(" "), "pw-cat --record --raw -");
+        let (capture, device) = capture_for(&c, Some(&jabra()));
+        assert_eq!(
+            capture.join(" "),
+            "pw-cat --record --raw --target alsa_input.jabra -"
+        );
+        assert_eq!(device, "Jabra Evolve2 65");
+        let c = cfg("pw-cat --record --raw", Some("my-mic"));
+        let (capture, device) = capture_for(&c, Some(&jabra()));
+        assert_eq!(capture.join(" "), "pw-cat --record --raw --target my-mic -");
+        assert_eq!(device, "my-mic");
+    }
+
+    #[test]
+    fn avfoundation_names_the_chosen_device() {
+        let c = cfg("ffmpeg -f avfoundation -i :default -ac 1 -", None);
+        assert_eq!(
+            capture_for(&c, None).0.join(" "),
+            "ffmpeg -f avfoundation -i :default -ac 1 -"
+        );
+        let mac = mics::Native {
+            id: "MacBook Pro Microphone".into(),
+            name: "MacBook Pro Microphone".into(),
+        };
+        let (capture, device) = capture_for(&c, Some(&mac));
+        assert_eq!(
+            capture[4], ":MacBook Pro Microphone",
+            "one argument, spaces and all"
+        );
+        assert_eq!(device, "MacBook Pro Microphone");
     }
 }

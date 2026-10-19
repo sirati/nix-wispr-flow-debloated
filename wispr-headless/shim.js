@@ -251,6 +251,27 @@ function build(electron) {
   // rule: prefs.user.hideFlowBarPermanently, clickableBubbleSnoozeUntil).
   let barVisible = null;
   let barTimer = null;
+  // Wispr's microphone ranking, for the recorder to open the device Wispr
+  // would (daemon/src/mics.rs). Device IDs are Chromium's, so names go along,
+  // with the raw label of each device Wispr's page last listed.
+  let sentMics = null;
+  function updateMics(state) {
+    const user = state?.prefs?.user;
+    if (!Array.isArray(user?.rankedAudioDevices)) return;
+    const seen = state?.sharedSettings?.audioDevices ?? state?.audioDevices;
+    const label = (id) => (Array.isArray(seen) ? seen.find((d) => d?.deviceId === id)?.label : undefined) ?? null;
+    const entry = (d) => ({ name: String(d?.name ?? ""), label: label(d?.deviceId), default: d?.deviceId === "default" });
+    const ranked = user.rankedAudioDevices.map(entry);
+    // A virtual device the user picked comes first, as in Wispr.
+    const picked = user.rankedAudioDevices.find((d) => d?.deviceId === user.overrideAudioDeviceId);
+    if (picked?.isVirtual) ranked.unshift(entry(picked));
+    const json = JSON.stringify(ranked);
+    if (json === sentMics) return;
+    sentMics = json;
+    trace({ ev: "mics", count: ranked.length, labelled: ranked.filter((r) => r.label).length });
+    daemon?.send({ op: "mics", ranked });
+  }
+
   function updateBar(state) {
     const user = state?.prefs?.user;
     if (!user) return;
@@ -416,6 +437,7 @@ function build(electron) {
       const a = args[0];
       if (ch === "zubridge:state-update") {
         this.ack(a);
+        updateMics(a?.state);
         if (this.role === "status" && a?.state) {
           const changed = this.lastState ? changedPaths(this.lastState, a.state) : [];
           this.prevState = this.lastState;
@@ -489,6 +511,7 @@ function build(electron) {
       if (ch === "dictation:audioStart" || ch === "dictation:audioStop" || HUB_SOUNDS[ch] || ch === "dictation:audioSetup") return lazy.route(ch, args);
       if (/^media:(start|stop)Meeting/.test(ch)) lazy.meeting = ch.startsWith("media:start");
     }
+    if (ch === "zubridge:state-update") updateMics(args[0]?.state);
     if (lazy.role === "status" && ch === "zubridge:state-update" && args[0]?.state) {
       lazy.prevState = lazy.lastState;
       lazy.lastState = args[0].state;
