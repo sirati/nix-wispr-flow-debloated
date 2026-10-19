@@ -4,11 +4,10 @@
 //! drawn with Core Animation layers, one per shape (y down: they sit in a
 //! flipped canvas layer of our own; AppKit draws a view's own backing layer
 //! y up even when it is marked flipped), and AppKit labels for text in the
-//! system font. The
-//! panel is exactly the size of the pill, so clicks next to it go through.
-//! AppKit runs on the main thread: commands are forwarded to it with
-//! libdispatch, and a resting or hidden bar schedules nothing. Sizes are
-//! points, which are Wispr's CSS pixels.
+//! system font. The panel is exactly the size of the pill, so clicks next to
+//! it go through. AppKit runs on the main thread: commands are forwarded to
+//! it with libdispatch, and a resting or hidden bar schedules nothing. Sizes
+//! are points, which are Wispr's CSS pixels.
 //!
 //! Everything here is safe Rust through objc2's generated AppKit bindings.
 //! The one class we define, `BarView`, overrides `mouseDown:`,
