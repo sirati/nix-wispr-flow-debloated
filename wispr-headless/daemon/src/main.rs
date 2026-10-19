@@ -11,6 +11,8 @@ mod pill_mac;
 mod pill_x11;
 mod protocol;
 mod recorder;
+#[cfg(target_os = "linux")]
+mod text;
 mod wave;
 
 #[cfg(target_os = "macos")]
@@ -24,7 +26,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bar::PillCommand;
+use bar::{BarEvent, PillCommand};
 use protocol::{Command, Event};
 use recorder::{Progress, Recording};
 
@@ -33,6 +35,8 @@ struct Config {
     device: String,
     player: Vec<String>,
     sounds: Option<String>,
+    /// Figtree for the bar's text (Linux; macOS uses its system font).
+    fonts: Option<String>,
 }
 
 fn config() -> Config {
@@ -56,6 +60,7 @@ fn config() -> Config {
     let mut device = "Default (PipeWire)".to_string();
     let mut player = vec!["pw-cat".into(), "--playback".into()];
     let mut sounds = None;
+    let mut fonts = None;
     let mut target = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -68,6 +73,7 @@ fn config() -> Config {
             }
             "--target" => target = args.next(),
             "--sounds" => sounds = args.next(),
+            "--font-dir" => fonts = args.next(),
             // Any command that writes 16 kHz s16 mono PCM to stdout: ffmpeg on
             // macOS, a stand-in microphone in tests.
             "--capture-cmd" => {
@@ -110,6 +116,7 @@ fn config() -> Config {
         device,
         player,
         sounds,
+        fonts,
     }
 }
 
@@ -159,6 +166,7 @@ fn main() {
     // The flow bar keeps the main thread (AppKit needs it on macOS); commands
     // and the recorder run on their own, and the process ends with them.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
+    let fonts = cfg.fonts.clone();
     {
         let out = Out(out.0.clone());
         std::thread::spawn(move || {
@@ -167,14 +175,21 @@ fn main() {
         });
     }
     let log_out = Out(out.0.clone());
-    let click_out = Out(out.0.clone());
+    let event_out = Out(out.0.clone());
     pill::run(
         pill_rx,
+        fonts.as_deref(),
         move |msg| log_out.send(&Event::Log { msg }),
-        // Clicks go straight to the shim.
-        move |action| {
-            click_out.send(&Event::Click {
-                action: action.to_string(),
+        // Clicks and notification results go straight to the shim.
+        move |e| {
+            event_out.send(&match e {
+                BarEvent::Click(action) => Event::Click {
+                    action: action.to_string(),
+                },
+                BarEvent::NoticeAction(index) => Event::NoticeAction { index },
+                BarEvent::NoticeClosed(reason) => Event::NoticeClosed {
+                    reason: reason.to_string(),
+                },
             })
         },
     );
@@ -272,6 +287,20 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             }
             Ok(Some(Command::Indicator { state })) => {
                 let _ = pill_tx.send(PillCommand::Indicator(state));
+            }
+            Ok(Some(Command::Notify {
+                title,
+                actions,
+                timeout,
+            })) => {
+                let _ = pill_tx.send(PillCommand::Notify {
+                    title,
+                    actions,
+                    timeout: Duration::from_secs_f64(timeout.max(0.0) / 1000.0),
+                });
+            }
+            Ok(Some(Command::NotifyClear)) => {
+                let _ = pill_tx.send(PillCommand::NotifyClear);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }

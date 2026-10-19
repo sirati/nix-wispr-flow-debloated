@@ -10,7 +10,7 @@
 //! screen). X's core drawing writes pixels without blending, so shapes on the
 //! pill are composited over its colour first.
 
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc as Shared, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,14 +19,17 @@ use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CoordMode,
-    CreateGCAux, CreateWindowAux, EventMask, Point, PolyShape, Rectangle, Window, WindowClass,
+    CreateGCAux, CreateWindowAux, EventMask, ImageFormat, ImageOrder, Point, PolyShape, Rectangle,
+    Window, WindowClass,
 };
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
 use crate::bar::{
-    click_action, over, BarState, Frame, Mode, PillCommand, Shape, BOTTOM_MARGIN, FRAME, MAX_SIZE,
+    over, BarEvent, BarState, Frame, Mode, PillCommand, Shape, Text, BOTTOM_MARGIN, FRAME,
+    WINDOW_SIZE,
 };
+use crate::text::Fonts;
 
 /// Display scale from an X resource string (`Xft.dpi: 192` gives 2).
 pub fn scale_from_resources(resources: &str) -> f64 {
@@ -51,8 +54,8 @@ impl Geometry {
     pub fn new(scale: f64) -> Geometry {
         Geometry {
             scale,
-            width: px(MAX_SIZE.0, scale),
-            height: px(MAX_SIZE.1, scale),
+            width: px(WINDOW_SIZE.0, scale),
+            height: px(WINDOW_SIZE.1, scale),
         }
     }
 
@@ -75,10 +78,15 @@ fn px(css: f64, scale: f64) -> u16 {
 struct Surface {
     conn: Shared<RustConnection>,
     window: Window,
+    /// Frames are drawn here, then copied to the window in one go (no flicker).
+    buffer: u32,
     gc: u32,
     mapped: bool,
     input: Option<(i16, i16, u16, u16)>,
     geo: Geometry,
+    fonts: Option<Fonts>,
+    /// The server wants image pixels least significant byte first.
+    lsb: bool,
 }
 
 /// Premultiplied ARGB, as a 32-bit visual expects.
@@ -120,6 +128,39 @@ fn capsule(r: Rectangle) -> (Vec<Arc>, Rectangle) {
     }
 }
 
+/// A rectangle with corners of radius `rad`: four quarter-circles (drawn as
+/// full circles, covered by the bands) and two crossing bands.
+fn rounded(r: Rectangle, rad: u16) -> (Vec<Arc>, Vec<Rectangle>) {
+    let rad = rad.min(r.width / 2).min(r.height / 2);
+    let d = 2 * rad;
+    let (right, bottom) = (r.x + (r.width - d) as i16, r.y + (r.height - d) as i16);
+    let arcs = [(r.x, r.y), (right, r.y), (r.x, bottom), (right, bottom)]
+        .map(|(x, y)| Arc {
+            x,
+            y,
+            width: d,
+            height: d,
+            angle1: 0,
+            angle2: 360 * 64,
+        })
+        .to_vec();
+    let rects = vec![
+        Rectangle {
+            x: r.x + rad as i16,
+            y: r.y,
+            width: r.width - d,
+            height: r.height,
+        },
+        Rectangle {
+            x: r.x,
+            y: r.y + rad as i16,
+            width: r.width,
+            height: r.height - d,
+        },
+    ];
+    (arcs, rects)
+}
+
 fn read_scale(conn: &RustConnection, root: Window) -> f64 {
     conn.get_property(
         false,
@@ -136,9 +177,10 @@ fn read_scale(conn: &RustConnection, root: Window) -> f64 {
 }
 
 impl Surface {
-    fn open() -> Result<Surface, String> {
+    fn open(fonts: Option<Fonts>) -> Result<Surface, String> {
         let (conn, screen_num) = x11rb::connect(None).map_err(|e| format!("no X display: {e}"))?;
         let screen = conn.setup().roots[screen_num].clone();
+        let lsb = conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
         let visual = screen
             .allowed_depths
             .iter()
@@ -192,14 +234,20 @@ impl Surface {
         let gc = conn.generate_id().map_err(|e| e.to_string())?;
         conn.create_gc(gc, window, &CreateGCAux::new().foreground(0))
             .map_err(|e| e.to_string())?;
+        let buffer = conn.generate_id().map_err(|e| e.to_string())?;
+        conn.create_pixmap(32, buffer, window, geo.width, geo.height)
+            .map_err(|e| e.to_string())?;
         conn.flush().map_err(|e| e.to_string())?;
         let mut s = Surface {
             conn: Shared::new(conn),
             window,
+            buffer,
             gc,
             mapped: false,
             input: None,
             geo,
+            fonts,
+            lsb,
         };
         s.set_input(None);
         Ok(s)
@@ -257,10 +305,14 @@ impl Surface {
         self.color(color);
         if s.radius * 2.0 >= s.w.min(s.h) - 0.01 {
             let (arcs, mid) = capsule(r);
-            let _ = self.conn.poly_fill_arc(self.window, self.gc, &arcs);
-            let _ = self.conn.poly_fill_rectangle(self.window, self.gc, &[mid]);
+            let _ = self.conn.poly_fill_arc(self.buffer, self.gc, &arcs);
+            let _ = self.conn.poly_fill_rectangle(self.buffer, self.gc, &[mid]);
+        } else if s.radius * k >= 1.0 {
+            let (arcs, rects) = rounded(r, (s.radius * k).round() as u16);
+            let _ = self.conn.poly_fill_arc(self.buffer, self.gc, &arcs);
+            let _ = self.conn.poly_fill_rectangle(self.buffer, self.gc, &rects);
         } else {
-            let _ = self.conn.poly_fill_rectangle(self.window, self.gc, &[r]);
+            let _ = self.conn.poly_fill_rectangle(self.buffer, self.gc, &[r]);
         }
     }
 
@@ -282,7 +334,7 @@ impl Surface {
             .collect();
         self.color(color);
         let _ = self.conn.fill_poly(
-            self.window,
+            self.buffer,
             self.gc,
             PolyShape::CONVEX,
             CoordMode::ORIGIN,
@@ -294,7 +346,7 @@ impl Surface {
         let g = self.geo;
         self.color([0; 4]);
         let _ = self.conn.poly_fill_rectangle(
-            self.window,
+            self.buffer,
             self.gc,
             &[Rectangle {
                 x: 0,
@@ -318,43 +370,126 @@ impl Surface {
                 self.fill_rotated(s, origin, fill);
             }
         }
+        for t in &f.texts {
+            self.draw_text(t, origin);
+        }
+        let _ = self.conn.copy_area(
+            self.buffer,
+            self.window,
+            self.gc,
+            0,
+            0,
+            0,
+            0,
+            g.width,
+            g.height,
+        );
         let _ = self.conn.flush();
+    }
+
+    fn draw_text(&self, t: &Text, origin: (f64, f64)) {
+        let Some(fonts) = &self.fonts else { return };
+        let k = self.geo.scale;
+        let (w, h, pixels) = fonts.render(t, k);
+        let data: Vec<u8> = pixels
+            .iter()
+            .flat_map(|&p| {
+                let v = argb(p);
+                if self.lsb {
+                    v.to_le_bytes()
+                } else {
+                    v.to_be_bytes()
+                }
+            })
+            .collect();
+        let _ = self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.buffer,
+            self.gc,
+            w,
+            h,
+            (origin.0 + t.x * k).round() as i16,
+            (origin.1 + t.top * k).round() as i16,
+            0,
+            32,
+            &data,
+        );
+    }
+
+    /// The pointer in CSS pixels of the pill `area`, if it is on it.
+    fn pointer(&self, area: Rectangle) -> Option<(f64, f64)> {
+        let p = self.conn.query_pointer(self.window).ok()?.reply().ok()?;
+        let (x, y) = (p.win_x - area.x, p.win_y - area.y);
+        let inside = p.same_screen
+            && x >= 0
+            && y >= 0
+            && (x as u16) < area.width
+            && (y as u16) < area.height;
+        inside.then(|| (f64::from(x) / self.geo.scale, f64::from(y) / self.geo.scale))
     }
 }
 
-/// Runs the bar until the command channel closes. `on_click` gets "start",
-/// "stop" or "cancel" when the bar is clicked with the left button.
+/// What the bar's loop waits for.
+enum Input {
+    Command(PillCommand),
+    /// A left click, in CSS pixels of the pill on screen.
+    Click(f64, f64),
+    Quit,
+}
+
+/// Runs the bar until the command channel closes. `fonts` is a directory
+/// with Figtree; `on_event` gets clicks and notification results.
 pub fn run(
     commands: Receiver<PillCommand>,
+    fonts: Option<&str>,
     log: impl Fn(String),
-    on_click: impl Fn(&'static str) + Send + 'static,
+    on_event: impl Fn(BarEvent),
 ) {
-    let mut surface = match Surface::open() {
+    let fonts = fonts.and_then(|dir| {
+        Fonts::load(dir)
+            .map_err(|e| log(format!("no text in the flow bar: {e}")))
+            .ok()
+    });
+    let fallback_width = |text: &str, size: f64| 0.55 * size * text.chars().count() as f64;
+    let mut surface = match Surface::open(fonts) {
         Ok(s) => Some(s),
         Err(e) => {
             log(format!("flow bar off: {e}"));
             None
         }
     };
-    // Clicks: a thread that blocks on X events. What a click means depends on
-    // the mode and where it lands, which it reads from here.
-    let shown = Shared::new(Mutex::new(Mode::Hidden));
+
+    // One queue for commands and clicks.
+    let (tx, inputs) = mpsc::channel::<Input>();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for c in commands {
+                if tx.send(Input::Command(c)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Input::Quit);
+        });
+    }
+    // Clicks: a thread that blocks on X events, converted to pill pixels with
+    // the pill on screen.
+    let shown_area = Shared::new(Mutex::new(Rectangle::default()));
     if let Some(s) = &surface {
         let conn = s.conn.clone();
-        let geo = s.geo;
-        let shown = shown.clone();
+        let scale = s.geo.scale;
+        let area = shown_area.clone();
         std::thread::spawn(move || {
             while let Ok(event) = conn.wait_for_event() {
                 if let XEvent::ButtonPress(press) = event {
                     if press.detail != 1 {
                         continue;
                     }
-                    let mode = *shown.lock().expect("mode lock poisoned");
-                    let body = geo.body(mode.size());
-                    let x = f64::from(press.event_x - body.x) / geo.scale;
-                    let y = f64::from(press.event_y - body.y) / geo.scale;
-                    if let Some(action) = click_action(mode, x, y) {
-                        on_click(action);
+                    let a = *area.lock().expect("area lock poisoned");
+                    let x = f64::from(press.event_x - a.x) / scale;
+                    let y = f64::from(press.event_y - a.y) / scale;
+                    if tx.send(Input::Click(x, y)).is_err() {
+                        return;
                     }
                 }
             }
@@ -362,6 +497,7 @@ pub fn run(
     }
 
     let mut state = BarState::default();
+    let mut last: Option<(Mode, Rectangle)> = None;
     let mut animated = false;
     loop {
         // Only animations need frames; a resting or hidden bar sleeps.
@@ -370,21 +506,47 @@ pub fn run(
         } else {
             Duration::from_secs(3600)
         };
-        match commands.recv_timeout(timeout) {
-            Ok(c) => state.apply(c),
+        match inputs.recv_timeout(timeout) {
+            Ok(Input::Command(c)) => state.apply(c),
+            Ok(Input::Click(x, y)) => {
+                if let Some(e) = state.click(x, y) {
+                    on_event(e);
+                }
+            }
+            Ok(Input::Quit) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
         }
-        let f = state.frame(Instant::now());
-        animated = f.animated;
-        *shown.lock().expect("mode lock poisoned") = f.mode;
+        let pointer = match (&surface, last) {
+            (Some(s), Some((Mode::Notice, area))) => s.pointer(area),
+            _ => None,
+        };
+        let f = match surface.as_ref().and_then(|s| s.fonts.as_ref()) {
+            Some(fonts) => state.frame(
+                Instant::now(),
+                &|t, size, bold| fonts.width(t, size, bold),
+                pointer,
+            ),
+            None => state.frame(
+                Instant::now(),
+                &|t, size, _| fallback_width(t, size),
+                pointer,
+            ),
+        };
+        for e in &f.events {
+            on_event(*e);
+        }
+        let mut area = Rectangle::default();
         if let Some(s) = surface.as_mut() {
+            area = s.geo.body(f.size);
+            *shown_area.lock().expect("area lock poisoned") = area;
             let show = f.mode != Mode::Hidden;
             s.set_visible(show);
             if show {
                 s.draw(&f);
             }
         }
+        last = Some((f.mode, area));
+        animated = f.animated;
     }
 }
 
@@ -395,12 +557,12 @@ mod tests {
     #[test]
     fn resting_bar_matches_wispr_at_200_percent() {
         let g = Geometry::new(2.0);
-        let r = g.body(Mode::Resting.size());
+        let r = g.body((40.0, 8.0));
         assert_eq!((r.width, r.height), (80, 16), "measured from Wispr's page");
         assert_eq!(r.y as u16 + r.height, g.height, "sits on the bottom line");
         assert!((r.x as u16 * 2 + r.width).abs_diff(g.width) <= 1, "centred");
-        let hands_free = g.body(Mode::HandsFree.size());
-        assert_eq!((hands_free.width, hands_free.height), (g.width, g.height));
+        let notice = g.body(WINDOW_SIZE);
+        assert_eq!((notice.width, notice.height), (g.width, g.height));
     }
 
     #[test]

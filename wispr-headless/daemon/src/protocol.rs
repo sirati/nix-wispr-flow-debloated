@@ -22,6 +22,15 @@ pub enum Command {
     Commanding { active: bool },
     /// `status:setIndicatorState`; only "resting" reaches us.
     Indicator { state: String },
+    /// Show a simple notification (Wispr's "condensed" layout): title,
+    /// button labels, timeout in milliseconds (0: none).
+    Notify {
+        title: String,
+        actions: Vec<String>,
+        timeout: f64,
+    },
+    /// `notification:clear` from main.
+    NotifyClear,
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while
@@ -82,6 +91,14 @@ pub enum Event {
     /// hands-free accept), "cancel" for the hands-free cancel button.
     Click {
         action: String,
+    },
+    /// A notification button was clicked, by index.
+    NoticeAction {
+        index: usize,
+    },
+    /// The notification closed by itself: "timeout" or "action".
+    NoticeClosed {
+        reason: String,
     },
     Log {
         msg: String,

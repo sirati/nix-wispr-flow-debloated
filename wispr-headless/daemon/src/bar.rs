@@ -13,14 +13,18 @@
 //!   `status:micSilence` false) while push-to-talk or hands-free; otherwise
 //!   they are 2x2 dots. See wave.rs for the movement.
 //! - `status:commandModeStatus` turns outline and bars orange.
+//! - Simple notifications (Wispr's "condensed" layout, such as "Transcript
+//!   cancelled" with Undo) replace the bar: a title, up to two buttons and a
+//!   progress bar. As on Wispr's page, the timer runs here (paused while the
+//!   pointer is on it), and a clicked button shows a check for 600 ms.
 //!
 //! Anything else the page shows (polish results, instruct mode, reminders,
-//! notifications) loads Wispr's own page instead; the shim decides that.
+//! other notifications) loads Wispr's own page instead; the shim decides that.
 //!
-//! The output is a list of shapes in Wispr's CSS pixels relative to the
-//! pill's top left corner, y down; pill_x11.rs (Linux) and pill_mac.rs (macOS)
-//! draw them. The pill is red instead of Wispr's black, so it is clear on
-//! screen whether Rust or Wispr's page draws it.
+//! The output is a list of shapes and texts in Wispr's CSS pixels relative to
+//! the pill's top left corner, y down; pill_x11.rs (Linux) and pill_mac.rs
+//! (macOS) draw them. The pill is red instead of Wispr's black, so it is
+//! clear on screen whether Rust or Wispr's page draws it.
 
 use std::time::{Duration, Instant};
 
@@ -29,8 +33,9 @@ use crate::wave;
 /// Gap between the bottom of the pill and the bottom of the screen.
 pub const BOTTOM_MARGIN: f64 = 10.0;
 pub const FRAME: Duration = Duration::from_millis(16);
-/// The largest pill (hands-free), for a fixed-size window.
-pub const MAX_SIZE: (f64, f64) = (102.5, 30.0);
+/// The largest thing drawn (a notification), for a fixed-size window.
+pub const WINDOW_SIZE: (f64, f64) = (NOTICE_MAX_WIDTH, NOTICE_HEIGHT);
+const HANDS_FREE: (f64, f64) = (102.5, 30.0);
 
 /// Pill fill: red (Wispr: black, opaque while dictating, 50 % at rest).
 pub const RED: [u8; 3] = [0xc8, 0x14, 0x14];
@@ -54,6 +59,24 @@ const GAP: f64 = 4.0;
 const SPINNER_BOX: f64 = 16.0;
 const SPINNER_GAP: f64 = 6.0;
 
+/// Notification ("condensed"): padding 8x16, Figtree 15/20 px, buttons with
+/// 6x10 padding and radius 8, a 3 px progress bar along the bottom.
+const NOTICE_HEIGHT: f64 = 48.0;
+const NOTICE_MAX_WIDTH: f64 = 440.0;
+const NOTICE_PAD: f64 = 16.0;
+const NOTICE_RADIUS: f64 = 24.0;
+const NOTICE_GAP: f64 = 16.0;
+const NOTICE_BUTTON_PAD: f64 = 10.0;
+const NOTICE_BUTTON_GAP: f64 = 8.0;
+const TEXT_SIZE: f64 = 15.0;
+const TEXT_LINE: f64 = 20.0;
+const TEXT: [u8; 4] = [0xfc, 0xfc, 0xfb, 0xff];
+const BUTTON_FILL: [u8; 4] = [0xff, 0xff, 0xff, 0x14];
+const BUTTON_HOVER: [u8; 4] = [0xff, 0xff, 0xff, 0x1f];
+const TRACK: [u8; 4] = [0x9d, 0x9c, 0x98, 0x66];
+const PROGRESS: [u8; 4] = [0xff, 0xff, 0xeb, 0xff];
+const ACTION_SHOWN: Duration = Duration::from_millis(600);
+
 /// What the bar shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Mode {
@@ -65,19 +88,33 @@ pub enum Mode {
     HandsFree,
     Processing,
     Error,
+    Notice,
 }
 
 impl Mode {
-    /// Pill size, CSS pixels (Wispr's horizontal layout).
-    pub fn size(self) -> (f64, f64) {
+    /// Pill size, CSS pixels (Wispr's horizontal layout); a notification's
+    /// depends on its text.
+    fn size(self) -> (f64, f64) {
         match self {
             Mode::Hidden | Mode::Resting => (40.0, 8.0),
             Mode::Initializing | Mode::PushToTalk => (73.0, 30.0),
-            Mode::HandsFree => MAX_SIZE,
+            Mode::HandsFree => HANDS_FREE,
             Mode::Processing => (98.0, 30.0),
             Mode::Error => (91.0, 30.0),
+            Mode::Notice => WINDOW_SIZE,
         }
     }
+}
+
+/// Something the bar reports to the shim.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BarEvent {
+    /// "start", "stop" or "cancel".
+    Click(&'static str),
+    /// A notification button, by index.
+    NoticeAction(usize),
+    /// The notification closed: "timeout" or "action".
+    NoticeClosed(&'static str),
 }
 
 /// The page's indicator state (only what we draw).
@@ -91,8 +128,15 @@ enum Indicator {
     Error(Instant),
 }
 
-/// What a click at `(x, y)` (CSS pixels in the pill) means in each mode.
-pub fn click_action(mode: Mode, x: f64, _y: f64) -> Option<&'static str> {
+/// Centre x of the hands-free cancel and accept buttons.
+fn buttons() -> (f64, f64) {
+    let content = BUTTON + GAP + WAVE_BOX + GAP + BUTTON;
+    let left = (HANDS_FREE.0 - content) / 2.0;
+    (left + BUTTON / 2.0, left + content - BUTTON / 2.0)
+}
+
+/// What a click at `x` (CSS pixels in the pill) means in a dictation mode.
+fn click_action(mode: Mode, x: f64) -> Option<&'static str> {
     match mode {
         Mode::Resting => Some("start"),
         Mode::PushToTalk => Some("stop"),
@@ -108,13 +152,6 @@ pub fn click_action(mode: Mode, x: f64, _y: f64) -> Option<&'static str> {
         }
         _ => None,
     }
-}
-
-/// Centre x of the hands-free cancel and accept buttons.
-fn buttons() -> (f64, f64) {
-    let content = BUTTON + GAP + WAVE_BOX + GAP + BUTTON;
-    let left = (MAX_SIZE.0 - content) / 2.0;
-    (left + BUTTON / 2.0, left + content - BUTTON / 2.0)
 }
 
 /// Wispr's audio level is 0..1; tolerate dB just in case.
@@ -152,6 +189,14 @@ pub enum PillCommand {
     /// Whether Wispr shows its resting bar (its hideFlowBarPermanently and
     /// snooze preferences).
     RestingBar(bool),
+    /// Show a notification: title, button labels, timeout.
+    Notify {
+        title: String,
+        actions: Vec<String>,
+        timeout: Duration,
+    },
+    /// Main closed the notification.
+    NotifyClear,
 }
 
 /// A rectangle with rounded corners, rotated about its centre; CSS pixels,
@@ -197,22 +242,60 @@ impl Shape {
             border: None,
         }
     }
+
+    fn contains(&self, x: f64, y: f64) -> bool {
+        (x - self.cx).abs() <= self.w / 2.0 && (y - self.cy).abs() <= self.h / 2.0
+    }
 }
+
+/// One line of text: its line box starts at (`x`, `top`). `bg` is the colour
+/// under it, for drawing code that cannot blend.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Text {
+    pub x: f64,
+    pub top: f64,
+    pub line: f64,
+    pub size: f64,
+    /// Semibold (Wispr's 550) rather than regular.
+    pub bold: bool,
+    pub color: [u8; 4],
+    pub bg: [u8; 4],
+    pub text: String,
+}
+
+/// Text width in CSS pixels, from the platform's font: (text, size, bold).
+pub type Measure<'a> = &'a dyn Fn(&str, f64, bool) -> f64;
 
 /// One frame to draw.
 pub struct Frame {
     pub mode: Mode,
-    /// Pill size; shapes are relative to its top left.
+    /// Pill size; shapes and texts are relative to its top left.
     pub size: (f64, f64),
     /// The pill first, then everything on it.
     pub shapes: Vec<Shape>,
+    pub texts: Vec<Text>,
     /// Whether the next frame differs (animation running).
     pub animated: bool,
+    /// For the shim.
+    pub events: Vec<BarEvent>,
+}
+
+struct Notice {
+    title: String,
+    actions: Vec<String>,
+    timeout: Duration,
+    /// 0..1 of the timeout, not counting time with the pointer on it.
+    progress: f64,
+    /// The clicked button and when.
+    clicked: Option<(usize, Instant)>,
+    /// Button areas in the last frame.
+    buttons: Vec<Shape>,
 }
 
 /// The bar's state, fed with commands; the drawing code asks it what to show.
 pub struct BarState {
     indicator: Indicator,
+    notice: Option<Notice>,
     resting_bar: bool,
     enabled: bool,
     mic_active: bool,
@@ -222,6 +305,8 @@ pub struct BarState {
     level: f64,
     last_frame: Instant,
     start: Instant,
+    /// The mode of the last frame, for clicks.
+    shown: Mode,
 }
 
 impl Default for BarState {
@@ -229,6 +314,7 @@ impl Default for BarState {
         let now = Instant::now();
         BarState {
             indicator: Indicator::Rest,
+            notice: None,
             resting_bar: false,
             enabled: true,
             mic_active: false,
@@ -238,6 +324,7 @@ impl Default for BarState {
             level: 0.0,
             last_frame: now,
             start: now,
+            shown: Mode::Hidden,
         }
     }
 }
@@ -258,6 +345,8 @@ impl BarState {
         match command {
             PillCommand::Status(s) => match s.as_str() {
                 "initializing" => {
+                    // A new dictation closes a notification (main clears it too).
+                    self.notice = None;
                     self.indicator = Indicator::Initializing;
                     self.waving = false;
                 }
@@ -305,6 +394,21 @@ impl BarState {
             }
             PillCommand::Enabled(e) => self.enabled = e,
             PillCommand::RestingBar(r) => self.resting_bar = r,
+            PillCommand::Notify {
+                title,
+                actions,
+                timeout,
+            } => {
+                self.notice = Some(Notice {
+                    title,
+                    actions: actions.into_iter().take(2).collect(),
+                    timeout,
+                    progress: 0.0,
+                    clicked: None,
+                    buttons: Vec::new(),
+                })
+            }
+            PillCommand::NotifyClear => self.notice = None,
         }
         if !self.recording() {
             self.target = 0.0;
@@ -312,9 +416,12 @@ impl BarState {
     }
 
     /// The mode on screen: Hidden while Wispr's own page draws the bar.
-    pub fn shown(&self, now: Instant) -> Mode {
+    fn mode(&self, now: Instant) -> Mode {
         if !self.enabled {
             return Mode::Hidden;
+        }
+        if self.notice.is_some() {
+            return Mode::Notice;
         }
         match self.indicator {
             Indicator::Rest if self.resting_bar => Mode::Resting,
@@ -334,32 +441,58 @@ impl BarState {
         }
     }
 
-    /// Advances the animations to `now` and returns what to draw.
-    pub fn frame(&mut self, now: Instant) -> Frame {
+    /// A left click at `(x, y)` CSS pixels in the pill drawn last.
+    pub fn click(&mut self, x: f64, y: f64) -> Option<BarEvent> {
+        if self.shown == Mode::Notice {
+            let n = self.notice.as_mut()?;
+            if n.clicked.is_some() {
+                return None;
+            }
+            let i = n.buttons.iter().position(|b| b.contains(x, y))?;
+            n.clicked = Some((i, Instant::now()));
+            return Some(BarEvent::NoticeAction(i));
+        }
+        click_action(self.shown, x).map(BarEvent::Click)
+    }
+
+    /// Advances the animations to `now` and returns what to draw. `pointer`
+    /// is the mouse position in the pill, if it is on it.
+    pub fn frame(&mut self, now: Instant, measure: Measure, pointer: Option<(f64, f64)>) -> Frame {
         if let Indicator::Error(until) = self.indicator {
             if now >= until {
                 self.rest();
             }
         }
-        let dt = now.duration_since(self.last_frame).as_secs_f64() * 1000.0;
-        self.level = wave::smooth(self.level, self.target, dt);
+        let dt = now.duration_since(self.last_frame);
+        self.level = wave::smooth(self.level, self.target, dt.as_secs_f64() * 1000.0);
         self.last_frame = now;
+        let mut events = Vec::new();
+        if let Some(closed) = self.advance_notice(now, dt, pointer.is_some()) {
+            events.push(closed);
+        }
         let t = now.duration_since(self.start).as_secs_f64();
-        let mode = self.shown(now);
-        let size = mode.size();
+        let mode = self.mode(now);
+        self.shown = mode;
         let mut shapes = Vec::new();
-        let animated = match mode {
-            Mode::Hidden => false,
+        let mut texts = Vec::new();
+        let (size, animated) = match mode {
+            Mode::Hidden => (mode.size(), false),
             Mode::Resting => {
+                let size = mode.size();
                 shapes.push(pill(
                     size,
                     [RED[0], RED[1], RED[2], 0x80],
                     REST_OUTLINE,
                     1.0,
                 ));
-                false
+                (size, false)
             }
+            Mode::Notice => match self.notice.as_mut() {
+                Some(n) => (n.draw(measure, pointer, &mut shapes, &mut texts), true),
+                None => (mode.size(), false),
+            },
             _ => {
+                let size = mode.size();
                 let outline = match mode {
                     Mode::Error => (ERROR_OUTLINE, 1.5),
                     _ if self.command_mode => ([COMMAND[0], COMMAND[1], COMMAND[2], 0xff], 1.0),
@@ -371,15 +504,36 @@ impl BarState {
                     outline.0,
                     outline.1,
                 ));
-                self.content(mode, size, t, &mut shapes)
+                (size, self.content(mode, size, t, &mut shapes))
             }
         };
         Frame {
             mode,
             size,
             shapes,
+            texts,
             animated,
+            events,
         }
+    }
+
+    /// Runs the notification's timer; returns its close event when it ends.
+    fn advance_notice(&mut self, now: Instant, dt: Duration, hovered: bool) -> Option<BarEvent> {
+        let n = self.notice.as_mut()?;
+        let reason = match n.clicked {
+            Some((_, at)) if now.duration_since(at) >= ACTION_SHOWN => Some("action"),
+            Some(_) => None,
+            None => {
+                if !hovered && self.shown == Mode::Notice && !n.timeout.is_zero() {
+                    n.progress += dt.as_secs_f64() / n.timeout.as_secs_f64();
+                }
+                (n.progress >= 1.0).then_some("timeout")
+            }
+        };
+        if reason.is_some() {
+            self.notice = None;
+        }
+        reason.map(BarEvent::NoticeClosed)
     }
 
     /// The pill's content; returns whether it is animated.
@@ -428,34 +582,162 @@ impl BarState {
     }
 }
 
+impl Notice {
+    /// Lays out and draws the notification; returns its size.
+    fn draw(
+        &mut self,
+        measure: Measure,
+        pointer: Option<(f64, f64)>,
+        shapes: &mut Vec<Shape>,
+        texts: &mut Vec<Text>,
+    ) -> (f64, f64) {
+        let fill = [RED[0], RED[1], RED[2], 0xff];
+        let title_w = measure(&self.title, TEXT_SIZE, true).ceil();
+        let labels: Vec<f64> = self
+            .actions
+            .iter()
+            .map(|a| measure(a, TEXT_SIZE, false).ceil())
+            .collect();
+        let buttons_w: f64 = labels
+            .iter()
+            .map(|w| w + 2.0 * NOTICE_BUTTON_PAD)
+            .sum::<f64>()
+            + NOTICE_BUTTON_GAP * labels.len().saturating_sub(1) as f64;
+        let gap = if labels.is_empty() { 0.0 } else { NOTICE_GAP };
+        let w = (NOTICE_PAD * 2.0 + title_w + gap + buttons_w).min(NOTICE_MAX_WIDTH);
+        let h = NOTICE_HEIGHT;
+        shapes.push(Shape::rect(0.0, 0.0, w, h, NOTICE_RADIUS, fill));
+        let text_top = (h - TEXT_LINE) / 2.0;
+        texts.push(Text {
+            x: NOTICE_PAD,
+            top: text_top,
+            line: TEXT_LINE,
+            size: TEXT_SIZE,
+            bold: true,
+            color: TEXT,
+            bg: fill,
+            text: self.title.clone(),
+        });
+
+        self.buttons.clear();
+        let mut x = w - NOTICE_PAD - buttons_w;
+        for (i, (label, lw)) in self.actions.iter().zip(&labels).enumerate() {
+            let bw = lw + 2.0 * NOTICE_BUTTON_PAD;
+            let hovered = pointer
+                .is_some_and(|(px, py)| px >= x && px <= x + bw && py >= 8.0 && py <= h - 8.0);
+            let button = Shape::rect(
+                x,
+                8.0,
+                bw,
+                h - 16.0,
+                8.0,
+                if hovered { BUTTON_HOVER } else { BUTTON_FILL },
+            );
+            shapes.push(button);
+            self.buttons.push(button);
+            match self.clicked {
+                // Wispr swaps the label for a check while the action runs.
+                Some((c, _)) if c == i => check_icon(x + bw / 2.0, h / 2.0, 16.0, TEXT, shapes),
+                _ => texts.push(Text {
+                    x: x + NOTICE_BUTTON_PAD,
+                    top: text_top,
+                    line: TEXT_LINE,
+                    size: TEXT_SIZE,
+                    bold: false,
+                    color: TEXT,
+                    bg: over(button.fill, fill),
+                    text: label.clone(),
+                }),
+            }
+            x += bw + NOTICE_BUTTON_GAP;
+        }
+
+        if !self.timeout.is_zero() {
+            // Along the bottom edge, inside the rounded corners.
+            let (left, right) = (NOTICE_RADIUS / 2.0, w - NOTICE_RADIUS / 2.0);
+            shapes.push(Shape::rect(left, h - 3.0, right - left, 3.0, 1.5, TRACK));
+            let done = (right - left) * self.progress.clamp(0.0, 1.0);
+            if done > 0.0 {
+                shapes.push(Shape::rect(left, h - 3.0, done, 3.0, 1.5, PROGRESS));
+            }
+        }
+        (w, h)
+    }
+}
+
 fn pill(size: (f64, f64), fill: [u8; 4], outline: [u8; 4], width: f64) -> Shape {
     let mut s = Shape::rect(0.0, 0.0, size.0, size.1, size.1 / 2.0, fill);
     s.border = Some((outline, width));
     s
 }
 
-/// Lucide's 12 px icons (24-unit viewBox, stroke 3) scaled to CSS pixels.
-const ICON: f64 = 12.0 / 24.0;
-
-fn icon_line(cx: f64, cy: f64, a: (f64, f64), b: (f64, f64), fill: [u8; 4]) -> Shape {
-    let p = |(x, y): (f64, f64)| (cx + (x - 12.0) * ICON, cy + (y - 12.0) * ICON);
-    Shape::line(p(a), p(b), 3.0 * ICON, fill)
+/// A lucide icon line (24-unit viewBox) drawn `size` pixels wide at stroke
+/// `stroke` units.
+fn icon_line(
+    cx: f64,
+    cy: f64,
+    size: f64,
+    stroke: f64,
+    a: (f64, f64),
+    b: (f64, f64),
+    fill: [u8; 4],
+) -> Shape {
+    let k = size / 24.0;
+    let p = |(x, y): (f64, f64)| (cx + (x - 12.0) * k, cy + (y - 12.0) * k);
+    Shape::line(p(a), p(b), stroke * k, fill)
 }
 
 fn cancel_button(cx: f64, cy: f64, shapes: &mut Vec<Shape>) {
     let r = BUTTON / 2.0;
     shapes.push(Shape::rect(cx - r, cy - r, BUTTON, BUTTON, r, CANCEL_BG));
-    // lucide x: M18 6 6 18, m6 6 12 12
-    shapes.push(icon_line(cx, cy, (18.0, 6.0), (6.0, 18.0), CANCEL_FG));
-    shapes.push(icon_line(cx, cy, (6.0, 6.0), (18.0, 18.0), CANCEL_FG));
+    // lucide x, 12 px, stroke 3: M18 6 6 18, m6 6 12 12
+    shapes.push(icon_line(
+        cx,
+        cy,
+        12.0,
+        3.0,
+        (18.0, 6.0),
+        (6.0, 18.0),
+        CANCEL_FG,
+    ));
+    shapes.push(icon_line(
+        cx,
+        cy,
+        12.0,
+        3.0,
+        (6.0, 6.0),
+        (18.0, 18.0),
+        CANCEL_FG,
+    ));
 }
 
 fn accept_button(cx: f64, cy: f64, shapes: &mut Vec<Shape>) {
     let r = BUTTON / 2.0;
     shapes.push(Shape::rect(cx - r, cy - r, BUTTON, BUTTON, r, ACCEPT_BG));
-    // lucide check: M20 6 9 17l-5-5
-    shapes.push(icon_line(cx, cy, (20.0, 6.0), (9.0, 17.0), ACCEPT_FG));
-    shapes.push(icon_line(cx, cy, (9.0, 17.0), (4.0, 12.0), ACCEPT_FG));
+    shapes.push(icon_line(
+        cx,
+        cy,
+        12.0,
+        3.0,
+        (20.0, 6.0),
+        (9.0, 17.0),
+        ACCEPT_FG,
+    ));
+    shapes.push(icon_line(
+        cx,
+        cy,
+        12.0,
+        3.0,
+        (9.0, 17.0),
+        (4.0, 12.0),
+        ACCEPT_FG,
+    ));
+}
+
+/// lucide check (M20 6 9 17l-5-5), stroke 2.
+fn check_icon(cx: f64, cy: f64, size: f64, fill: [u8; 4], shapes: &mut Vec<Shape>) {
+    shapes.push(icon_line(cx, cy, size, 2.0, (20.0, 6.0), (9.0, 17.0), fill));
+    shapes.push(icon_line(cx, cy, size, 2.0, (9.0, 17.0), (4.0, 12.0), fill));
 }
 
 /// Wispr's processing spinner: 8 bars of 2x5 px, 6 px from the centre.
@@ -499,6 +781,11 @@ pub fn over(top: [u8; 4], bottom: [u8; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
 
+    /// 8 px per character.
+    fn measure(text: &str, _size: f64, _bold: bool) -> f64 {
+        8.0 * text.chars().count() as f64
+    }
+
     fn state() -> BarState {
         let mut s = BarState::default();
         s.apply(PillCommand::RestingBar(true));
@@ -509,18 +796,22 @@ mod tests {
         Instant::now()
     }
 
+    fn mode(s: &mut BarState) -> Mode {
+        s.frame(now(), &measure, None).mode
+    }
+
     #[test]
     fn push_to_talk_goes_through_wispr_states() {
         let mut s = state();
-        assert_eq!(s.shown(now()), Mode::Resting);
+        assert_eq!(mode(&mut s), Mode::Resting);
         s.apply(PillCommand::Status("initializing".into()));
-        assert_eq!(s.shown(now()), Mode::Initializing);
+        assert_eq!(mode(&mut s), Mode::Initializing);
         s.apply(PillCommand::Status("listening".into()));
-        assert_eq!(s.shown(now()), Mode::PushToTalk);
+        assert_eq!(mode(&mut s), Mode::PushToTalk);
         s.apply(PillCommand::Status("stopping".into()));
-        assert_eq!(s.shown(now()), Mode::Processing);
+        assert_eq!(mode(&mut s), Mode::Processing);
         s.apply(PillCommand::Status("idle".into()));
-        assert_eq!(s.shown(now()), Mode::Resting);
+        assert_eq!(mode(&mut s), Mode::Resting);
     }
 
     #[test]
@@ -529,14 +820,17 @@ mod tests {
         s.apply(PillCommand::Status("initializing".into()));
         s.apply(PillCommand::Mic(true));
         assert!(
-            !s.frame(now()).animated,
+            !s.frame(now(), &measure, None).animated,
             "dropped while initializing, as in Wispr"
         );
         s.apply(PillCommand::Status("listening".into()));
-        assert!(!s.frame(now()).animated, "still dots until the first audio");
+        assert!(
+            !s.frame(now(), &measure, None).animated,
+            "still dots until the first audio"
+        );
         s.apply(PillCommand::Mic(true));
         s.apply(PillCommand::Level(1.0));
-        let f = s.frame(now() + Duration::from_secs(1));
+        let f = s.frame(now() + Duration::from_secs(1), &measure, None);
         assert!(f.animated);
         let tallest = f.shapes[1..].iter().map(|b| b.h).fold(0.0, f64::max);
         assert!(
@@ -544,48 +838,117 @@ mod tests {
             "a loud voice makes tall bars"
         );
         s.apply(PillCommand::Silence(true));
-        assert!(!s.frame(now()).animated);
+        assert!(!s.frame(now(), &measure, None).animated);
     }
 
     #[test]
-    fn hands_free_keeps_its_pill_through_listening() {
+    fn hands_free_keeps_its_pill_and_its_buttons_work() {
         let mut s = state();
         s.apply(PillCommand::Status("initializing".into()));
         s.apply(PillCommand::Popo);
         s.apply(PillCommand::Status("listening".into()));
-        assert_eq!(s.shown(now()), Mode::HandsFree);
-        assert_eq!(Mode::HandsFree.size(), (102.5, 30.0));
+        let f = s.frame(now(), &measure, None);
+        assert_eq!((f.mode, f.size), (Mode::HandsFree, (102.5, 30.0)));
+        let (cancel, accept) = buttons();
+        assert_eq!(s.click(cancel, 15.0), Some(BarEvent::Click("cancel")));
+        assert_eq!(s.click(accept, 15.0), Some(BarEvent::Click("stop")));
+        assert_eq!(s.click(HANDS_FREE.0 / 2.0, 15.0), None);
+        // [cancel 18] 4 [waveform 46] 4 [accept 18], centred.
+        assert!((accept - cancel - (18.0 + 4.0 + 46.0 + 4.0)).abs() < 1e-9);
+        assert!((cancel - 9.0 - (HANDS_FREE.0 - 90.0) / 2.0).abs() < 1e-9);
     }
 
     #[test]
-    fn hands_free_buttons_cancel_and_accept() {
-        let (cancel, accept) = buttons();
-        assert_eq!(click_action(Mode::HandsFree, cancel, 15.0), Some("cancel"));
-        assert_eq!(click_action(Mode::HandsFree, accept, 15.0), Some("stop"));
-        assert_eq!(click_action(Mode::HandsFree, MAX_SIZE.0 / 2.0, 15.0), None);
-        assert_eq!(click_action(Mode::PushToTalk, 10.0, 15.0), Some("stop"));
-        assert_eq!(click_action(Mode::Resting, 10.0, 4.0), Some("start"));
-        assert_eq!(click_action(Mode::Processing, 10.0, 15.0), None);
-        // [cancel 18] 4 [waveform 46] 4 [accept 18], centred.
-        assert!((accept - cancel - (18.0 + 4.0 + 46.0 + 4.0)).abs() < 1e-9);
-        assert!((cancel - 9.0 - (MAX_SIZE.0 - 90.0) / 2.0).abs() < 1e-9);
+    fn rest_and_push_to_talk_clicks() {
+        let mut s = state();
+        mode(&mut s);
+        assert_eq!(s.click(10.0, 4.0), Some(BarEvent::Click("start")));
+        s.apply(PillCommand::Status("listening".into()));
+        mode(&mut s);
+        assert_eq!(s.click(10.0, 15.0), Some(BarEvent::Click("stop")));
+        s.apply(PillCommand::Status("processing".into()));
+        mode(&mut s);
+        assert_eq!(s.click(10.0, 15.0), None);
     }
 
     #[test]
     fn errors_flash_then_rest() {
         let mut s = state();
         s.apply(PillCommand::Status("error".into()));
-        assert_eq!(s.shown(now()), Mode::Error);
+        assert_eq!(mode(&mut s), Mode::Error);
         let later = now() + Duration::from_millis(600);
-        assert_eq!(s.frame(later).mode, Mode::Resting);
+        assert_eq!(s.frame(later, &measure, None).mode, Mode::Resting);
     }
 
     #[test]
     fn wispr_page_hides_the_bar() {
         let mut s = state();
         s.apply(PillCommand::Enabled(false));
-        assert_eq!(s.shown(now()), Mode::Hidden);
-        assert!(s.frame(now()).shapes.is_empty());
+        let f = s.frame(now(), &measure, None);
+        assert_eq!(f.mode, Mode::Hidden);
+        assert!(f.shapes.is_empty());
+    }
+
+    fn cancelled(s: &mut BarState) {
+        s.apply(PillCommand::Notify {
+            title: "Transcript cancelled".into(),
+            actions: vec!["Undo".into()],
+            timeout: Duration::from_secs(3),
+        });
+    }
+
+    #[test]
+    fn a_notification_replaces_the_bar_and_times_out() {
+        let mut s = state();
+        cancelled(&mut s);
+        let t0 = now();
+        let f = s.frame(t0, &measure, None);
+        assert_eq!(f.mode, Mode::Notice);
+        // 16 + 160 (title) + 16 + 10 + 32 (Undo) + 10 + 16
+        assert_eq!(f.size, (260.0, 48.0));
+        assert_eq!(f.texts[0].text, "Transcript cancelled");
+        assert_eq!(f.texts[1].text, "Undo");
+        let f = s.frame(t0 + Duration::from_millis(3100), &measure, None);
+        assert_eq!(f.events, vec![BarEvent::NoticeClosed("timeout")]);
+        assert_eq!(f.mode, Mode::Resting);
+    }
+
+    #[test]
+    fn hovering_pauses_the_notification() {
+        let mut s = state();
+        cancelled(&mut s);
+        let t0 = now();
+        s.frame(t0, &measure, None);
+        let f = s.frame(t0 + Duration::from_secs(5), &measure, Some((20.0, 20.0)));
+        assert!(f.events.is_empty() && f.mode == Mode::Notice);
+        let f = s.frame(t0 + Duration::from_secs(9), &measure, None);
+        assert_eq!(f.events, vec![BarEvent::NoticeClosed("timeout")]);
+    }
+
+    #[test]
+    fn undo_reports_the_action_shows_a_check_then_closes() {
+        let mut s = state();
+        cancelled(&mut s);
+        s.frame(now(), &measure, None);
+        // Undo sits at the right: x from 260 - 16 - 52 = 192 to 244.
+        assert_eq!(s.click(100.0, 24.0), None, "the title is not a button");
+        assert_eq!(s.click(210.0, 24.0), Some(BarEvent::NoticeAction(0)));
+        assert_eq!(s.click(210.0, 24.0), None, "only once");
+        let f = s.frame(now(), &measure, None);
+        assert_eq!(f.texts.len(), 1, "the label became a check");
+        let f = s.frame(now() + Duration::from_millis(700), &measure, None);
+        assert_eq!(f.events, vec![BarEvent::NoticeClosed("action")]);
+    }
+
+    #[test]
+    fn a_new_dictation_or_main_closes_the_notification() {
+        let mut s = state();
+        cancelled(&mut s);
+        s.apply(PillCommand::Status("initializing".into()));
+        assert_eq!(mode(&mut s), Mode::Initializing);
+        cancelled(&mut s);
+        s.apply(PillCommand::NotifyClear);
+        assert_eq!(mode(&mut s), Mode::Initializing);
     }
 
     #[test]

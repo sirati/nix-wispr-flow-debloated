@@ -37,6 +37,7 @@ const MIC_TARGET = "@micTarget@";
 const CAPTURE_CMD = "@captureCmd@";
 const DEVICE_NAME = "@deviceName@";
 const PLAYER_CMD = "@playerCmd@";
+const FONT_DIR = "@fontDir@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
@@ -127,6 +128,23 @@ function barCommand(ch, a) {
 // the hotkey reminder.
 const PAGE_STATUSES = /^(polish_|instruct_chat_|toggle_hotkey_reminder)/;
 
+// Notifications the Rust bar draws: Wispr's "condensed" layout (a title and
+// up to two buttons) whose strings are known here. The page translates keys,
+// so only for an English UI; anything else loads the page.
+const NOTICE_TEXT = {
+  transcript_cancelled_title: "Transcript cancelled",
+  transcript_cancelled_detailed_action_undo: "Undo",
+};
+function nativeNotice(p, locale) {
+  if (!/^en/i.test(locale) || p?.variant !== "condensed" || p.titleWrap || p.selfDismiss === false) return null;
+  if (p.icon || p.badge || p.badgeIcon) return null;
+  const text = (t) => (typeof t === "string" ? t : t?.values ? undefined : NOTICE_TEXT[t?.key]);
+  const title = text(p.title);
+  const actions = (p.actions ?? []).map((a) => text(a?.text));
+  if (!title || actions.length > 2 || actions.some((a) => !a)) return null;
+  return { op: "notify", title, actions, timeout: Number(p.timeout ?? 4000) || 0 };
+}
+
 // The value at a dotted path, or undefined. A value that was null or missing
 // before is arriving for the first time (Wispr fills placeholders at login).
 const valueAt = (obj, p) => p.split(".").reduce((o, k) => (o !== null && typeof o === "object" ? o[k] : undefined), obj);
@@ -161,6 +179,7 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   if (given(CAPTURE_CMD)) args.push("--capture-cmd", CAPTURE_CMD);
   if (given(DEVICE_NAME)) args.push("--device-name", DEVICE_NAME);
   if (given(PLAYER_CMD)) args.push("--player-cmd", PLAYER_CMD);
+  if (given(FONT_DIR)) args.push("--font-dir", FONT_DIR);
   // Tests only: a stand-in microphone.
   if (process.env.WISPR_HEADLESS_TEST_CAPTURE) args.push("--capture-cmd", process.env.WISPR_HEADLESS_TEST_CAPTURE);
   let child;
@@ -208,6 +227,7 @@ function build(electron) {
   const byRole = new Map(); // role -> Lazy (first window of that role)
   let headless = true;
   let session = null; // current dictation uuid
+  let notice = null; // the notification the Rust bar shows (Wispr's payload)
 
   const fakeEvent = (wc) => ({ sender: wc, senderFrame: null, frameId: 0, processId: 0, ports: [], returnValue: undefined, reply: () => {} });
   const emitFrom = (lazy, ch, payload) => {
@@ -273,6 +293,16 @@ function build(electron) {
         else if (msg.action === "cancel") emitFrom(status, "status:cancelClicked", "user_action_cancel_button");
         break;
       }
+      case "noticeAction": {
+        const action = notice?.actions?.[msg.index];
+        if (action) emitFrom(byRole.get("status"), "notification:callback", { callback: action.callback, type: notice.type, callbackOperationId: notice.callbackOperationId, isFirstHit: undefined });
+        break;
+      }
+      case "noticeClosed":
+        // The page reports its own timeout or action to main the same way.
+        if (notice) emitFrom(byRole.get("status"), "notification:clear", { type: notice.type, reason: String(msg.reason) });
+        notice = null;
+        break;
       case "micFailed":
         trace({ ev: "daemon.micFailed", error: String(msg.error).slice(0, 200) });
         emitFrom(hub, "dictation:micAcquisitionFailed", { transcriptionEntityUuid: uuid });
@@ -432,7 +462,19 @@ function build(electron) {
           this.remindersActive = a?.reminders?.length > 0;
           if (!this.remindersActive) return true;
         }
-        if (ch === "notification:show") this.notificationActive = true;
+        if (ch === "notification:show") {
+          const n = daemon && nativeNotice(a, electron.app.getLocale());
+          if (n) {
+            notice = a;
+            daemon.send(n);
+            return true;
+          }
+          this.notificationActive = true;
+        }
+        if (ch === "notification:clear" && notice) {
+          notice = null;
+          daemon.send({ op: "notifyClear" });
+        }
         if (STATUS_DROP.has(ch)) return true;
         return false;
       }
@@ -456,7 +498,11 @@ function build(electron) {
       const cmd = barCommand(ch, args[0]);
       if (cmd) daemon?.send(cmd);
       if (ch === "notification:show") { lazy.notificationActive = true; lazy.checkStatusIdle(); }
-      if (ch === "notification:clear") { lazy.notificationActive = false; lazy.checkStatusIdle(); }
+      if (ch === "notification:clear") {
+        lazy.notificationActive = false;
+        lazy.checkStatusIdle();
+        if (notice) { notice = null; daemon?.send({ op: "notifyClear" }); }
+      }
       if (ch === "status:setReminders") { lazy.remindersActive = args[0]?.reminders?.length > 0; lazy.checkStatusIdle(); }
     }
     return false;

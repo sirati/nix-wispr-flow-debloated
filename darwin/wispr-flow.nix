@@ -59,6 +59,8 @@ let
       "-ac 1 -ar 16000 -f s16le -flush_packets 1 -"
     ];
     deviceName = "Default (macOS)";
+    # The bar uses the system font.
+    fontDir = "";
     playerCmd = "/usr/bin/afplay";
   };
 

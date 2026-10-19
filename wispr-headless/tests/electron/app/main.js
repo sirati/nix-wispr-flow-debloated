@@ -140,6 +140,36 @@ app.whenReady().then(async () => {
   status.webContents.send("status:dictationStatus", "idle");
   check(renderers() === 0, "still no renderers after a dictation");
 
+  // Wispr's "Transcript cancelled" pill is drawn in Rust, with its Undo.
+  let callback = null;
+  let cleared = null;
+  ipcMain.on("notification:callback", (_e, a) => { callback = a; });
+  ipcMain.on("notification:clear", (_e, a) => { cleared = a; });
+  status.webContents.send("notification:show", {
+    type: "TranscriptCancelled", status: "info", title: { key: "transcript_cancelled_title" },
+    actions: [{ text: { key: "transcript_cancelled_detailed_action_undo" }, callback: "retry_last_text" }],
+    variant: "condensed", window: "status", timeout: 3000, playSound: false,
+  });
+  await wait(300);
+  check(renderers() === 0, "the cancel notification draws in Rust, no status page");
+  if (xdotool) {
+    // Without fonts the bar estimates 0.55 x 15 px per character: the pill is
+    // 266x48 at the bottom centre, Undo at x 197..250 of it.
+    execSync(`${xdotool} mousemove 730 766 click 1`);
+    await until("undo", () => callback !== null, 3_000);
+    check(callback?.callback === "retry_last_text" && callback?.type === "TranscriptCancelled", `Undo sends notification:callback retry_last_text (${callback?.callback})`);
+    await until("closed", () => cleared !== null, 3_000);
+    check(cleared?.reason === "action", `the pill closes after Undo with reason action (${cleared?.reason})`);
+  }
+  cleared = null;
+  // (Off the pill: the pointer on it pauses the timer.)
+  if (xdotool) execSync(`${xdotool} mousemove 10 10`);
+  status.webContents.send("notification:show", {
+    type: "TranscriptCancelled", title: { key: "transcript_cancelled_title" }, actions: [], variant: "condensed", timeout: 500,
+  });
+  await until("timeout", () => cleared !== null, 3_000);
+  check(cleared?.reason === "timeout", `an untouched notification times out (${cleared?.reason})`);
+
   // A notification needs the real status page.
   status.webContents.send("notification:show", { type: "tip" });
   await until("status loaded", () => loaded.includes("status"));

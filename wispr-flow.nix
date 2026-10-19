@@ -81,6 +81,8 @@ let
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
     micTarget = cfg.headless.micTarget;
+    # The flow bar's text: Figtree, the font of Wispr's own page.
+    fontDir = "${pkgs.figtree}/share/fonts/truetype";
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
