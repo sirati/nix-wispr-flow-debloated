@@ -40,8 +40,13 @@ const PLAYER_CMD = "@playerCmd@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
-// A loaded window that went back to showing nothing is stopped after this.
-const STATUS_IDLE_MS = Number(process.env.WISPR_HEADLESS_TEST_IDLE_MS) || 15_000;
+// A loaded window that went back to showing nothing is stopped after this:
+// the status page almost at once (time for its exit animation), since the
+// Rust bar takes over; a hidden window after a minute.
+const STATUS_IDLE_MS = Number(process.env.WISPR_HEADLESS_TEST_IDLE_MS) || 400;
+// The Rust bar stays up this long after the status page loads, so the bar
+// never blanks while the page paints its first frame.
+const HANDOVER_MS = 150;
 const HIDDEN_IDLE_MS = Number(process.env.WISPR_HEADLESS_TEST_IDLE_MS) || 60_000;
 
 function openTrace() {
@@ -302,12 +307,15 @@ function build(electron) {
       this.materialized = true;
       this.cancelIdle();
       trace({ ev: "materialize", win: this.role, why });
-      if (this.role === "status") daemon?.send({ op: "pill", enabled: false });
-      if (!this.load) return Promise.resolve();
+      if (!this.load) {
+        if (this.role === "status") daemon?.send({ op: "pill", enabled: false });
+        return Promise.resolve();
+      }
       const [method, args] = this.load;
       this.loading = new Promise((resolve) => {
         this.wc.once("did-finish-load", () => {
           this.loading = null;
+          if (this.role === "status") setTimeout(() => { if (this.materialized) daemon?.send({ op: "pill", enabled: false }); }, HANDOVER_MS);
           const queued = this.queue.splice(0);
           for (const [ch, a] of queued) this.realSend(ch, ...a);
           if (this.wantVisible && !this.win.isDestroyed()) this.realWin[this.showMethod].call(this.win);
@@ -362,7 +370,8 @@ function build(electron) {
     // Status window: back to showing nothing?
     checkStatusIdle() {
       if (this.role !== "status" || !this.materialized) return;
-      if (!this.notificationActive && !this.remindersActive && !this.drawsMoreThanBar && !session) this.scheduleIdle(STATUS_IDLE_MS, "only the bar");
+      // A running dictation needs no page: the Rust bar draws all of it.
+      if (!this.notificationActive && !this.remindersActive && !this.drawsMoreThanBar) this.scheduleIdle(STATUS_IDLE_MS, "only the bar");
       else this.cancelIdle();
     }
 

@@ -79,8 +79,11 @@ fn rgba([r, g, b, a]: [u8; 4]) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(c(r), c(g), c(b), c(a))
 }
 
+/// A clockwise rotation as seen on screen. Core Animation turns a positive
+/// angle counterclockwise even in our flipped (y-down) geometry, so the sign
+/// is reversed (otherwise the check mark comes out mirrored).
 fn rotation(angle: f64) -> CGAffineTransform {
-    let (sin, cos) = angle.sin_cos();
+    let (sin, cos) = (-angle).sin_cos();
     CGAffineTransform {
         a: cos,
         b: sin,
