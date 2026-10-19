@@ -22,6 +22,13 @@
 // kill causes is kept from Wispr. If wispr-headless cannot run, every window
 // loads as usual. Only names and key paths are logged, never values, in
 // ~/.cache/wispr-flow/shim-trace.jsonl.
+//
+// A new Wispr version must still have these names in .webpack/main/index.js:
+// dictation:audioStart, dictation:audioChunk, recordingStarted,
+// recordingDone, status:dictationStatus, status:audioLevel, status:micActive,
+// status:popo, status:startClicked, notification:show, zubridge:state-update,
+// hideFlowBarPermanently, clickableBubbleSnoozeUntil, and the preload paths
+// renderer/<role>/preload.js.
 "use strict";
 
 const path = require("path");

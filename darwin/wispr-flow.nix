@@ -1,6 +1,5 @@
 # Wispr Flow for the Mac, pinned by Nix and without Chromium renderers until
-# its UI is needed (the same headless shim as on Linux;
-# see the README).
+# its UI is needed (the same headless shim as on Linux).
 #
 # The app is Wispr's own release zip with its app.asar (and app.asar.unpacked)
 # moved, unchanged, to Resources/wispr/, and a Resources/app/ folder holding a
@@ -26,7 +25,7 @@
 # Bumping: take the version and URL from
 # https://dl.wisprflow.com/wispr-flow/darwin/arm64/RELEASES.json (currentRelease),
 # update `version` and `hash`, and check the shim's IPC names still exist in
-# the new app.asar (see the README).
+# the new app.asar (listed at the top of wispr-headless/shim.js).
 #
 # Arguments (see flake.nix, lib.macWisprFlow):
 #   native   nixpkgs for the build machine (x86_64-linux)
