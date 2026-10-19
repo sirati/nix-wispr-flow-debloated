@@ -10,7 +10,17 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape", "randr"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", features = ["objc2-quartz-core", "objc2-core-foundation"] }
+objc2-quartz-core = "0.3"
+objc2-core-foundation = "0.3"
+dispatch2 = "0.3"
 
 [profile.release]
 lto = true

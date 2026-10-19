@@ -15,6 +15,7 @@ trap 'rm -rf "$work"' EXIT
 cp -r "$here/app" "$work/app"
 mkdir -p "$work/app/wispr-shim"
 sed -e "s#@daemon@#$daemon#" -e "s#@pwcat@#/bin/true#" -e "s#@micTarget@##" \
+	-e "s#@captureCmd@##" -e "s#@deviceName@##" -e "s#@playerCmd@##" \
 	"$here/../../shim.js" > "$work/app/wispr-shim/index.js"
 printf '{"name":"wispr-like","main":"wispr-shim/index.js","wisprOriginalMain":"main.js"}\n' > "$work/app/package.json"
 

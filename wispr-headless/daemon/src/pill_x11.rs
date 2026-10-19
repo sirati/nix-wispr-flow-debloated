@@ -1,7 +1,4 @@
-//! Wispr's flow bar, drawn without Chromium: the small resting bar at the
-//! bottom of the screen, Wispr's waveform while recording (see wave.rs), and
-//! pulsing dots while Wispr finishes. A click on the resting bar starts a
-//! dictation and a click while recording stops it, as on Wispr's own bar.
+//! The flow bar on Linux (see bar.rs for what it shows).
 //!
 //! It is an X11 window (XWayland on GNOME and KDE): GNOME keeps no native
 //! Wayland window above others, and an override-redirect X11 window is never
@@ -9,10 +6,8 @@
 //! clicks next to it go through. A separate thread waits for X events, so a
 //! resting bar costs no wakeups. If there is no X display, the bar is off.
 //!
-//! Sizes are Wispr's CSS pixels, multiplied by the display scale (Xft.dpi /
-//! 96, so 2 on a 200 % screen). Measured from Wispr's own page at 200 %: the
-//! resting bar is 80x16 device pixels, a black fill at 50 % inside a 2 px
-//! #aaaaaa outline at 75 %.
+//! Sizes are multiplied by the display scale (Xft.dpi / 96, so 2 on a 200 %
+//! screen).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc as Shared;
@@ -28,61 +23,11 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
 
+use crate::bar::{
+    click_action, dot_alpha, BarState, Frame, Mode, PillCommand, BAR_GAP, BORDER, BOTTOM_MARGIN,
+    DOT, DOT_STEP, FRAME, WINDOW,
+};
 use crate::wave;
-
-/// All sizes below are CSS pixels.
-const WINDOW: (f64, f64) = (66.0, 18.0);
-const REST: (f64, f64) = (40.0, 8.0);
-const ACTIVE: (f64, f64) = (54.0, 18.0);
-const BORDER: f64 = 1.0;
-const BAR_GAP: f64 = 2.0;
-/// Gap between the bottom of the bar and the bottom of the screen.
-const BOTTOM_MARGIN: f64 = 10.0;
-const FRAME: Duration = Duration::from_millis(16);
-
-/// What the bar shows.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Mode {
-    Hidden,
-    Resting,
-    Recording,
-    Working,
-}
-
-/// From Wispr's dictation status and whether its resting bar is enabled.
-pub fn mode_for(status: &str, resting_bar: bool) -> Mode {
-    match status {
-        "recording" => Mode::Recording,
-        "idle" | "testing" | "dismissed" | "" => {
-            if resting_bar {
-                Mode::Resting
-            } else {
-                Mode::Hidden
-            }
-        }
-        _ => Mode::Working,
-    }
-}
-
-/// What a click on the bar means in each mode.
-pub fn click_action(mode: Mode) -> Option<&'static str> {
-    match mode {
-        Mode::Resting => Some("start"),
-        Mode::Recording => Some("stop"),
-        Mode::Working | Mode::Hidden => None,
-    }
-}
-
-/// Wispr's audio level is 0..1; tolerate dB just in case.
-pub fn normalize_level(v: f64) -> f64 {
-    if !v.is_finite() {
-        0.0
-    } else if v < 0.0 {
-        ((v + 60.0) / 60.0).clamp(0.0, 1.0)
-    } else {
-        v.clamp(0.0, 1.0)
-    }
-}
 
 /// Display scale from an X resource string (`Xft.dpi: 192` gives 2).
 pub fn scale_from_resources(resources: &str) -> f64 {
@@ -113,10 +58,7 @@ impl Geometry {
 
     /// The part of the window a mode draws on, centred on the bottom line.
     pub fn body(&self, mode: Mode) -> Rectangle {
-        let (w, h) = match mode {
-            Mode::Resting => REST,
-            _ => ACTIVE,
-        };
+        let (w, h) = mode.size();
         let (w, h) = (px(w, self.scale), px(h, self.scale));
         Rectangle {
             x: ((self.width - w) / 2) as i16,
@@ -129,19 +71,6 @@ impl Geometry {
 
 fn px(css: f64, scale: f64) -> u16 {
     (css * scale).round().max(1.0) as u16
-}
-
-/// Commands for the bar thread.
-pub enum PillCommand {
-    Status(String),
-    Level(f64),
-    /// `status:micActive`: bars are white while the mic is active.
-    Mic(bool),
-    /// Wispr's own status page is up and draws the bar itself.
-    Enabled(bool),
-    /// Whether Wispr shows its resting bar (its hideFlowBarPermanently and
-    /// snooze preferences).
-    RestingBar(bool),
 }
 
 struct Surface {
@@ -340,7 +269,7 @@ impl Surface {
         self.fill_capsule(argb(0x80, 0, 0, 0), inner);
     }
 
-    fn draw(&mut self, mode: Mode, heights: &[f64; wave::BARS], mic_active: bool, phase: f64) {
+    fn draw(&mut self, f: &Frame) {
         let g = self.geo;
         self.fill(
             0,
@@ -351,22 +280,23 @@ impl Surface {
                 height: g.height,
             }],
         );
-        let area = g.body(mode);
+        let area = g.body(f.mode);
         self.set_input(Some(area));
-        if mode == Mode::Hidden {
+        if f.mode == Mode::Hidden {
             let _ = self.conn.flush();
             return;
         }
         self.body(area);
         let cy = f64::from(area.y) + f64::from(area.height) / 2.0;
-        match mode {
+        match f.mode {
             Mode::Recording => {
                 let bar_w = px(wave::BAR_WIDTH, g.scale);
                 let gap = px(BAR_GAP, g.scale);
                 let total = wave::BARS as u16 * bar_w + (wave::BARS as u16 - 1) * gap;
                 let left = area.x + ((area.width - total) / 2) as i16;
-                let alpha = if mic_active { 0xff } else { 0x66 };
-                let rects: Vec<Rectangle> = heights
+                let alpha = if f.mic_active { 0xff } else { 0x66 };
+                let rects: Vec<Rectangle> = f
+                    .heights
                     .iter()
                     .enumerate()
                     .map(|(i, &h)| {
@@ -383,15 +313,14 @@ impl Surface {
                 self.fill(argb(alpha, 0xff, 0xff, 0xff), &rects);
             }
             Mode::Working => {
-                let d = px(3.0, g.scale);
-                let step = px(6.0, g.scale) as i16;
+                let d = px(DOT, g.scale);
+                let step = px(DOT_STEP, g.scale) as i16;
                 let cx = area.x + (area.width / 2) as i16;
-                for i in 0..3i16 {
-                    let pulse = ((phase * 6.0 - f64::from(i) * 0.9).sin() * 0.5 + 0.5) * 0.8 + 0.2;
+                for i in 0..3usize {
                     self.fill_arcs(
-                        argb((pulse * 255.0) as u8, 0xff, 0xff, 0xff),
+                        argb((dot_alpha(f.t, i) * 255.0) as u8, 0xff, 0xff, 0xff),
                         &[Arc {
-                            x: cx + (i - 1) * step - (d / 2) as i16,
+                            x: cx + (i as i16 - 1) * step - (d / 2) as i16,
                             y: (cy - f64::from(d) / 2.0) as i16,
                             width: d,
                             height: d,
@@ -442,56 +371,28 @@ pub fn run(
         });
     }
 
-    let mut status = String::from("idle");
-    let mut resting_bar = false;
-    let mut enabled = true;
-    let mut mic_active = false;
-    let mut target = 0.0f64;
-    let mut level = 0.0f64;
-    let mut last_frame = Instant::now();
+    let mut state = BarState::default();
     let mut last_drawn: Option<Mode> = None;
-    let start = Instant::now();
     loop {
-        let mode = mode_for(&status, resting_bar);
         // Only animated modes need frames; a resting or hidden bar sleeps.
-        let animated = enabled && matches!(mode, Mode::Recording | Mode::Working);
-        let timeout = if animated {
+        let timeout = if state.shown().animated() {
             FRAME
         } else {
             Duration::from_secs(3600)
         };
         match commands.recv_timeout(timeout) {
-            Ok(PillCommand::Status(s)) => {
-                status = s;
-                if status != "recording" {
-                    target = 0.0;
-                }
-            }
-            Ok(PillCommand::Level(v)) => target = normalize_level(v),
-            Ok(PillCommand::Mic(m)) => mic_active = m,
-            Ok(PillCommand::Enabled(e)) => enabled = e,
-            Ok(PillCommand::RestingBar(r)) => resting_bar = r,
+            Ok(c) => state.apply(c),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        let now = Instant::now();
-        level = wave::smooth(
-            level,
-            target,
-            now.duration_since(last_frame).as_secs_f64() * 1000.0,
-        );
-        last_frame = now;
-
-        let mode = mode_for(&status, resting_bar);
-        let show = enabled && mode != Mode::Hidden;
-        *shown.lock().expect("mode lock poisoned") = if show { mode } else { Mode::Hidden };
+        let f = state.frame(Instant::now());
+        *shown.lock().expect("mode lock poisoned") = f.mode;
         if let Some(s) = surface.as_mut() {
+            let show = f.mode != Mode::Hidden;
             s.set_visible(show);
-            let animated = matches!(mode, Mode::Recording | Mode::Working);
-            if show && (animated || last_drawn != Some(mode)) {
-                let t = start.elapsed().as_secs_f64();
-                s.draw(mode, &wave::heights(t, level), mic_active, t);
-                last_drawn = Some(mode);
+            if show && (f.mode.animated() || last_drawn != Some(f.mode)) {
+                s.draw(&f);
+                last_drawn = Some(f.mode);
             }
             if !show {
                 last_drawn = None;
@@ -503,25 +404,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn statuses_map_to_modes() {
-        assert_eq!(mode_for("recording", true), Mode::Recording);
-        assert_eq!(mode_for("idle", true), Mode::Resting);
-        assert_eq!(mode_for("idle", false), Mode::Hidden);
-        assert_eq!(mode_for("flushing", false), Mode::Working);
-        assert_eq!(mode_for("compressing", true), Mode::Working);
-        assert_eq!(mode_for("reconnecting", true), Mode::Working);
-        assert_eq!(mode_for("something-new", true), Mode::Working);
-    }
-
-    #[test]
-    fn clicks_start_from_rest_and_stop_a_recording() {
-        assert_eq!(click_action(Mode::Resting), Some("start"));
-        assert_eq!(click_action(Mode::Recording), Some("stop"));
-        assert_eq!(click_action(Mode::Working), None);
-        assert_eq!(click_action(Mode::Hidden), None);
-    }
 
     #[test]
     fn resting_bar_matches_wispr_at_200_percent() {
@@ -542,15 +424,6 @@ mod tests {
         assert_eq!(scale_from_resources("Xft.dpi: 96"), 1.0);
         assert_eq!(scale_from_resources(""), 1.0);
         assert_eq!(scale_from_resources("Xft.dpi: 9999"), 4.0);
-    }
-
-    #[test]
-    fn levels_are_clamped_and_db_tolerated() {
-        assert_eq!(normalize_level(0.5), 0.5);
-        assert_eq!(normalize_level(3.0), 1.0);
-        assert_eq!(normalize_level(f64::NAN), 0.0);
-        assert!((normalize_level(-30.0) - 0.5).abs() < 1e-9);
-        assert_eq!(normalize_level(-200.0), 0.0);
     }
 
     #[test]

@@ -14,9 +14,15 @@ struct Daemon {
     lines: Receiver<Value>,
 }
 
+/// The binary under test. Cross-built tests run on another machine than the
+/// build, so its path can be given there.
+fn binary() -> String {
+    std::env::var("WISPR_HEADLESS_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_wispr-headless").into())
+}
+
 impl Daemon {
     fn start(capture: &str) -> Daemon {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wispr-headless"))
+        let mut child = Command::new(binary())
             .args(["--capture-cmd", capture])
             .env_remove("DISPLAY")
             .stdin(Stdio::piped())

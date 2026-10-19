@@ -17,12 +17,14 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   # The unit tests and the binary's own tests (a stand-in microphone) run
-  # here; the indicator is skipped without a display.
+  # here; the indicator is skipped without a display. The macOS build is
+  # cross-compiled on Linux (darwin/cross-packages.nix), which runs its tests
+  # on the Mac instead.
 
   meta = {
     description = "Recorder and speech indicator that stand in for Wispr Flow's hidden windows";
     license = lib.licenses.mit;
     mainProgram = "wispr-headless";
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ [ "aarch64-darwin" ];
   };
 }

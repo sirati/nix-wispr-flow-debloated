@@ -4,10 +4,19 @@
 //! Spawned by the Electron shim (wispr-headless/shim.js), which speaks to it
 //! in JSON lines on stdin/stdout. Exits when stdin closes.
 
-mod pill;
+mod bar;
+#[cfg(target_os = "macos")]
+mod pill_mac;
+#[cfg(target_os = "linux")]
+mod pill_x11;
 mod protocol;
 mod recorder;
 mod wave;
+
+#[cfg(target_os = "macos")]
+use pill_mac as pill;
+#[cfg(target_os = "linux")]
+use pill_x11 as pill;
 
 use std::io::{BufRead, Write};
 use std::process::{Command as Process, Stdio};
@@ -15,7 +24,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use pill::PillCommand;
+use bar::PillCommand;
 use protocol::{Command, Event};
 use recorder::{Progress, Recording};
 
@@ -59,11 +68,24 @@ fn config() -> Config {
             }
             "--target" => target = args.next(),
             "--sounds" => sounds = args.next(),
-            // Tests: any command that writes 16 kHz s16 mono PCM to stdout.
+            // Any command that writes 16 kHz s16 mono PCM to stdout: ffmpeg on
+            // macOS, a stand-in microphone in tests.
             "--capture-cmd" => {
                 if let Some(c) = args.next() {
                     capture = c.split_whitespace().map(String::from).collect();
                     device = "test source".into();
+                }
+            }
+            // What Wispr is told the device is called (after --capture-cmd).
+            "--device-name" => {
+                if let Some(d) = args.next() {
+                    device = d;
+                }
+            }
+            // A command that plays the WAV file given as its last argument.
+            "--player-cmd" => {
+                if let Some(c) = args.next() {
+                    player = c.split_whitespace().map(String::from).collect();
                 }
             }
             "--version" => {
@@ -132,26 +154,38 @@ fn play(cfg: &Config, name: &str, out: &Out) {
 fn main() {
     let cfg = config();
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
-    let clock = Instant::now();
-    let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
 
-    // The flow bar runs on its own thread; its clicks go straight to the shim.
+    // The flow bar keeps the main thread (AppKit needs it on macOS); commands
+    // and the recorder run on their own, and the process ends with them.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
     {
-        let log_out = Out(out.0.clone());
-        let click_out = Out(out.0.clone());
+        let out = Out(out.0.clone());
         std::thread::spawn(move || {
-            pill::run(
-                pill_rx,
-                move |msg| log_out.send(&Event::Log { msg }),
-                move |action| {
-                    click_out.send(&Event::Click {
-                        action: action.to_string(),
-                    })
-                },
-            )
+            serve(&cfg, &out, &pill_tx);
+            std::process::exit(0);
         });
     }
+    let log_out = Out(out.0.clone());
+    let click_out = Out(out.0.clone());
+    pill::run(
+        pill_rx,
+        move |msg| log_out.send(&Event::Log { msg }),
+        // Clicks go straight to the shim.
+        move |action| {
+            click_out.send(&Event::Click {
+                action: action.to_string(),
+            })
+        },
+    );
+    // The bar only stops once serve() is done and about to exit.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
+    let clock = Instant::now();
+    let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
 
     // Commands arrive on their own thread so audio can be polled in between.
     let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
@@ -219,7 +253,7 @@ fn main() {
             Ok(Some(Command::Pill { enabled })) => {
                 let _ = pill_tx.send(PillCommand::Enabled(enabled));
             }
-            Ok(Some(Command::Sound { name })) => play(&cfg, &name, &out),
+            Ok(Some(Command::Sound { name })) => play(cfg, &name, out),
             Ok(Some(Command::Mic { active })) => {
                 let _ = pill_tx.send(PillCommand::Mic(active));
             }

@@ -87,6 +87,16 @@ app.whenReady().then(async () => {
   await wait(800);
   check(renderers() === 0, "first-time store data does not load the status page");
 
+  // Nix pins the version: update checks always find nothing.
+  const { autoUpdater } = require("electron");
+  let updateAnswer = null;
+  autoUpdater.once("update-not-available", () => { updateAnswer = "none"; });
+  autoUpdater.once("update-available", () => { updateAnswer = "available"; });
+  autoUpdater.setFeedURL({ url: "https://example.invalid/feed" });
+  autoUpdater.checkForUpdates();
+  await wait(100);
+  check(updateAnswer === "none", `update checks find no update (${updateAnswer})`);
+
   // A click on the Rust bar reaches the app as Wispr's own start click.
   let xdotool = null;
   try { xdotool = execSync("command -v xdotool").toString().trim(); } catch {}

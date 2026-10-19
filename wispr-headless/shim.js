@@ -29,10 +29,15 @@ const fs = require("fs");
 const childProcess = require("child_process");
 const readline = require("readline");
 
-// Filled in by the Nix build.
+// Filled in by the Nix build; empty when unused (pw-cat and the PipeWire
+// target on Linux, the capture and player commands on macOS).
 const DAEMON = "@daemon@";
 const PW_CAT = "@pwcat@";
 const MIC_TARGET = "@micTarget@";
+const CAPTURE_CMD = "@captureCmd@";
+const DEVICE_NAME = "@deviceName@";
+const PLAYER_CMD = "@playerCmd@";
+const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
 // A loaded window that went back to showing nothing is stopped after this.
@@ -76,19 +81,25 @@ const roleOf = (opts) => {
   const m = /renderer[\\/]([^\\/]+)[\\/]preload\.js$/.exec(String(opts?.webPreferences?.preload ?? ""));
   return m ? m[1] : null;
 };
-const LAZY_ROLES = new Set(["status", "hub", "contextMenu", "scratchpad", "meeting_recorder", "feature_tour"]);
+// Windows that load when shown. Not here: windows that show themselves on
+// 'ready-to-show' (macOS's accessibility_drop and meeting_ax_inspector), which
+// never fires without a load; they are only created when needed anyway.
+const LAZY_ROLES = new Set(["status", "hub", "contextMenu", "scratchpad", "meeting_recorder", "feature_tour", "overlay"]);
 
 // Messages to a renderer-less window that need no page.
 const HUB_DROP = new Set([
   "status:dictationStatus", "hub:hidden", "hub:shown", "history:needsUpdate", "media:initialize",
   "meetingRecorder:weeklyQuotaUpdated", "zubridge:dispatch-ack", "dictation:audioSetup",
+  // macOS, one-way updates for the Hub's own recorder (focused app, whether
+  // playing media can be paused), which does not run here.
+  "helper:appInfoUpdate", "media:isPlaying",
 ]);
 const HUB_SOUNDS = {
   "media:playDictationStartSound": "start",
   "media:playDictationStopSound": "stop",
   "media:playAchievementSound": "achievement",
 };
-const STATUS_DROP = new Set(["status:monitorChanged", "notification:clear", "zubridge:dispatch-ack"]);
+const STATUS_DROP = new Set(["status:monitorChanged", "notification:clear", "zubridge:dispatch-ack", "helper:appInfoUpdate"]);
 // Store changes that may make the status window show something.
 const STATUS_WAKE_KEYS = [/^remoteNotifications\.new/, /^remoteNotifications\.unreadCount/, /^subscription\.(tier|daysLeft|gracePeriodEndsAt)/, /[Ll]imit|[Qq]uota|[Nn]udge|[Rr]eminder/];
 
@@ -119,9 +130,13 @@ function changedPaths(a, b, prefix = "", depth = 3, out = []) {
 // ---------------------------------------------------------------- the daemon
 
 function startDaemon(resourcesPath, onEvent, onExit) {
-  if (DAEMON.startsWith("@")) return null;
-  const args = ["--pw-cat", PW_CAT, "--sounds", path.join(resourcesPath, "assets", "sounds")];
-  if (MIC_TARGET && !MIC_TARGET.startsWith("@")) args.push("--target", MIC_TARGET);
+  if (!given(DAEMON)) return null;
+  const args = ["--sounds", path.join(resourcesPath, "assets", "sounds")];
+  if (given(PW_CAT)) args.push("--pw-cat", PW_CAT);
+  if (given(MIC_TARGET)) args.push("--target", MIC_TARGET);
+  if (given(CAPTURE_CMD)) args.push("--capture-cmd", CAPTURE_CMD);
+  if (given(DEVICE_NAME)) args.push("--device-name", DEVICE_NAME);
+  if (given(PLAYER_CMD)) args.push("--player-cmd", PLAYER_CMD);
   // Tests only: a stand-in microphone.
   if (process.env.WISPR_HEADLESS_TEST_CAPTURE) args.push("--capture-cmd", process.env.WISPR_HEADLESS_TEST_CAPTURE);
   let child;
@@ -276,6 +291,8 @@ function build(electron) {
           const queued = this.queue.splice(0);
           for (const [ch, a] of queued) this.realSend(ch, ...a);
           if (this.wantVisible && !this.win.isDestroyed()) this.realWin[this.showMethod].call(this.win);
+          // Loaded for a message but never shown: stop it again later.
+          else if (this.role !== "status") this.scheduleIdle(HIDDEN_IDLE_MS, "loaded, not shown");
           resolve();
         });
         // A load started while the renderer we killed is still going away
@@ -525,7 +542,26 @@ function build(electron) {
     return realEmit(ch, e, ...args);
   };
 
-  return new Proxy(electron, { get: (t, k) => (k === "BrowserWindow" ? ShimWindow : t[k]) });
+  const autoUpdater = pinnedUpdater();
+  return new Proxy(electron, {
+    get: (t, k) => (k === "BrowserWindow" ? ShimWindow : k === "autoUpdater" ? autoUpdater : t[k]),
+  });
+}
+
+// Nix pins Wispr's version, so the app never updates itself: every check
+// finds nothing (macOS's Squirrel would also refuse our re-signed bundle).
+function pinnedUpdater() {
+  const { EventEmitter } = require("events");
+  const u = new EventEmitter();
+  let feed = "";
+  u.setFeedURL = (opts) => { feed = typeof opts === "string" ? opts : String(opts?.url ?? ""); };
+  u.getFeedURL = () => feed;
+  u.checkForUpdates = () => {
+    trace({ ev: "update.check" });
+    setImmediate(() => { u.emit("checking-for-update"); u.emit("update-not-available"); });
+  };
+  u.quitAndInstall = () => trace({ ev: "update.install.ignored" });
+  return u;
 }
 
 // Nothing here may stop Wispr from starting.
@@ -535,5 +571,10 @@ try {
   try { console.error("wispr-shim: not installed:", e); } catch {}
 }
 
-const root = path.join(__dirname, "..");
-require(path.join(root, require(path.join(root, "package.json")).wisprOriginalMain));
+// As the app's main (Linux), load Wispr's own entry. On macOS a loader in the
+// app requires this file from the Nix profile and then loads Wispr itself.
+// (Not require.main: Electron may start the main script without setting it.)
+if (!globalThis.wisprShimLoader) {
+  const root = path.join(__dirname, "..");
+  require(path.join(root, require(path.join(root, "package.json")).wisprOriginalMain));
+}
