@@ -207,7 +207,28 @@ function startDaemon(resourcesPath, onEvent, onExit) {
 
 // ---------------------------------------------------------------- the hook
 
+// When Wispr's helper last reported a key. The helper reports every key, so
+// nothing per key is kept or logged: only how long before a dictation starts
+// the last one came (rec.initializing's sinceKey), to measure Wispr's delay.
+let lastKeyAt = 0;
+
+function watchHelper() {
+  const realSpawn = childProcess.spawn;
+  childProcess.spawn = function (command, ...rest) {
+    const child = realSpawn.call(this, command, ...rest);
+    try {
+      if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command)) && child.stdout) {
+        child.stdout.on("data", (chunk) => {
+          if (chunk.includes("KeypressEvent")) lastKeyAt = Date.now();
+        });
+      }
+    } catch {}
+    return child;
+  };
+}
+
 function install() {
+  watchHelper();
   const Module = require("module");
   const realLoad = Module._load;
   let proxied = null;
@@ -472,7 +493,7 @@ function build(electron) {
         return false;
       }
       if (this.role === "status") {
-        if (ch === "status:dictationStatus" && a === "initializing") trace({ ev: "rec.initializing" });
+        if (ch === "status:dictationStatus" && a === "initializing") trace({ ev: "rec.initializing", sinceKey: lastKeyAt ? Date.now() - lastKeyAt : null });
         const cmd = barCommand(ch, a);
         if (cmd) daemon.send(cmd);
         // The page plays this one itself when it is up.
