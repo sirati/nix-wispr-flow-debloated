@@ -16,6 +16,7 @@ mod pill_mac;
 mod pill_x11;
 mod protocol;
 mod recorder;
+mod resample;
 #[cfg(target_os = "linux")]
 mod text;
 mod wave;
@@ -161,21 +162,62 @@ fn start_recording(
     chosen: Option<&mics::Native>,
     clock_ms: f64,
     out: &Out,
+    ready: &mut Ready,
 ) -> Result<Recording, String> {
     let (capture, device) = capture_for(cfg, chosen);
     #[cfg(target_os = "macos")]
-    if mics::Backend::of(&capture) == mics::Backend::AvFoundation {
-        let input = cfg.target.as_deref().or(chosen.map(|n| n.id.as_str()));
-        match Recording::start_native(uuid.to_string(), input, device.clone(), clock_ms) {
+    if let Some(unit) = ready.prepare(cfg, chosen) {
+        match Recording::start_native(uuid.to_string(), unit, device.clone(), clock_ms) {
             Ok(r) => return Ok(r),
-            Err(_) => out.send(&Event::Log {
-                msg: "native capture failed; using the capture command".into(),
-            }),
+            Err(_) => {
+                // Perhaps the device went away: prepare afresh next time.
+                ready.unit = None;
+                out.send(&Event::Log {
+                    msg: "native capture failed; using the capture command".into(),
+                });
+            }
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = out;
+    let _ = (out, ready);
     Recording::start(uuid.to_string(), &capture, device, clock_ms)
+}
+
+/// macOS: the input unit kept prepared (microphone off) for the input the
+/// next recording will use, so starting it is all a dictation waits for.
+#[derive(Default)]
+struct Ready {
+    #[cfg(target_os = "macos")]
+    unit: Option<Arc<mic_mac::Prepared>>,
+}
+
+impl Ready {
+    /// The unit for the input `capture_for` would pick, prepared if it is
+    /// not yet (macOS with the AVFoundation capture command only).
+    #[cfg(target_os = "macos")]
+    fn prepare(
+        &mut self,
+        cfg: &Config,
+        chosen: Option<&mics::Native>,
+    ) -> Option<Arc<mic_mac::Prepared>> {
+        if mics::Backend::of(&cfg.capture) != mics::Backend::AvFoundation {
+            return None;
+        }
+        let input = cfg.target.as_deref().or(chosen.map(|n| n.id.as_str()));
+        if !self
+            .unit
+            .as_ref()
+            .is_some_and(|u| u.input.as_deref() == input)
+        {
+            self.unit = mic_mac::Prepared::new(input).ok().map(Arc::new);
+        }
+        self.unit.clone()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn prepare(&mut self, _cfg: &Config, _chosen: Option<&mics::Native>) -> Option<()> {
+        None
+    }
 }
 
 struct Out(Arc<Mutex<std::io::Stdout>>);
@@ -265,24 +307,36 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     // at start, when Wispr's ranking changes and after each recording, so a
     // start never waits for it.
     let backend = mics::Backend::of(&cfg.capture);
+    // Commands arrive on their own thread so audio can be polled in between.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
     let inputs = Arc::new(Mutex::new(Vec::<mics::Native>::new()));
     let (relist, relist_rx) = mpsc::channel::<()>();
     if cfg.target.is_none() && backend != mics::Backend::Fixed {
         let inputs = inputs.clone();
         let program = cfg.capture.first().cloned().unwrap_or_default();
+        let done = cmd_tx.clone();
         std::thread::spawn(move || {
             while relist_rx.recv().is_ok() {
                 while relist_rx.try_recv().is_ok() {}
                 let found = mics::list(backend, &program);
                 *inputs.lock().expect("inputs lock poisoned") = found;
+                // So the next recording's input gets prepared.
+                if done.send(Some(Command::Relisted)).is_err() {
+                    return;
+                }
             }
         });
     }
     let _ = relist.send(());
     let mut ranked: Vec<mics::Ranked> = Vec::new();
+    let mut ready = Ready::default();
+    // Prepares for the input the next recording will use (macOS).
+    let prepare = |ready: &mut Ready, ranked: &[mics::Ranked]| {
+        let inputs = inputs.lock().expect("inputs lock poisoned");
+        let _ = ready.prepare(cfg, mics::choose(ranked, &inputs));
+    };
+    prepare(&mut ready, &ranked);
 
-    // Commands arrive on their own thread so audio can be polled in between.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
     {
         let log_out = Out(out.0.clone());
         std::thread::spawn(move || {
@@ -327,7 +381,7 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                     let inputs = inputs.lock().expect("inputs lock poisoned");
                     mics::choose(&ranked, &inputs).cloned()
                 };
-                match start_recording(cfg, &uuid, chosen.as_ref(), clock_ms(), out) {
+                match start_recording(cfg, &uuid, chosen.as_ref(), clock_ms(), out, &mut ready) {
                     Ok(r) => {
                         out.send(&Event::Started { uuid });
                         recording = Some(r);
@@ -346,6 +400,11 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             Ok(Some(Command::Mics { ranked: r })) => {
                 ranked = r;
                 let _ = relist.send(());
+            }
+            Ok(Some(Command::Relisted)) => {
+                if recording.is_none() {
+                    prepare(&mut ready, &ranked);
+                }
             }
             Ok(Some(Command::Status { value })) => {
                 let _ = pill_tx.send(PillCommand::Status(value));

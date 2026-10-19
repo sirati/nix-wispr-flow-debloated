@@ -33,6 +33,9 @@ pub enum Command {
     NotifyClear,
     /// Wispr's microphone ranking (`prefs.user.rankedAudioDevices`).
     Mics { ranked: Vec<crate::mics::Ranked> },
+    /// Internal, never from the shim: the system's inputs were listed again.
+    #[serde(skip)]
+    Relisted,
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while

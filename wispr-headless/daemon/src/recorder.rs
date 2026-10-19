@@ -86,9 +86,9 @@ enum Source {
         child: Child,
         reader: Option<JoinHandle<()>>,
     },
-    /// macOS: this process's own capture session.
+    /// macOS: the daemon's prepared input unit, running for this recording.
     #[cfg(target_os = "macos")]
-    Native(crate::mic_mac::Capture),
+    Native(std::sync::Arc<crate::mic_mac::Prepared>),
 }
 
 impl Source {
@@ -176,20 +176,20 @@ impl Recording {
         })
     }
 
-    /// macOS: captures the microphone called `input` (or the default) in this
-    /// process, which starts sooner than a capture command.
+    /// macOS: records with the daemon's prepared input unit, which starts in
+    /// a few milliseconds.
     #[cfg(target_os = "macos")]
     pub fn start_native(
         uuid: String,
-        input: Option<&str>,
+        unit: std::sync::Arc<crate::mic_mac::Prepared>,
         device: String,
         clock_ms: f64,
     ) -> Result<Recording, String> {
         let (tx, rx) = mpsc::channel();
-        let capture = crate::mic_mac::Capture::start(input, tx)?;
+        unit.start(tx)?;
         Ok(Recording {
             uuid,
-            source: Source::Native(capture),
+            source: Source::Native(unit),
             bytes: rx,
             chunker: Chunker::default(),
             index: 0,
