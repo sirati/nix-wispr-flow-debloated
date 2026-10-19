@@ -44,7 +44,7 @@
 
       # The Mac app (see darwin/wispr-flow.nix and the README). Cross
       # compiling needs an Apple SDK toolchain, which the caller provides:
-      #   lib.macWisprFlow { native; builders; darwin; daemon; }
+      #   lib.macWisprFlow { native; builders; darwin; daemon; user; }
       # with daemon = a cross build of ./wispr-headless/daemon.
       lib.macWisprFlow = import ./darwin/wispr-flow.nix;
 

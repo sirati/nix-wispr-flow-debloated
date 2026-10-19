@@ -33,11 +33,16 @@
 #   builders trivial builders (runCommand) whose output is for aarch64-darwin
 #   darwin   nixpkgs for aarch64-darwin, for ffmpeg from the binary cache
 #   daemon   wispr-headless cross-built for aarch64-darwin
+#   user     the macOS user who runs Wispr
+#   signingIdentity  name of the local code-signing certificate; created on
+#            first activation, and kept so macOS keeps Wispr's permissions
 {
   native,
   builders,
   darwin,
   daemon,
+  user,
+  signingIdentity ? "Wispr Flow local code signing (Nix)",
 }:
 let
   version = "1.6.1174";
@@ -137,6 +142,8 @@ builders.runCommand "mac-wispr-flow"
     cp ${./wispr-flow-activate.sh} "$out/bin/activate"
     substituteInPlace "$out/bin/activate" \
       --replace-fail '@bundle@' "$out" \
-      --replace-fail '@version@' '${version}'
+      --replace-fail '@version@' '${version}' \
+      --replace-fail '@user@' ${native.lib.escapeShellArg user} \
+      --replace-fail '@identity@' ${native.lib.escapeShellArg signingIdentity}
     chmod 755 "$out/bin/activate"
   ''

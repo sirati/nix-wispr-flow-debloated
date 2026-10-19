@@ -51,12 +51,15 @@ wispr-flow-debloated.lib.macWisprFlow {
   builders = crossBuilders; # trivial builders targeting aarch64-darwin
   darwin = import nixpkgs { system = "aarch64-darwin"; };
   daemon = crossRustPlatformPackage ./wispr-headless/daemon;
+  user = "alice";           # the macOS user who runs Wispr
+  # signingIdentity = "…";  # optional, see below
 }
 ```
 
 Copy the result to the Mac and run its `bin/activate` with sudo. Activation
 copies the app to `/Applications/Wispr Flow.app`, signs it with the
-certificate `Wispr Flow local code signing (Nix)` from the System keychain
+certificate named by `signingIdentity` (default `Wispr Flow local code
+signing (Nix)`) from the System keychain
 (created on first activation; its key never leaves the Mac), and restarts
 Wispr. The first time, Wispr's own build is moved to
 `~/.local/setup/app-backups/`. The app never updates itself; bump `version`

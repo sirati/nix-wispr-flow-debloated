@@ -6,12 +6,12 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 bundle='@bundle@'
 version='@version@'
 profile=/nix/var/nix/profiles/mac-wispr-flow
-user=alice
-user_home=/Users/alice
+user='@user@'
+user_home=$(dscl . -read "/Users/$user" NFSHomeDirectory | awk '{print $2}')
 target='/Applications/Wispr Flow.app'
 source_app="$bundle/Applications/Wispr Flow.app"
 keychain=/Library/Keychains/System.keychain
-identity='Wispr Flow local code signing (Nix)'
+identity='@identity@'
 state_dir='/Library/Application Support/nix-wispr-flow'
 backups="$user_home/.local/setup/app-backups"
 
