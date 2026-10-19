@@ -1,24 +1,41 @@
 # Wispr Flow, debloated
 
-Nix packaging for [Wispr Flow](https://wisprflow.ai) dictation on NixOS and
-macOS, without its Electron app running Chromium in the background. Wispr
-Flow is proprietary; this repository has no affiliation with Wispr, and on
-Linux it builds on the unofficial
-[wispr-flow-linux](https://github.com/wispr-flow-linux/wispr-flow-linux) port.
+Nix packaging for [Wispr Flow](https://wisprflow.ai) dictation on Linux and
+macOS. Wispr's Electron app normally keeps five Chromium renderers running in
+the background, one of them playing videos in a hidden window. With this
+package no renderer runs until Wispr shows a window. A small Rust daemon
+records the microphone and draws the flow bar instead.
 
-## What is here
+Wispr Flow is proprietary, and this project has no affiliation with Wispr.
+On Linux it builds on the unofficial
+[wispr-flow-linux](https://github.com/wispr-flow-linux/wispr-flow-linux)
+port. On macOS it uses Wispr's own release.
 
-| Path | What it is |
-|---|---|
-| `wispr-flow.nix` | NixOS module `programs.wisprFlow`: the Linux port, fixed to apply all of its patches, run as a home-manager user service, optionally headless. |
-| `wispr-headless/` | The headless mode. `shim.js` runs in Wispr's Electron main process and keeps its windows without a renderer until their UI is needed. `daemon/` (Rust) records the microphone and draws Wispr's flow bar (X11 on Linux, AppKit on macOS). See [its README](wispr-headless/README.md). |
-| `wispr-ime.nix`, `wispr-ime/` | NixOS module `programs.wisprIme`: dictated text is typed through fcitx5 (an IBus bridge in safe Rust) instead of the clipboard, with Wispr's helper patched to use it. |
-| `dictation-buttons.nix` | NixOS module `services.dictationButtons`: mouse and headset buttons as a dictation key. |
-| `wispr-patches/` | Extra patches for Wispr's bundle (the Hub's video painting while hidden). |
-| `darwin/` | The Mac app: Wispr's pinned release with the headless shim, installed and signed by an activation script. |
-| `tests/ime-vm/` | A GNOME-on-Wayland VM test for wispr-ime. |
+## How it works
 
-## Using it from a NixOS flake
+`wispr-headless/shim.js` runs in Electron's main process before Wispr's code.
+Wispr still gets real windows, but a window loads its page only when Wispr
+shows it or sends it a message the shim does not handle, such as a
+notification. Once the window shows nothing again, the shim stops its
+renderer. If the daemon cannot run, every window loads as usual.
+
+The daemon in `wispr-headless/daemon` does the work of the hidden windows:
+
+- It records from the microphone selected in Wispr, with CoreAudio on macOS
+  and `pw-cat` on Linux, and sends Wispr the same audio messages its own
+  recorder sends.
+- It starts recording when the dictation shortcut goes down. If another key
+  joins before Wispr asks to record, it drops that recording.
+- It draws the flow bar following Wispr's own states: the resting bar, the
+  push-to-talk and hands-free pills with their buttons, the processing
+  spinner, and the "Transcript cancelled" notification with Undo. The pill is
+  red, so a black pill means Wispr's own page is drawing.
+
+Nix pins the Wispr version, and the app never updates itself.
+
+## Use
+
+Add the flake input:
 
 ```nix
 inputs.wispr-flow-debloated = {
@@ -27,8 +44,7 @@ inputs.wispr-flow-debloated = {
 };
 ```
 
-Import `wispr-flow-debloated.nixosModules.wispr-flow` (and `wispr-ime`,
-`dictation-buttons`, or `default` for all three), then for example:
+On NixOS, import `wispr-flow-debloated.nixosModules.default` and enable it:
 
 ```nix
 programs.wisprFlow = {
@@ -38,12 +54,18 @@ programs.wisprFlow = {
 };
 ```
 
-The options are documented in each module.
+`programs.wisprIme` fixes dictation on GNOME. Wispr's helper types text by
+copying it to the clipboard and pressing Ctrl+V. GNOME has no protocol that
+lets a program set the clipboard without a window, so the copy opens a window
+that takes focus and the paste goes to the wrong place. wispr-ime types the
+text through the input method instead, with fcitx5 behind a small IBus bridge
+written in safe Rust. Other desktops work without it.
 
-## The Mac app
+`services.dictationButtons` turns mouse or headset buttons into a dictation
+key.
 
-`lib.macWisprFlow` builds the Mac bundle on Linux. It needs an Apple SDK
-cross toolchain from the caller:
+On macOS, `lib.macWisprFlow` cross-builds the app on Linux. The caller
+provides an Apple SDK toolchain:
 
 ```nix
 wispr-flow-debloated.lib.macWisprFlow {
@@ -52,31 +74,51 @@ wispr-flow-debloated.lib.macWisprFlow {
   darwin = import nixpkgs { system = "aarch64-darwin"; };
   daemon = crossRustPlatformPackage ./wispr-headless/daemon;
   user = "alice";           # the macOS user who runs Wispr
-  # signingIdentity = "…";  # optional, see below
 }
 ```
 
-Copy the result to the Mac and run its `bin/activate` with sudo. Activation
-copies the app to `/Applications/Wispr Flow.app`, signs it with the
-certificate named by `signingIdentity` (default `Wispr Flow local code
-signing (Nix)`) from the System keychain
-(created on first activation; its key never leaves the Mac), and restarts
-Wispr. The first time, Wispr's own build is moved to
-`~/.local/setup/app-backups/`. The app never updates itself; bump `version`
-and `hash` in `darwin/wispr-flow.nix` instead. The shim and the Rust daemon
-live in the activated profile, so changing them does not copy the 600 MB app
-again.
-
-The first start after switching from Wispr's own build asks again for
-microphone and accessibility access, and once for Wispr's keychain item
-(choose Always Allow). If accessibility looks enabled but dictation does
-nothing, reset the stale entry with
+Copy the result to the Mac and run its `bin/activate` with sudo. The shim
+changes the app, which breaks Wispr's signature, so activation installs the
+app in `/Applications` and signs it again. It uses a certificate that it
+creates once in the System keychain (`signingIdentity`, default `Wispr Flow
+local code signing (Nix)`). The private key never leaves the Mac. macOS ties
+Wispr's permissions to that certificate, so you grant microphone and
+accessibility access once after switching from Wispr's own build. Wispr also
+asks once for its keychain item; choose Always Allow. If accessibility looks
+enabled but dictation does nothing, run
 `sudo tccutil reset Accessibility com.electron.wispr-flow` and enable it
-again. The certificate stays, so later versions keep these permissions.
+again. The first activation moves Wispr's own build to
+`~/.local/setup/app-backups/`.
+
+## Updating Wispr
+
+On Linux, change the rev of the `wispr-flow-linux` input in `flake.nix`. On
+macOS, take `currentRelease` from
+`https://dl.wisprflow.com/wispr-flow/darwin/arm64/RELEASES.json` and update
+`version` and `hash` in `darwin/wispr-flow.nix`.
+
+Then check that the new `app.asar` still has the names the shim uses in
+`.webpack/main/index.js`: `dictation:audioStart`, `dictation:audioChunk`,
+`recordingStarted`, `recordingDone`, `status:dictationStatus`,
+`status:audioLevel`, `status:micActive`, `status:popo`, `status:startClicked`,
+`notification:show`, `zubridge:state-update`, `hideFlowBarPermanently`,
+`clickableBubbleSnoozeUntil`, and the preload paths
+`renderer/<role>/preload.js`.
 
 ## Tests
 
     nix flake check                                  # builds the Rust crates with their tests
-    cd wispr-headless/daemon && cargo test           # unit tests + the binary with a stand-in mic
-    wispr-headless/tests/electron/run.sh <binary>    # shim + daemon in Electron 42
+    cd wispr-headless/daemon && cargo test           # unit tests and the binary with a stand-in microphone
+    wispr-headless/tests/electron/run.sh <binary>    # shim and daemon in Electron 42
     tests/ime-vm/run-wispr-ime.sh                    # wispr-ime in a GNOME VM (needs /dev/kvm)
+
+The Electron test needs `electron_42`, `xvfb-run` and `nodejs` on `PATH`. The
+macOS daemon build puts its test binaries in `libexec/tests`. Run them on the
+Mac with `WISPR_HEADLESS_BIN=<out>/bin/wispr-headless`.
+
+## Debugging
+
+The shim writes a trace to `~/.cache/wispr-flow/shim-trace.jsonl`. It holds
+IPC channel names, key paths and timings, never values or keystrokes. On
+macOS, `WISPR_HEADLESS_SNAPSHOT_DIR` makes the daemon save each state of the
+flow bar as a TIFF.

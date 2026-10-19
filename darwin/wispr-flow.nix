@@ -1,6 +1,6 @@
 # Wispr Flow for the Mac, pinned by Nix and without Chromium renderers until
-# its UI is needed (the same headless shim as Linux, see
-# ../wispr-headless/README.md).
+# its UI is needed (the same headless shim as on Linux;
+# see the README).
 #
 # The app is Wispr's own release zip with its app.asar (and app.asar.unpacked)
 # moved, unchanged, to Resources/wispr/, and a Resources/app/ folder holding a
