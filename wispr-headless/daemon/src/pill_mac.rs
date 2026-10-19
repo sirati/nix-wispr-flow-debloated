@@ -96,7 +96,8 @@ fn font(size: f64, bold: bool) -> Retained<NSFont> {
     NSFont::systemFontOfSize_weight(size, if bold { 0.3 } else { 0.0 })
 }
 
-/// A text field adds this much around its text.
+/// A text field draws its text this far in from its frame; its intrinsic size
+/// is the text's alone, so the frame needs this much more on each side.
 const LABEL_INSET: f64 = 2.0;
 
 /// A clockwise rotation as seen on screen: in the flipped canvas a positive
@@ -130,6 +131,9 @@ struct Bar {
     size: (f64, f64),
     /// A frame is scheduled.
     ticking: bool,
+    /// Debugging: WISPR_HEADLESS_SNAPSHOT_DIR, where each drawn mode is saved as
+    /// a TIFF (the screen cannot be captured over ssh).
+    snapshots: Option<String>,
 }
 
 impl Bar {
@@ -173,6 +177,7 @@ impl Bar {
             mode: Mode::Hidden,
             size: (0.0, 0.0),
             ticking: false,
+            snapshots: std::env::var("WISPR_HEADLESS_SNAPSHOT_DIR").ok(),
         })
     }
 
@@ -222,7 +227,7 @@ impl Bar {
         let measure = |text: &str, size: f64, bold: bool| {
             measurer.setFont(Some(&font(size, bold)));
             measurer.setStringValue(&NSString::from_str(text));
-            measurer.intrinsicContentSize().width - 2.0 * LABEL_INSET
+            measurer.intrinsicContentSize().width
         };
         let f = self.state.frame(Instant::now(), &measure, pointer);
         for e in &f.events {
@@ -277,6 +282,15 @@ impl Bar {
         for label in &self.labels[f.texts.len()..] {
             label.setHidden(true);
         }
+        if let Some(dir) = &self.snapshots {
+            let bounds = self.view.bounds();
+            if let Some(rep) = self.view.bitmapImageRepForCachingDisplayInRect(bounds) {
+                self.view.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
+                if let Some(tiff) = rep.TIFFRepresentation() {
+                    let _ = std::fs::write(format!("{dir}/{:?}.tiff", f.mode), tiff.to_vec());
+                }
+            }
+        }
     }
 
     fn show_text(&self, label: &NSTextField, t: &Text, height: f64) {
@@ -289,7 +303,7 @@ impl Bar {
         let y = height - t.top - (t.line + size.height) / 2.0;
         label.setFrame(NSRect::new(
             NSPoint::new(t.x - LABEL_INSET, y),
-            NSSize::new(size.width, size.height),
+            NSSize::new(size.width + 2.0 * LABEL_INSET, size.height),
         ));
     }
 

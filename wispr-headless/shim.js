@@ -295,9 +295,11 @@ function build(electron) {
         trace({ ev: "daemon.ready" });
         break;
       case "started":
+        trace({ ev: "rec.started" });
         emitFrom(hub, "dictation:recordingStarted", { transcriptionEntityUuid: uuid });
         break;
       case "chunk": {
+        if (msg.index === 0) trace({ ev: "rec.firstChunk" });
         const buf = Buffer.from(msg.pcm, "base64");
         const packet = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
         emitFrom(hub, "dictation:audioChunk", { packet, index: msg.index, volume: msg.volume, duration: msg.duration, encoding: "wav", transcriptionEntityUuid: uuid });
@@ -454,6 +456,7 @@ function build(electron) {
       if (this.role === "hub") {
         if (ch === "dictation:audioStart") {
           session = a?.transcriptionEntityUuid ?? null;
+          trace({ ev: "rec.audioStart" });
           daemon.send({ op: "start", uuid: session });
           return true;
         }
@@ -469,6 +472,7 @@ function build(electron) {
         return false;
       }
       if (this.role === "status") {
+        if (ch === "status:dictationStatus" && a === "initializing") trace({ ev: "rec.initializing" });
         const cmd = barCommand(ch, a);
         if (cmd) daemon.send(cmd);
         // The page plays this one itself when it is up.
