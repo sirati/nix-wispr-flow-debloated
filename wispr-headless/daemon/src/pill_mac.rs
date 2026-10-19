@@ -1,8 +1,10 @@
 //! The flow bar on macOS (see bar.rs for what it shows).
 //!
 //! A borderless, non-activating panel above other windows on every Space,
-//! drawn with Core Animation layers, one per shape (y down: the root layer's
-//! geometry is flipped), and AppKit labels for text in the system font. The
+//! drawn with Core Animation layers, one per shape (y down: they sit in a
+//! flipped canvas layer of our own; AppKit draws a view's own backing layer
+//! y up even when it is marked flipped), and AppKit labels for text in the
+//! system font. The
 //! panel is exactly the size of the pill, so clicks next to it go through.
 //! AppKit runs on the main thread: commands are forwarded to it with
 //! libdispatch, and a resting or hidden bar schedules nothing. Sizes are
@@ -98,11 +100,10 @@ fn font(size: f64, bold: bool) -> Retained<NSFont> {
 /// A text field adds this much around its text.
 const LABEL_INSET: f64 = 2.0;
 
-/// A clockwise rotation as seen on screen. Core Animation turns a positive
-/// angle counterclockwise even in our flipped (y-down) geometry, so the sign
-/// is reversed (otherwise the check mark comes out mirrored).
+/// A clockwise rotation as seen on screen: in the flipped canvas a positive
+/// angle turns clockwise, as in our y-down shapes.
 fn rotation(angle: f64) -> CGAffineTransform {
-    let (sin, cos) = (-angle).sin_cos();
+    let (sin, cos) = angle.sin_cos();
     CGAffineTransform {
         a: cos,
         b: sin,
@@ -117,7 +118,8 @@ struct Bar {
     mtm: MainThreadMarker,
     panel: Retained<NSPanel>,
     view: Retained<BarView>,
-    root: Retained<CALayer>,
+    /// Holds the shape layers, y down.
+    canvas: Retained<CALayer>,
     /// One layer per shape and one label per text, reused between frames.
     layers: Vec<Retained<CALayer>>,
     labels: Vec<Retained<NSTextField>>,
@@ -156,14 +158,15 @@ impl Bar {
         );
         let view = BarView::init_with_frame(BarView::alloc(mtm), start);
         view.setWantsLayer(true);
-        let root = view.layer()?;
-        root.setGeometryFlipped(true);
+        let canvas = CALayer::new();
+        canvas.setGeometryFlipped(true);
+        view.layer()?.addSublayer(&canvas);
         panel.setContentView(Some(&view));
         Some(Bar {
             mtm,
             panel,
             view,
-            root,
+            canvas,
             layers: Vec::new(),
             labels: Vec::new(),
             measurer: NSTextField::labelWithString(&NSString::from_str(""), mtm),
@@ -247,9 +250,13 @@ impl Bar {
     fn draw(&mut self, f: &Frame) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
+        self.canvas.setFrame(CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(f.size.0, f.size.1),
+        ));
         while self.layers.len() < f.shapes.len() {
             let layer = CALayer::new();
-            self.root.addSublayer(&layer);
+            self.canvas.addSublayer(&layer);
             self.layers.push(layer);
         }
         for (layer, s) in self.layers.iter().zip(&f.shapes) {
