@@ -1,0 +1,345 @@
+From 111d70d1b1ba82567ce296383ee54aa297a2f0e4 Mon Sep 17 00:00:00 2001
+From: sirati <sirati@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:39:18 +0200
+Subject: [PATCH] mtmd: granite-speech: run the audio encoder on Core ML
+
+With -DMTMD_COREML=ON on Apple platforms and MTMD_COREML_AUDIO set to a
+granite_speech_audio_*.mlpackage, mtmd hands Granite Speech's stacked
+log-mel to Core ML (the Neural Engine) and falls back to the ggml
+encoder for pieces over 10 s or when Core ML fails.
+---
+ tools/mtmd/CMakeLists.txt |  14 +++
+ tools/mtmd/mtmd-coreml.h  |  28 ++++++
+ tools/mtmd/mtmd-coreml.mm | 197 ++++++++++++++++++++++++++++++++++++++
+ tools/mtmd/mtmd.cpp       |  26 +++++
+ 4 files changed, 265 insertions(+)
+ create mode 100644 tools/mtmd/mtmd-coreml.h
+ create mode 100644 tools/mtmd/mtmd-coreml.mm
+
+diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
+index 8ca4ae3..36686da 100644
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -175,3 +175,17 @@ if (LLAMA_BUILD_TOOLS)
+     target_link_libraries(llama-mtmd-debug PRIVATE llama-common mtmd Threads::Threads)
+     target_compile_features(llama-mtmd-debug PRIVATE cxx_std_17)
+ endif()
++
++# Granite Speech's audio encoder on Core ML (Apple only, opt in): set
++# MTMD_COREML_AUDIO=/path/to/granite_speech_audio_*.mlpackage at run time.
++option(MTMD_COREML "mtmd: Core ML audio encoder for Granite Speech" OFF)
++if (APPLE AND MTMD_COREML)
++    # Compiled as C++ by clang in Objective-C++ mode: enable_language(OBJCXX)
++    # in a subdirectory leaves CMake without its rules here.
++    target_sources(mtmd PRIVATE mtmd-coreml.mm mtmd-coreml.h)
++    set_source_files_properties(mtmd-coreml.mm PROPERTIES
++        LANGUAGE CXX
++        COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc")
++    target_compile_definitions(mtmd PRIVATE MTMD_COREML)
++    target_link_libraries(mtmd PRIVATE "-framework CoreML" "-framework Foundation")
++endif()
+diff --git a/tools/mtmd/mtmd-coreml.h b/tools/mtmd/mtmd-coreml.h
+new file mode 100644
+index 0000000..b9cff3e
+--- /dev/null
++++ b/tools/mtmd/mtmd-coreml.h
+@@ -0,0 +1,28 @@
++// Granite Speech's audio encoder on Core ML (the Neural Engine), for mtmd.
++#pragma once
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct mtmd_coreml;
++
++// path: a granite_speech_audio_*.mlpackage (compiled once and cached in
++// ~/Library/Caches/llama-mtmd-coreml) or an .mlmodelc. Starts loading its
++// functions (T250, T375, T500, or those $MTMD_COREML_AUDIO_FRAMES lists,
++// e.g. "500") in the background. NULL on failure.
++struct mtmd_coreml * mtmd_coreml_init(const char * path);
++
++// mel: mtmd's stacked log-mel, n_mel (160) rows of n_frames, row-major
++// (mel[m * n_frames + t]). Writes n_tokens rows of n_embd floats to out.
++// false if no bucket holds n_frames or Core ML fails: the caller then runs
++// the ggml encoder.
++bool mtmd_coreml_encode(struct mtmd_coreml * ctx, const float * mel, int n_mel, int n_frames,
++                        float * out, int n_tokens, int n_embd);
++
++void mtmd_coreml_free(struct mtmd_coreml * ctx);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/tools/mtmd/mtmd-coreml.mm b/tools/mtmd/mtmd-coreml.mm
+new file mode 100644
+index 0000000..5e527eb
+--- /dev/null
++++ b/tools/mtmd/mtmd-coreml.mm
+@@ -0,0 +1,197 @@
++// See mtmd-coreml.h.
++#import <CoreML/CoreML.h>
++#import <Foundation/Foundation.h>
++
++#include "mtmd-coreml.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++struct bucket {
++    int frames;
++    NSString * function;
++    MLModel * model = nil;           // set by the loader
++    dispatch_semaphore_t loaded;      // signalled once model is set (or failed)
++};
++
++// The compiled model next to nothing the user owns: in the caches directory,
++// recompiled when the package is newer than the cache.
++NSURL * compiled_url(NSString * path, NSError ** err) {
++    NSURL * src = [NSURL fileURLWithPath:path];
++    if ([path hasSuffix:@".mlmodelc"]) {
++        return src;
++    }
++    NSFileManager * fm = NSFileManager.defaultManager;
++    NSURL * caches = [[fm URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask] firstObject];
++    NSURL * dir = [caches URLByAppendingPathComponent:@"llama-mtmd-coreml" isDirectory:YES];
++    [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
++    NSString * name = [[path lastPathComponent] stringByDeletingPathExtension];
++    NSURL * dst = [dir URLByAppendingPathComponent:[name stringByAppendingString:@".mlmodelc"]];
++    NSDate * src_t = [[fm attributesOfItemAtPath:path error:nil] fileModificationDate];
++    NSDate * dst_t = [[fm attributesOfItemAtPath:dst.path error:nil] fileModificationDate];
++    if (dst_t && src_t && [dst_t compare:src_t] != NSOrderedAscending) {
++        return dst;
++    }
++    NSURL * tmp = [MLModel compileModelAtURL:src error:err];
++    if (!tmp) {
++        return nil;
++    }
++    [fm removeItemAtURL:dst error:nil];
++    if (![fm moveItemAtURL:tmp toURL:dst error:err]) {
++        return nil;
++    }
++    return dst;
++}
++
++// Copies src (row-major, `rows` x `cols` floats) into a [1, rows, 1, T] fp16
++// array, zero padded, honouring Core ML's strides (rows may be padded).
++void fill_fp16(MLMultiArray * a, const float * src, int rows, int cols) {
++    [a getMutableBytesWithHandler:^(void * bytes, NSInteger size, NSArray<NSNumber *> * strides) {
++        memset(bytes, 0, (size_t) size);
++        _Float16 * d = (_Float16 *) bytes;
++        const NSInteger s_row = strides[1].integerValue, s_t = strides[3].integerValue;
++        for (int r = 0; r < rows; r++) {
++            for (int t = 0; t < cols; t++) {
++                d[r * s_row + t * s_t] = (_Float16) (src ? src[(size_t) r * cols + t] : 1.0f);
++            }
++        }
++    }];
++}
++
++} // namespace
++
++struct mtmd_coreml {
++    std::vector<bucket> buckets;
++};
++
++extern "C" struct mtmd_coreml * mtmd_coreml_init(const char * path) {
++    @autoreleasepool {
++        NSError * err = nil;
++        NSURL * url = compiled_url([NSString stringWithUTF8String:path], &err);
++        if (!url) {
++            fprintf(stderr, "mtmd_coreml: cannot compile %s: %s\n", path, err.localizedDescription.UTF8String);
++            return nullptr;
++        }
++        // Each loaded function may hold its own copy of the weights, so
++        // fewer can be asked for; a piece goes to the smallest that holds it.
++        std::vector<int> sizes;
++        if (const char * list = getenv("MTMD_COREML_AUDIO_FRAMES"); list && *list) {
++            for (const char * p = list; *p;) {
++                char * end;
++                const long n = strtol(p, &end, 10);
++                if (end == p) {
++                    p++;
++                    continue;
++                }
++                if (n == 250 || n == 375 || n == 500) {
++                    sizes.push_back((int) n);
++                }
++                p = end;
++            }
++        } else {
++            sizes = {250, 375, 500};
++        }
++        std::sort(sizes.begin(), sizes.end());
++        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
++        if (sizes.empty()) {
++            fprintf(stderr, "mtmd_coreml: MTMD_COREML_AUDIO_FRAMES names none of 250, 375, 500\n");
++            return nullptr;
++        }
++        auto * ctx = new mtmd_coreml;
++        // Not resized after this: the loaders keep pointers into it.
++        ctx->buckets.reserve(sizes.size());
++        for (int frames : sizes) {
++            bucket b;
++            b.frames = frames;
++            b.function = [NSString stringWithFormat:@"T%d", frames];
++            b.loaded = dispatch_semaphore_create(0);
++            ctx->buckets.push_back(b);
++        }
++        // Loading specializes each function for the Neural Engine (slow the
++        // first time, then cached by Core ML); it runs while the LLM loads.
++        for (auto & b : ctx->buckets) {
++            bucket * bp = &b;
++            MLModelConfiguration * cfg = [MLModelConfiguration new];
++            cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
++            cfg.functionName = b.function;  // macOS 15
++            [MLModel loadContentsOfURL:url configuration:cfg completionHandler:^(MLModel * m, NSError * e) {
++                if (!m) {
++                    fprintf(stderr, "mtmd_coreml: cannot load %s: %s\n", bp->function.UTF8String,
++                            e.localizedDescription.UTF8String);
++                }
++                bp->model = m;
++                dispatch_semaphore_signal(bp->loaded);
++            }];
++        }
++        return ctx;
++    }
++}
++
++extern "C" bool mtmd_coreml_encode(struct mtmd_coreml * ctx, const float * mel, int n_mel, int n_frames,
++                                   float * out, int n_tokens, int n_embd) {
++    if (!ctx || n_mel != 160 || n_embd != 2048) {
++        return false;
++    }
++    bucket * b = nullptr;
++    for (auto & c : ctx->buckets) {
++        if (c.frames >= n_frames) { b = &c; break; }
++    }
++    if (!b) {
++        return false;  // longer than 10 s: the ggml encoder takes it
++    }
++    dispatch_semaphore_wait(b->loaded, DISPATCH_TIME_FOREVER);
++    dispatch_semaphore_signal(b->loaded);  // stays signalled for the next piece
++    if (!b->model || n_tokens > (b->frames + 14) / 15 * 3) {
++        return false;
++    }
++    @autoreleasepool {
++        NSError * err = nil;
++        const int T = b->frames;
++        MLMultiArray * x = [[MLMultiArray alloc] initWithShape:@[@1, @160, @1, @(T)]
++                                                      dataType:MLMultiArrayDataTypeFloat16 error:&err];
++        MLMultiArray * m = [[MLMultiArray alloc] initWithShape:@[@1, @1, @1, @(T)]
++                                                      dataType:MLMultiArrayDataTypeFloat16 error:&err];
++        if (!x || !m) {
++            return false;
++        }
++        fill_fp16(x, mel, n_mel, n_frames);
++        fill_fp16(m, nullptr, 1, n_frames);  // ones for the clip, zeros after
++        MLDictionaryFeatureProvider * in = [[MLDictionaryFeatureProvider alloc]
++            initWithDictionary:@{@"mel": x, @"mask": m} error:&err];
++        id<MLFeatureProvider> res = [b->model predictionFromFeatures:in error:&err];
++        if (!res) {
++            fprintf(stderr, "mtmd_coreml: prediction failed: %s\n", err.localizedDescription.UTF8String);
++            return false;
++        }
++        MLMultiArray * y = [res featureValueForName:@"embd"].multiArrayValue;  // [1, N, 2048]
++        __block bool ok = y.dataType == MLMultiArrayDataTypeFloat16;
++        if (ok) {
++            [y getBytesWithHandler:^(const void * bytes, NSInteger) {
++                const _Float16 * s = (const _Float16 *) bytes;
++                const NSInteger s_tok = y.strides[1].integerValue, s_ch = y.strides[2].integerValue;
++                for (int i = 0; i < n_tokens; i++) {
++                    for (int c = 0; c < n_embd; c++) {
++                        out[(size_t) i * n_embd + c] = (float) s[i * s_tok + c * s_ch];
++                    }
++                }
++            }];
++        }
++        return ok;
++    }
++}
++
++extern "C" void mtmd_coreml_free(struct mtmd_coreml * ctx) {
++    if (!ctx) {
++        return;
++    }
++    for (auto & b : ctx->buckets) {
++        dispatch_semaphore_wait(b.loaded, DISPATCH_TIME_FOREVER);
++        b.model = nil;
++    }
++    delete ctx;
++}
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index e18f639..c41232b 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -5,6 +5,9 @@
+ #include "mtmd-audio.h"
+ #include "mtmd-image.h"
+ #include "debug/mtmd-debug.h"
++#ifdef MTMD_COREML
++#include "mtmd-coreml.h"
++#endif
+ 
+ #include "llama.h"
+ #include "../src/llama-ext.h"
+@@ -520,6 +523,10 @@ mtmd_context_params mtmd_context_params_default() {
+ struct mtmd_context {
+     struct clip_ctx * ctx_v; // vision
+     struct clip_ctx * ctx_a; // audio
++#ifdef MTMD_COREML
++    // Granite Speech's audio encoder on Core ML, from $MTMD_COREML_AUDIO
++    struct mtmd_coreml * coreml = nullptr;
++#endif
+     std::vector<float> out_embd; // image embedding vector
+ 
+     // generation context
+@@ -1071,6 +1078,12 @@ struct mtmd_context {
+             case PROJECTOR_TYPE_GRANITE_SPEECH:
+                 {
+                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_granite_speech>(ctx_a);
++#ifdef MTMD_COREML
++                    if (const char * path = getenv("MTMD_COREML_AUDIO"); path && *path) {
++                        coreml = mtmd_coreml_init(path);
++                        LOG_INF("%s: Core ML audio encoder %s: %s\n", __func__, path, coreml ? "loading" : "failed");
++                    }
++#endif
+                 } break;
+             case PROJECTOR_TYPE_GEMMA4A:
+                 {
+@@ -1148,6 +1161,9 @@ struct mtmd_context {
+     }
+ 
+     ~mtmd_context() {
++#ifdef MTMD_COREML
++        mtmd_coreml_free(coreml);
++#endif
+         clip_free(ctx_a);
+         clip_free(ctx_v);
+         clip_free(ctx_gen_a);
+@@ -2029,6 +2045,16 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
+         }
+         int n_mmproj_embd = ctx->n_embd_out();
+         out_embd.resize((size_t)chunk->tokens_audio->n_tokens * n_mmproj_embd);
++#ifdef MTMD_COREML
++        if (ctx->coreml && chunk->tokens_audio->batch_f32.entries.size() == 1) {
++            const auto & mel = chunk->tokens_audio->batch_f32.entries[0];
++            if (mtmd_coreml_encode(ctx->coreml, mel.get_ro_buf().data(), mel.ny(), mel.nx(), out_embd.data(),
++                                   (int) chunk->tokens_audio->n_tokens, n_mmproj_embd)) {
++                return 0;
++            }
++            LOG_WRN("%s: Core ML audio encoder declined (%d frames), using ggml\n", __func__, mel.nx());
++        }
++#endif
+         bool ok = clip_image_batch_encode(
+             ctx->ctx_a,
+             ctx->n_threads,
+-- 
+2.56.0
+

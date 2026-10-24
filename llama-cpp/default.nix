@@ -4,6 +4,9 @@
 #         an mmproj quantized with plain llama-quantize (which stores them
 #         as F16) no longer aborts in ssm_conv, on Metal or the CPU
 #   0002  llama-quantize keeps those weights in F32 in the first place
+#   0003  on the Mac, mtmd can run the audio encoder on Core ML (the Neural
+#         Engine) instead: MTMD_COREML_AUDIO names a
+#         granite_speech_audio_*.mlpackage; without it, nothing changes
 #
 # Not nixpkgs' llama-cpp: Granite Speech needs b11852 or later (older
 # releases lack its chat template).
@@ -55,6 +58,7 @@ stdenv.mkDerivation {
   patches = [
     ./patches/0001-granite-speech-conv-dw-f32.patch
     ./patches/0002-quantize-keep-conv-dw-f32.patch
+    ./patches/0003-mtmd-coreml-audio-encoder.patch
   ];
 
   outputs = [
@@ -99,6 +103,7 @@ stdenv.mkDerivation {
     # on Metal.
     (lib.cmakeFeature "GGML_CPU_ARM_ARCH" "armv8.6-a+fp16")
     (lib.cmakeFeature "CMAKE_OSX_DEPLOYMENT_TARGET" "15.0")
+    (lib.cmakeBool "MTMD_COREML" true)
   ]
   ++ lib.optionals crossDarwin [
     # The cross compiler is a plain clang, not a cc-wrapper, so CMake is
