@@ -116,7 +116,18 @@ let
       "--max-dictation-seconds"
       (toString cfg.headless.maxDictationSeconds)
     ]
+    ++ lib.optionals local.enable (
+      lib.optionals (local.startSound != null) [
+        "--local-start-sound"
+        local.startSound
+      ]
+      ++ lib.optionals (local.stopSound != null) [
+        "--local-stop-sound"
+        local.stopSound
+      ]
+    )
   );
+  localSounds = pkgs.callPackage ./wispr-headless/local-sounds.nix { };
   # Wispr's key codes on Linux: Windows virtual-key codes, which the port's
   # helper reports (its keymap.rs, evdev KEY_F13..KEY_F24).
   wisprKeyCodes = lib.listToAttrs (
@@ -310,6 +321,22 @@ in
           type = colour;
           default = "#15803d";
           description = "Fill of the flow bar while a dictation goes to the local model.";
+        };
+        startSound = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = "${localSounds}/local-start.wav";
+          defaultText = lib.literalMD "two notes going up (./wispr-headless/local-sounds.nix)";
+          description = ''
+            Played when a dictation to the local model starts recording; it
+            differs from Wispr's own so the key pressed can be heard. Null:
+            silent.
+          '';
+        };
+        stopSound = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = "${localSounds}/local-stop.wav";
+          defaultText = lib.literalMD "the same two notes going down";
+          description = "Played when it stops recording. Null: silent.";
         };
         llamaCpp = lib.mkOption {
           type = lib.types.package;

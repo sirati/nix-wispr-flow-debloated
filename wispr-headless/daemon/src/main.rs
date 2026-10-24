@@ -72,6 +72,10 @@ struct Config {
     device: String,
     player: Vec<String>,
     sounds: Option<String>,
+    /// Played when a local dictation starts and when it stops recording:
+    /// sounds of their own, so the key pressed can be heard.
+    local_start_sound: Option<String>,
+    local_stop_sound: Option<String>,
     /// Figtree for the bar's text (Linux; macOS uses its system font).
     fonts: Option<String>,
     /// Where dictations this process starts itself go (`dictate`), unless
@@ -126,6 +130,8 @@ fn config() -> Config {
     let mut asr_config = None;
     let mut fill = bar::WISPR_FILL;
     let mut local_fill = bar::LOCAL_FILL;
+    let mut local_start_sound = None;
+    let mut local_stop_sound = None;
     let mut run = Run::Shim;
     let mut hotkeys = Vec::new();
     let mut typing = typing::Options::default();
@@ -187,6 +193,8 @@ fn config() -> Config {
             "--asr-config" => asr_config = args.next().filter(|c| !c.is_empty()),
             // "#rrggbb".
             "--bar-color" => fill = args.next().and_then(|c| color(&c)).unwrap_or(fill),
+            "--local-start-sound" => local_start_sound = args.next().filter(|p| !p.is_empty()),
+            "--local-stop-sound" => local_stop_sound = args.next().filter(|p| !p.is_empty()),
             "--local-bar-color" => {
                 local_fill = args.next().and_then(|c| color(&c)).unwrap_or(local_fill)
             }
@@ -226,6 +234,8 @@ fn config() -> Config {
         device,
         player,
         sounds,
+        local_start_sound,
+        local_stop_sound,
         fonts,
         backend,
         asr_config,
@@ -386,14 +396,17 @@ fn play(cfg: &Config, name: &str, out: &Out) {
         "popo" => "popo-lock.wav",
         _ => return,
     };
-    let path = format!("{dir}/{file}");
+    play_file(cfg, &format!("{dir}/{file}"), out);
+}
+
+fn play_file(cfg: &Config, path: &str, out: &Out) {
     let (program, args) = match cfg.player.split_first() {
         Some(p) => p,
         None => return,
     };
     match Process::new(program)
         .args(args)
-        .arg(&path)
+        .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1121,12 +1134,18 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                         let _ = e.pill_tx.send(PillCommand::Popo);
                     }
                     let _ = e.pill_tx.send(PillCommand::Mic(true));
+                    if let Some(sound) = &e.cfg.local_start_sound {
+                        play_file(e.cfg, sound, e.out);
+                    }
                 }
                 Err(error) => return Some(control::Input::LocalFailed(error)),
             }
         }
         Action::EndLocal => {
             if let Some(l) = e.local.take() {
+                if let Some(sound) = &e.cfg.local_stop_sound {
+                    play_file(e.cfg, sound, e.out);
+                }
                 end_local(l, e.internal);
                 let _ = e.relist.send(());
             }
@@ -1200,6 +1219,8 @@ mod tests {
             device: "Default".into(),
             player: Vec::new(),
             sounds: None,
+            local_start_sound: None,
+            local_stop_sound: None,
             fonts: None,
             backend: None,
             asr_config: None,

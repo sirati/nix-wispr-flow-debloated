@@ -47,7 +47,9 @@
 #            Mac; null for the daemon's defaults in ~/Library/Application
 #            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
 #            targetSeconds ? 5; maxSeconds ? 10;
-#            barColor ? "#15803d", the bar for dictations to the local model }
+#            barColor ? "#15803d", the bar for dictations to the local model;
+#            startSound, stopSound ? two notes going up / down, played when
+#            one starts and stops recording (null: silent) }
 #   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
 #            whose cc is an aarch64-apple-darwin clang, and the macOS SDK it
 #            uses; only for llama.cpp, so only with localAsr and no
@@ -102,8 +104,11 @@ let
     maxSeconds = 10;
     serverArgs = [ ];
     barColor = "#15803d";
+    startSound = "${localSounds}/local-start.wav";
+    stopSound = "${localSounds}/local-stop.wav";
   }
   // (if localAsr == null then { } else localAsr);
+  localSounds = native.callPackage ../wispr-headless/local-sounds.nix { };
   llamaServer =
     local.llamaServer or (
       if stdenv == null || sdk == null then
@@ -195,6 +200,16 @@ let
         "--max-dictation-seconds"
         (toString maxDictationSeconds)
       ]
+      ++ native.lib.optionals (localAsr != null) (
+        native.lib.optionals (local.startSound != null) [
+          "--local-start-sound"
+          local.startSound
+        ]
+        ++ native.lib.optionals (local.stopSound != null) [
+          "--local-stop-sound"
+          local.stopSound
+        ]
+      )
     );
   };
 
