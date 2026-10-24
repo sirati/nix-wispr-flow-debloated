@@ -169,6 +169,30 @@ pub fn normalize_level(v: f64) -> f64 {
     }
 }
 
+/// Turns a dictation's volumes (dB) into 0..1 levels the way Wispr does
+/// for its own: against the quietest volume heard so far (but no lower than
+/// -60 dB), with the 20 dB above it filling the bar. A fixed -60..0 dB scale
+/// leaves speech at about half height.
+pub struct LevelScale {
+    floor: f64,
+}
+
+impl LevelScale {
+    pub fn new() -> LevelScale {
+        LevelScale { floor: 0.0 }
+    }
+
+    pub fn level(&mut self, db: f64) -> f64 {
+        if !db.is_finite() {
+            return 0.0;
+        }
+        if db < self.floor {
+            self.floor = db.max(-60.0);
+        }
+        ((db - self.floor) / 20.0).clamp(0.0, 1.0)
+    }
+}
+
 /// Alpha of spinner bar `i` (0..8) at `t` seconds: each fades from .88 to .15
 /// over 1.1 s, bar i starting (7 - i) x 0.1375 s into the loop.
 pub fn spinner_alpha(t: f64, i: usize) -> f64 {
@@ -1009,6 +1033,19 @@ mod tests {
         cancelled(&mut s);
         s.apply(PillCommand::NotifyClear);
         assert_eq!(mode(&mut s), Mode::Initializing);
+    }
+
+    #[test]
+    fn level_scale_follows_the_quietest_volume() {
+        let mut s = LevelScale::new();
+        // The first volume sets the floor: nothing to show yet.
+        assert_eq!(s.level(-50.0), 0.0);
+        assert!((s.level(-40.0) - 0.5).abs() < 1e-9);
+        assert_eq!(s.level(-25.0), 1.0);
+        // Silence lowers the floor, but not below -60 dB.
+        assert_eq!(s.level(-200.0), 0.0);
+        assert!((s.level(-50.0) - 0.5).abs() < 1e-9);
+        assert_eq!(s.level(f64::NAN), 0.0);
     }
 
     #[test]

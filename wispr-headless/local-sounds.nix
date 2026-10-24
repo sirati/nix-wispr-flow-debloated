@@ -7,7 +7,7 @@ runCommand "wispr-headless-local-sounds" { nativeBuildInputs = [ sox ]; } ''
   # One note: a sine with its octave, a 3 ms attack and a quick fall.
   note() {
     sox -n -r 44100 -c 1 -b 16 "$2" synth 0.075 sine "$1" sine "$(( $1 * 2 ))" \
-      remix 1v0.8,2v0.2 fade h 0.003 0.075 0.06 vol 0.175
+      remix 1v0.8,2v0.2 fade h 0.003 0.075 0.06 vol 0.0875
   }
   note 784 low.wav
   note 1175 high.wav

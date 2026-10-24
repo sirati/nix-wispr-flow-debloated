@@ -429,6 +429,8 @@ fn play_file(cfg: &Config, path: &str, out: &Out) {
 struct Local {
     recording: Recording,
     dictation: asr::Dictation,
+    /// The bar's level for this dictation's audio.
+    level: bar::LevelScale,
 }
 
 /// Ends a local dictation: the rest of its audio goes to the model, and the
@@ -437,6 +439,7 @@ fn end_local(local: Local, commands: &mpsc::Sender<Option<Command>>) {
     let Local {
         recording,
         mut dictation,
+        ..
     } = local;
     dictation.feed(&recording.finish_pcm());
     let commands = commands.clone();
@@ -987,7 +990,8 @@ fn serve(
                 Ok(pcm) if pcm.is_empty() => {}
                 Ok(pcm) => {
                     if ctl.local_recording() && !ctl.wispr_owns_bar() {
-                        let _ = pill_tx.send(PillCommand::Level(recorder::volume_db(&pcm)));
+                        let level = l.level.level(recorder::volume_db(&pcm));
+                        let _ = pill_tx.send(PillCommand::Level(level));
                     }
                     l.dictation.feed(&pcm);
                 }
@@ -1127,6 +1131,7 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                     *e.local = Some(Local {
                         recording: r,
                         dictation: asr.start(),
+                        level: bar::LevelScale::new(),
                     });
                     let _ = e.pill_tx.send(PillCommand::Local);
                     let _ = e.pill_tx.send(PillCommand::Status("listening".into()));
