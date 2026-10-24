@@ -297,9 +297,11 @@ in
           example = "~/.config/wispr-flow/keywords.txt";
           description = ''
             File of terms the transcription should spell as listed (names,
-            jargon), one per line or separated by commas; up to about 2000.
-            Read when each dictation starts, so edits need no rebuild. A long
-            list makes the model's context, and its memory, bigger.
+            jargon), one per line or separated by commas. Read when each
+            dictation starts, so edits need no rebuild. Keep it short: 200
+            terms cost nothing measurable, but 1800 made the model invent
+            sentences (8.5 % of words wrong instead of 1 % on LibriSpeech),
+            took twice as long and need a bigger context, so more memory.
           '';
         };
         targetSeconds = lib.mkOption {

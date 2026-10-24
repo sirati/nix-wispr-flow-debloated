@@ -3,8 +3,10 @@
 //! spell their way (IBM's keyword biasing). llama-server puts the audio after
 //! this text, so for every piece of a dictation the prompt is the same
 //! prefix and the server processes the keywords only once (its prompt
-//! cache); see `Engine::prime` in mod.rs. Each piece still attends to them:
-//! with 1500 terms (3.5k tokens) the pieces took 3x as long on a CPU.
+//! cache); see `Engine::prime` in mod.rs. Each piece still attends to them,
+//! and long lists cost accuracy. On LibriSpeech in 5 s pieces (on a CPU),
+//! 200 common words changed nothing; 1800 (4.1k tokens) took the error rate
+//! from 1.1 % to 8.5 %, with invented sentences, and doubled the time.
 
 pub const INSTRUCTION: &str = "transcribe the speech to text.";
 /// Granite Speech 5.0's context, in tokens.
