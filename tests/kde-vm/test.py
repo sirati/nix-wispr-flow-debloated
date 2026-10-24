@@ -171,6 +171,63 @@ with subtest("a keyboard unplugged while held lets go of its keys"):
         "  released local",
     ], got
 
+# ---------------------------------------------------------------- buttons
+DEVICE_LOG = "/tmp/hotkey-devices.log"
+CALL = "hid:1209:0001/3:1:0"
+# A bit the stand-in's descriptor leaves as padding; hidraw passes it on.
+SPARE = "hid:1209:0001/3:1:1"
+
+
+def buttons(kind, *steps):
+    """Plugs in a stand-in button device, does `steps`, unplugs it; the key
+    lines and the shortcut's events (without their indent)."""
+    machine.succeed(f"stand-in-buttons {kind} 2.0 " + " ".join(steps), timeout=60)
+    time.sleep(0.5)
+    lines = keys_since()
+    keys = [line for line in lines if not line.startswith("  ")]
+    events = [line.strip() for line in lines if line.startswith("  ")]
+    log(kind, steps, "->", lines)
+    return keys, events
+
+
+with subtest("a mouse button is a hold binding"):
+    machine.succeed("pkill -f -- --hotkey-test")
+    # The devices' threads log to stderr while the keys go to stdout, and
+    # unplugging does both at once: kept apart, so no line is cut in two.
+    as_alice(
+        f"{DAEMON} --hotkey-test --hotkey wispr:BTN_TASK"
+        f" --hotkey wispr:toggle:{CALL} --hotkey local:{SPARE}"
+        f" >{HOTKEY_LOG} 2>{DEVICE_LOG} &"
+    )
+    seen = 0
+    machine.wait_until_succeeds(f"grep -q 'shortcut: reading' {DEVICE_LOG}")
+    keys_since()
+    keys, events = buttons("mouse", "+BTN_TASK", "1.0", "-BTN_TASK")
+    assert keys == ["BTN_TASK down", "BTN_TASK up"], keys
+    assert "pressed wispr" in events and events[-1] == "released wispr", events
+    machine.succeed(f"grep -q 'shortcut: reading stand-in mouse' {DEVICE_LOG}")
+
+with subtest("a mouse unplugged while its button is held lets go of it"):
+    keys, events = buttons("mouse", "+BTN_TASK", "1.0")
+    assert keys == ["BTN_TASK down", "BTN_TASK up"], keys
+    assert events[-1] == "released wispr", events
+
+with subtest("a call button seen only in raw HID reports starts and stops hands-free"):
+    # The Jabra's hook switch: a report with the bit set, then one without.
+    keys, events = buttons("speaker", "0301", "0300", "1.0", "0301", "0300")
+    assert keys == [f"{CALL} down", f"{CALL} up"] * 2, keys
+    assert "pressed wispr" in events and events[-1] == "released wispr", events
+    # Plugged in after the daemon started, and readable through the group.
+    machine.succeed(
+        f"grep -q 'shortcut: reading stand-in speaker (hidraw)' {DEVICE_LOG}"
+    )
+    machine.succeed(f"grep -q 'shortcut: stopped reading stand-in speaker' {DEVICE_LOG}")
+
+with subtest("a HID device unplugged while its bit is set lets go of it"):
+    keys, events = buttons("speaker", "0302", "1.0")
+    assert keys == [f"{SPARE} down", f"{SPARE} up"], keys
+    assert "pressed local" in events and events[-1] == "released local", events
+
 # ---------------------------------------------------------------- typing
 TYPED = "/tmp/typed.txt"
 
@@ -210,7 +267,7 @@ with subtest("typing into Konsole"):
     log("Konsole got after A, Shift+Enter, B, Enter:", repr(read("/tmp/konsole.txt")))
 
 with subtest("the shortcut never reads the typing keyboard"):
-    log_text = read(HOTKEY_LOG)
+    log_text = read(HOTKEY_LOG) + read(DEVICE_LOG)
     assert "reading wispr-headless keyboard" not in log_text, log_text
     for line in keys_since():
         assert line in ("Enter down", "Enter up"), line

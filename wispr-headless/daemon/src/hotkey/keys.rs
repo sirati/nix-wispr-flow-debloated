@@ -6,8 +6,10 @@
 //! (`wispr` or `local`) says where its dictations go. Names are matched
 //! without regard to case.
 //! Left and right modifiers are separate keys, as in Wispr's own shortcuts.
-//! On Linux any evdev name works too (`KEY_F19`, `BTN_SIDE` for a mouse
-//! button), and on both platforms `code:N` is the raw code.
+//! On Linux any evdev name works too (`KEY_F19`, `BTN_SIDE` or `BTN_TASK`
+//! for a mouse button), `hid:DEVICE/REPORT:BYTE:BIT` is a button that only
+//! shows in raw HID reports (hidraw.rs), and on both platforms `code:N` is
+//! the raw code.
 
 use super::chord::{Binding, Key, Mode};
 
@@ -192,6 +194,14 @@ pub fn parse_key(name: &str) -> Result<Key, String> {
             code => Ok(code),
         };
     }
+    #[cfg(target_os = "linux")]
+    if let Some(key) = super::hidraw::parse_key(name) {
+        return key;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("hid:")) {
+        return Err(format!("{name}: hid: buttons are only read on Linux"));
+    }
     if let Some(n) = name.strip_prefix("code:") {
         return n.parse().map_err(|_| format!("{name}: not a key code"));
     }
@@ -212,6 +222,9 @@ pub fn key_name(key: Key) -> String {
     }
     #[cfg(target_os = "linux")]
     {
+        if let Some(name) = super::hidraw::key_name(key) {
+            return name;
+        }
         let name = format!("{:?}", evdev::KeyCode::new(key));
         if !name.starts_with("unknown") {
             return name;
@@ -370,7 +383,25 @@ mod tests {
         }
         assert_eq!(parse_key("BTN_SIDE"), Ok(0x113));
         assert_eq!(key_name(0x113), "BTN_SIDE");
+        // The Logitech mouse's spare button.
+        assert_eq!(parse_key("BTN_TASK"), Ok(0x117));
+        assert_eq!(key_name(0x117), "BTN_TASK");
+        let b = parse_binding("wispr:BTN_TASK").unwrap();
+        assert_eq!((b.keys, b.mode), (vec![0x117], Mode::Hold));
         assert_eq!(key_name(100), "RightAlt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hid_buttons_are_keys_of_their_own() {
+        let b = parse_binding("wispr:toggle:hid:0b0e:0412/3:1:0").unwrap();
+        assert_eq!((b.mode, b.backend.as_deref()), (Mode::Toggle, Some("wispr")));
+        assert_eq!(b.keys.len(), 1);
+        assert!(b.keys[0] >= super::super::hidraw::FIRST);
+        assert_eq!(key_name(b.keys[0]), "hid:0b0e:0412/3:1:0");
+        let b = parse_binding("local:hid:Jabra_SPEAK_410_USB/3:1:0/latch+RightAlt").unwrap();
+        assert_eq!(b.keys.len(), 2);
+        assert!(parse_binding("toggle:hid:0b0e:0412").is_err());
     }
 
     #[test]

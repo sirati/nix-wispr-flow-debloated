@@ -38,8 +38,10 @@ lets a program set the clipboard without a window, so the copy opens a window
 that takes focus and the paste goes to the wrong place. wispr-ime types the
 text through the input method instead. Other desktops work without it.
 
-`services.dictationButtons` turns mouse or headset buttons into a dictation
-key.
+`headless.hotkeys` are dictation shortcuts that wispr-headless reads itself:
+keys, mouse buttons (`wispr:BTN_TASK`) and buttons that only show in raw HID
+reports, such as a speakerphone's call button
+(`wispr:toggle:hid:0b0e:0412/3:1:0`).
 
 `headless.localAsr` transcribes on the machine instead of in Wispr's
 service, with IBM's Granite Speech 5.0 (2B) through llama.cpp's

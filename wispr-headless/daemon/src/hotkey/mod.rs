@@ -9,6 +9,8 @@
 mod chord;
 #[cfg(target_os = "linux")]
 mod evdev;
+#[cfg(target_os = "linux")]
+mod hidraw;
 mod keys;
 #[cfg(target_os = "macos")]
 mod mac;
@@ -33,8 +35,11 @@ pub type KeySink = Sender<(Key, bool)>;
 
 /// Watches the keyboards; `wanted` are the keys the bindings use (on Linux,
 /// devices that have one of them are read even if they are no keyboard,
-/// such as a mouse for its side buttons).
+/// such as a mouse for its side buttons; and the /dev/hidraw nodes of
+/// `hid:` buttons).
 pub fn watch(wanted: &[Key], keys: KeySink, log: Log) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    hidraw::watch(wanted, keys.clone(), log.clone())?;
     platform::watch(wanted, keys, log)
 }
 
