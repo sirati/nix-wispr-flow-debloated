@@ -124,6 +124,7 @@ let
     barColor = cfg.headless.barColor;
     localBarColor = local.barColor;
     inherit daemonArgs;
+    suppressWisprShortcut = lib.optionalString cfg.headless.suppressWisprShortcut "1";
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -281,6 +282,8 @@ in
         };
         llamaCpp = lib.mkOption {
           type = lib.types.package;
+          default = pkgs.callPackage ./llama-cpp { };
+          defaultText = lib.literalMD "this flake's llama.cpp (./llama-cpp, b11852 with the Granite Speech fixes)";
           description = ''
             llama.cpp with its llama-server, build b11852 or later (older
             ones lack Granite Speech's chat template).
@@ -376,8 +379,9 @@ in
           other key while it is held makes it an ordinary shortcut (Right
           Ctrl+C) and cancels it. `toggle:` starts and stops hands-free; a
           hold that grows into a toggle binding turns hands-free, like
-          Wispr's Fn+Space. Keys Wispr's own shortcuts use would start it
-          twice. Names are listed in wispr-headless/daemon/src/hotkey/keys.rs;
+          Wispr's Fn+Space. Wispr's own dictation shortcuts are switched off
+          (`suppressWisprShortcut`). Names are listed in
+          wispr-headless/daemon/src/hotkey/keys.rs;
           any evdev name (KEY_*, BTN_* for mouse buttons) works too, and
           `wispr-headless --hotkey-test` prints the names of the keys pressed.
         '';
@@ -395,6 +399,21 @@ in
           its own; see wispr-headless/daemon/src/typing/mod.rs). `auto`:
           wispr-ime on GNOME, else key presses through /dev/uinput (Wayland)
           or XTEST (X11), pasting what the layout cannot type.
+        '';
+      };
+      suppressWisprShortcut = lib.mkOption {
+        type = lib.types.bool;
+        default = cfg.headless.hotkeys != [ ];
+        defaultText = lib.literalExpression "headless.hotkeys != [ ]";
+        description = ''
+          Keep Wispr's own dictation shortcuts (push to talk, hands-free,
+          command mode; Settings > Shortcuts) from starting a dictation, so
+          only `hotkeys` do, without changing Wispr's settings. The shim
+          drops the helper's key events that would complete one of them
+          before Wispr sees them; all other keys still reach Wispr, so Escape
+          still cancels and its other shortcuts still work. Not while Wispr's
+          settings record a new shortcut, nor when wispr-headless is not
+          running.
         '';
       };
     };

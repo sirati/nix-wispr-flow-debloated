@@ -46,7 +46,9 @@
       # compiling needs an Apple SDK toolchain, which the caller provides:
       #   lib.macWisprFlow { native; builders; darwin; daemon; user; localAsr ? null; }
       # with daemon = a cross build of ./wispr-headless/daemon, and
-      # optionally signingIdentity, hotkeys and typing.
+      # optionally signingIdentity, barColor, hotkeys, suppressWisprShortcut
+      # and typing. With localAsr, also stdenv and sdk as for lib.macLlamaCpp
+      # below, unless localAsr.llamaServer names another llama-server.
       lib.macWisprFlow = import ./darwin/wispr-flow.nix;
 
       # llama.cpp for Granite Speech (see llama-cpp/default.nix), cross-built

@@ -27,8 +27,9 @@
 // dictation:audioStart, dictation:audioChunk, recordingStarted,
 // recordingDone, status:dictationStatus, status:audioLevel, status:micActive,
 // status:popo, status:startClicked, notification:show, zubridge:state-update,
-// hideFlowBarPermanently, clickableBubbleSnoozeUntil, and the preload paths
-// renderer/<role>/preload.js.
+// hideFlowBarPermanently, clickableBubbleSnoozeUntil, keyboard:isRecording,
+// the preload paths renderer/<role>/preload.js, and the helper's
+// KeypressEvent with prefs.user.shortcuts keyed by key codes.
 "use strict";
 
 const path = require("path");
@@ -53,6 +54,9 @@ const LOCAL_BAR_COLOR = "@localBarColor@";
 // More daemon arguments, separated by spaces: its own dictation shortcuts
 // (--hotkey) and how it types (--type-with, --wl-copy).
 const DAEMON_ARGS = "@daemonArgs@";
+// "1": wispr-headless's own shortcuts replace Wispr's, so the key events that
+// would start one of Wispr's dictations are kept from Wispr (see keyGate).
+const SUPPRESS_WISPR_SHORTCUT = "@suppressWisprShortcut@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
@@ -229,22 +233,43 @@ function startDaemon(resourcesPath, onEvent, onExit) {
 
 // Wispr's helper reports every key to the main process; the shim reads the
 // same messages so it can start recording on the dictation shortcut itself
-// (see keyChanged in build()). Nothing per key is logged or kept beyond the
-// keys held right now; the trace only gets how long before a dictation
-// starts the last key came (rec.initializing's sinceKey).
+// (see onKey in build()), or, with SUPPRESS_WISPR_SHORTCUT, keep the ones
+// that would start one of Wispr's dictations from Wispr (keyGate). Nothing
+// per key is logged or kept beyond the keys held right now; the trace only
+// gets how long before a dictation starts the last key came
+// (rec.initializing's sinceKey).
 let lastKeyAt = 0;
 let onKey = null; // (pressed: boolean, key: number) => void, set by build()
+let keyGate = null; // (pressed: boolean, key: number) => boolean, true: Wispr does not get it
 
 // The helper's framing: messages separated by "|", with "|" escaped as "+2"
 // and "+" as "+1" (Wispr's IPC reader).
+const unescapeHelper = (s) => s.replaceAll("+2", "|").replaceAll("+1", "+");
+const escapeHelper = (s) => s.replaceAll("+", "+1").replaceAll("|", "+2");
 function helperMessages() {
   let pending = "";
   return (chunk) => {
     pending += chunk.toString("utf8");
     const parts = pending.split("|");
     pending = parts.pop();
-    return parts.map((p) => p.replaceAll("+2", "|").replaceAll("+1", "+"));
+    return parts.map(unescapeHelper);
   };
+}
+
+// A key event's key as Wispr's keyboard service sees it: mouse buttons 2-9
+// become 4098-4105 (mouse_middle .. mouse10), other mouse buttons nothing.
+function wisprKey(p) {
+  if (typeof p?.key !== "number") return undefined;
+  if ((p.inputType || "keyboard") !== "mouse") return p.key;
+  return p.key >= 2 && p.key <= 9 ? 4096 + p.key : undefined;
+}
+
+function sawKey(p) {
+  lastKeyAt = Date.now();
+  const key = wisprKey(p);
+  const pressed = !/release/.test(String(p?.eventType));
+  if (key !== undefined) onKey?.(pressed, key);
+  return { key, pressed };
 }
 
 function watchHelper() {
@@ -252,22 +277,78 @@ function watchHelper() {
   childProcess.spawn = function (command, ...rest) {
     const child = realSpawn.call(this, command, ...rest);
     try {
+      // Its messages come on an extra pipe (fd 3); stdout only carries logs.
       if (/swift-helper-app-dist|wispr-flow-linux-helper/.test(String(command)) && child.stdio?.[3]) {
-        // Its messages come on an extra pipe (fd 3); stdout only carries logs.
-        const split = helperMessages();
-        child.stdio[3].on("data", (chunk) => {
-          for (const message of split(chunk)) {
-            if (!message.includes("KeypressEvent")) continue;
-            lastKeyAt = Date.now();
-            try {
-              const p = JSON.parse(message)?.HelperAPIRequest?.KeypressEvent?.payload;
-              if (p && typeof p.key === "number") onKey?.(!/release/.test(String(p.eventType)), p.key);
-            } catch {}
-          }
-        });
+        if (given(SUPPRESS_WISPR_SHORTCUT)) gateHelper(child);
+        else observeHelper(child);
       }
     } catch {}
     return child;
+  };
+}
+
+function observeHelper(child) {
+  const split = helperMessages();
+  child.stdio[3].on("data", (chunk) => {
+    for (const message of split(chunk)) {
+      if (!message.includes("KeypressEvent")) continue;
+      try {
+        const p = JSON.parse(message)?.HelperAPIRequest?.KeypressEvent?.payload;
+        if (p) sawKey(p);
+      } catch {}
+    }
+  });
+}
+
+// Wispr reads the helper with stdio[3].on("data"), so every 'data' event of
+// that pipe comes through here first and Wispr gets only whole messages. They
+// pass unchanged, except key events keyGate keeps from Wispr: those the shim
+// acknowledges as Wispr would, and the ones that pass are numbered again
+// (payload.index), as Wispr warns about every gap in the helper's count.
+function gateHelper(child) {
+  const fd3 = child.stdio[3];
+  const realEmit = fd3.emit;
+  const BAR = Buffer.from("|");
+  let pending = Buffer.alloc(0);
+  let passed = 0;
+  let kept = 0;
+  const ack = (uuid) => {
+    if (typeof uuid !== "string") return;
+    try { child.stdin?.write(escapeHelper(JSON.stringify({ HelperAPIResponse: { uuid, ACK: true } })) + "|"); } catch {}
+  };
+  // The message to hand on (raw, still escaped), or null to keep it.
+  const gate = (raw) => {
+    const text = unescapeHelper(raw.toString("utf8"));
+    if (!text.includes("KeypressEvent")) return raw;
+    let message;
+    try { message = JSON.parse(text); } catch { return raw; }
+    const p = message?.HelperAPIRequest?.KeypressEvent?.payload;
+    if (!p || typeof p !== "object") return raw;
+    const { key, pressed } = sawKey(p);
+    if (key !== undefined && keyGate?.(pressed, key)) {
+      if (kept++ === 0) trace({ ev: "wisprShortcut.suppressed" });
+      ack(message.HelperAPIRequest.uuid);
+      return null;
+    }
+    p.index = ++passed;
+    return Buffer.from(escapeHelper(JSON.stringify(message)), "utf8");
+  };
+  fd3.emit = function (name, chunk, ...rest) {
+    if (name !== "data") return realEmit.call(this, name, chunk, ...rest);
+    pending = Buffer.concat([pending, Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8")]);
+    const out = [];
+    let start = 0;
+    // "|" (0x7c) is one byte in UTF-8 and never part of another character.
+    for (let bar; (bar = pending.indexOf(0x7c, start)) !== -1; start = bar + 1) {
+      const raw = pending.subarray(start, bar);
+      let handOn = raw;
+      try { handOn = gate(raw); } catch (e) { trace({ ev: "keyGate.error", error: String(e).slice(0, 200) }); }
+      if (handOn) out.push(handOn, BAR);
+    }
+    pending = Buffer.from(pending.subarray(start));
+    if (out.length === 0) return false;
+    const data = Buffer.concat(out);
+    return realEmit.call(this, name, typeof chunk === "string" ? data.toString("utf8") : data, ...rest);
   };
 }
 
@@ -325,18 +406,28 @@ function build(electron) {
   // key codes held, sorted as strings and joined with "+". If another key
   // joins before Wispr asks to record, the combination is no longer a
   // dictation (fn+F-key, say) and the early recording is dropped; once Wispr
-  // has asked, only Wispr stops it.
-  const DICTATION_ACTIONS = new Set(["ptt", "popo", "command"]);
-  let dictationKeys = new Set();
+  // has asked, only Wispr stops it. Wispr's own list of the actions that
+  // start a dictation: push to talk, hands-free, command mode (lens, command).
+  const DICTATION_ACTIONS = new Set(["ptt", "popo", "lens", "command"]);
+  // Until Wispr's store arrives, its defaults: Fn, Fn+Space, Fn+Ctrl on the
+  // Mac; Ctrl+Win, Ctrl+Win+Space, Ctrl+Win+Alt (Windows key codes) on Linux.
+  let dictationKeys = new Set(process.platform === "darwin" ? ["63", "49+63", "59+63"] : ["162+91", "162+32+91", "162+164+91"]);
+  let dictationSets = [];
   const held = new Set();
   let early = false;
   let earlyAt = 0;
+  function setDictationKeys(keys) {
+    dictationKeys = keys;
+    dictationSets = [...keys].map((k) => k.split("+").map(Number));
+  }
+  setDictationKeys(dictationKeys);
   function updateShortcuts(state) {
     const shortcuts = state?.prefs?.user?.shortcuts;
     if (!shortcuts || typeof shortcuts !== "object") return;
-    dictationKeys = new Set(Object.entries(shortcuts).filter(([, action]) => DICTATION_ACTIONS.has(action)).map(([keys]) => keys));
+    const keys = Object.entries(shortcuts).filter(([, action]) => DICTATION_ACTIONS.has(action)).map(([keys]) => keys);
+    if (keys.join() !== [...dictationKeys].join()) setDictationKeys(new Set(keys));
   }
-  onKey = (pressed, key) => {
+  if (!given(SUPPRESS_WISPR_SHORTCUT)) onKey = (pressed, key) => {
     if (!daemon || !headless) return;
     if (!pressed) {
       held.delete(key);
@@ -358,6 +449,32 @@ function build(electron) {
       daemon.send({ op: "earlyCancel" });
     }
   };
+
+  // With wispr-headless's own shortcuts, Wispr's dictation shortcuts are
+  // kept from firing: Wispr starts one when a key goes down and the keys it
+  // knows to be held are exactly a shortcut, so a press that could make them
+  // one never reaches Wispr, nor does that key's release. Every other key
+  // does, so Escape, paste-last, undo and Wispr's other shortcuts work as
+  // before, as do the held modifiers Wispr looks at. Wispr may have dropped
+  // keys it thought stuck, so a press counts if it completes a shortcut
+  // with any of the keys it was told about. Off while Wispr's settings
+  // record a new shortcut, and when wispr-headless is not running.
+  const toldWispr = new Set(); // keys down whose press Wispr got
+  const keptFromWispr = new Set(); // keys down whose press it did not
+  if (given(SUPPRESS_WISPR_SHORTCUT)) keyGate = (pressed, key) => {
+    if (!pressed) {
+      toldWispr.delete(key);
+      return keptFromWispr.delete(key);
+    }
+    if (keptFromWispr.has(key)) return true;
+    const after = new Set(toldWispr).add(key);
+    const starts = daemon?.alive && headless && !recordingShortcut && dictationSets.some((s) => s.includes(key) && s.every((k) => after.has(k)));
+    if (!starts) toldWispr.add(key);
+    // (A repeat of a key Wispr has is dropped too; Wispr does nothing on it.)
+    else if (!toldWispr.has(key)) keptFromWispr.add(key);
+    return Boolean(starts);
+  };
+  let recordingShortcut = false; // Wispr's settings record a shortcut
 
   // The bar's buttons, clicked on the Rust bar or by wispr-headless for a
   // dictation of its own (its shortcut). A stop or cancel that comes before
@@ -773,6 +890,7 @@ function build(electron) {
   }
 
   ipcMain.emit = (ch, e, ...args) => {
+    if (ch === "keyboard:isRecording") recordingShortcut = Boolean(args[0]);
     const lazy = windows.get(e?.sender?.id);
     if (lazy && headless) {
       // The recorder sends WAV; a loaded Hub must not switch Wispr to Opus.

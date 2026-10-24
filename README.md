@@ -43,8 +43,9 @@ key.
 
 `headless.localAsr` transcribes on the machine instead of in Wispr's
 service, with IBM's Granite Speech 5.0 (2B) through llama.cpp's
-llama-server. It applies to the dictations wispr-headless starts itself
-(its `dictate` command); Wispr's own shortcut still goes to Wispr. The model
+llama-server (`localAsr.llamaCpp`, by default this flake's build). It applies to the dictations wispr-headless starts itself
+(its `dictate` command and its shortcuts); Wispr's own shortcut still goes
+to Wispr. The model
 loads when such a dictation starts and is freed once its text is out. The
 model files are not packaged: put `granite-speech-5.0-2b-Q4_K_M.gguf` and
 `mmproj-model-q4_k-convdw-f32.gguf` (the encoder, quantized with
@@ -63,8 +64,11 @@ Wispr, Right Ctrl with the local model, whose text is then typed into the
 focused window. A held key becomes a dictation after 200 ms alone; another
 key while it is held makes it an ordinary shortcut. On macOS,
 `lib.macWisprFlow` holds Right Option for Wispr and, with `localAsr`, Right
-Command for the local model (`hotkeys` changes that); set Wispr's own
-shortcut to other keys. To try it by hand,
+Command for the local model (`hotkeys` changes that). With shortcuts of its
+own, Wispr's dictation shortcuts (Fn by default on macOS) are switched off
+without touching Wispr's settings (`suppressWisprShortcut`): the shim drops
+the key events from Wispr's helper that would start one, and passes every
+other key, so Escape, paste-last and the rest still work. To try it by hand,
 `wispr-headless --hotkey-test --hotkey RightAlt` prints the keys pressed and
 what the shortcut does, and `echo text | wispr-headless --type-test` types
 into the focused window three seconds later.
@@ -80,8 +84,11 @@ wispr-flow-debloated.lib.macWisprFlow {
   daemon = crossRustPlatformPackage ./wispr-headless/daemon;
   user = "alice";           # the macOS user who runs Wispr
   # Optional: local transcription, models in
-  # ~/Library/Application Support/wispr-headless.
-  localAsr.llamaServer = "${llamaCppForMac}/bin/llama-server";
+  # ~/Library/Application Support/wispr-headless, with llama.cpp built by
+  # the same toolchain as lib.macLlamaCpp below.
+  localAsr = { };
+  stdenv = crossStdenv;
+  sdk = appleSdk;
 }
 ```
 

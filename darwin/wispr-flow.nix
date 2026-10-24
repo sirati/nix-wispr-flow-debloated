@@ -39,19 +39,28 @@
 #            black by default)
 #   localAsr transcription on the Mac for the dictations wispr-headless
 #            starts itself (see programs.wisprFlow.headless.localAsr in
-#            ../wispr-flow.nix for the meaning of each): { llamaServer, the
-#            path of an aarch64-darwin llama-server (b11852 or later);
+#            ../wispr-flow.nix for the meaning of each): { llamaServer ?
+#            llama-server from this flake's llama.cpp (../llama-cpp),
+#            cross-built with stdenv and sdk, or the path of another
+#            aarch64-darwin one (b11852 or later);
 #            backend ? "local"; model, mmproj, keywords ? null (paths on the
 #            Mac; null for the daemon's defaults in ~/Library/Application
 #            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
 #            targetSeconds ? 5; maxSeconds ? 10;
 #            barColor ? "#15803d", the bar for dictations to the local model }
+#   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
+#            whose cc is an aarch64-apple-darwin clang, and the macOS SDK it
+#            uses; only for llama.cpp, so only with localAsr and no
+#            llamaServer
 #   hotkeys  dictation shortcuts wispr-headless watches itself, through an
 #            event tap with Wispr's Accessibility permission (see the NixOS
 #            module's headless.hotkeys). Default: hold Right Option to
 #            dictate with Wispr and, with localAsr, Right Command with the
-#            local model; the left keys stay as they are. Wispr's own
-#            shortcut (Settings > Shortcuts) should then use other keys
+#            local model; the left keys stay as they are
+#   suppressWisprShortcut  keep Wispr's own dictation shortcuts (Fn by
+#            default) from starting a dictation, without changing Wispr's
+#            settings (see the NixOS module's headless.suppressWisprShortcut);
+#            on unless hotkeys is [ ]
 #   typing   how wispr-headless types what the local model heard: "auto" or
 #            "paste" (Cmd+V, the clipboard put back after), "keys"
 {
@@ -63,7 +72,10 @@
   signingIdentity ? "Wispr Flow local code signing (Nix)",
   barColor ? "#000000",
   localAsr ? null,
+  stdenv ? null,
+  sdk ? null,
   hotkeys ? null,
+  suppressWisprShortcut ? null,
   typing ? "auto",
 }:
 let
@@ -79,11 +91,24 @@ let
     barColor = "#15803d";
   }
   // (if localAsr == null then { } else localAsr);
+  llamaServer =
+    local.llamaServer or (
+      if stdenv == null || sdk == null then
+        throw "macWisprFlow: localAsr needs llamaServer, or stdenv and sdk to cross-build llama.cpp"
+      else
+        "${native.callPackage ../llama-cpp { inherit stdenv sdk; }}/bin/llama-server"
+    );
+  hotkeyList =
+    if hotkeys != null then
+      hotkeys
+    else
+      [ "wispr:RightOption" ] ++ native.lib.optional (localAsr != null) "local:RightCommand";
+  suppress = if suppressWisprShortcut != null then suppressWisprShortcut else hotkeyList != [ ];
   # wispr-headless/daemon/src/asr/mod.rs, Settings.
   asrConfig = native.writeText "wispr-headless-asr.json" (
     builtins.toJSON (
       {
-        server = local.llamaServer;
+        server = llamaServer;
         inherit (local)
           idleSeconds
           serverArgs
@@ -123,16 +148,12 @@ let
     asrConfig = native.lib.optionalString (localAsr != null) "${asrConfig}";
     inherit barColor;
     localBarColor = local.barColor;
+    suppressWisprShortcut = native.lib.optionalString suppress "1";
     daemonArgs = builtins.concatStringsSep " " (
       native.lib.concatMap (h: [
         "--hotkey"
         h
-      ]) (
-        if hotkeys != null then
-          hotkeys
-        else
-          [ "wispr:RightOption" ] ++ native.lib.optional (localAsr != null) "local:RightCommand"
-      )
+      ]) hotkeyList
       ++ [
         "--type-with"
         typing

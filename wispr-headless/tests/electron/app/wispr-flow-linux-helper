@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Stand-in for Wispr's helper (named like it, so the shim watches it): sends
+# key events and another message on fd 3 in the helper's framing, and writes
+# what it is sent on stdin to $1. The second part waits for the file $2.
+set -eu
+exec 4<&0
+cat <&4 >"$1" &
+key() {
+	printf '{"HelperAPIRequest":{"uuid":"%s","KeypressEvent":{"payload":{"eventType":"key_event_%s","key":%d,"index":%d}}}}|' "$1" "$2" "$3" "$4" >&3
+}
+key k1 press 63 1
+key k2 press 49 2
+key k3 release 49 3
+key k4 release 63 4
+# Another message, with escaped "|" and "+", split across two writes.
+printf '{"HelperAPIRequest":{"uuid":"a1","AppInfoUpdate":{"pay' >&3
+sleep 0.2
+printf 'load":{"appName":"a+2b+1c"}}}}|' >&3
+key k5 press 53 5
+key k6 release 53 6
+key k7 press 59 7
+key k8 press 63 8
+key k9 release 63 9
+key k10 release 59 10
+while [ ! -e "$2" ]; do sleep 0.05; done
+key k11 press 63 11
+key k12 release 63 12
+wait

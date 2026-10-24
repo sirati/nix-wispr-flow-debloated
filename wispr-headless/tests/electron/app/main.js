@@ -217,6 +217,48 @@ app.whenReady().then(async () => {
   status.webContents.send("zubridge:state-update", withSubscription("s2", 4));
   await until("woken by store", () => loaded.includes("status"), 5_000);
   check(loaded.includes("status"), "a changed subscription value loads the status page");
+
+  // Wispr's dictation shortcuts are kept from Wispr: the helper's key events
+  // that would complete one never arrive, everything else does, numbered
+  // without gaps, and the dropped ones are acknowledged to the helper.
+  hub.webContents.send("zubridge:state-update", {
+    updateId: "keys",
+    state: { prefs: { user: { shortcuts: { 63: "ptt", "49+63": "popo", "59+63": "lens", 53: "dismiss" } } } },
+  });
+  await wait(200);
+  const fs = require("fs");
+  const ackFile = path.join(app.getPath("temp"), `wispr-test-acks-${process.pid}`);
+  const goFile = `${ackFile}.go`;
+  const helper = require("child_process").spawn(path.join(__dirname, "wispr-flow-linux-helper"), [ackFile, goFile], { stdio: ["pipe", "pipe", "inherit", "pipe"] });
+  const fromHelper = [];
+  let pendingData = "";
+  // Wispr's reader (HelperAPIClient.pushData).
+  helper.stdio[3].on("data", (e) => {
+    pendingData += e.toString("utf8");
+    while (pendingData.includes("|")) {
+      const m = pendingData.split("|")[0];
+      pendingData = pendingData.slice(m.length + 1);
+      fromHelper.push(JSON.parse(m.replaceAll("+2", "|").replaceAll("+1", "+")).HelperAPIRequest);
+    }
+  });
+  const keys = () => fromHelper.filter((r) => r.KeypressEvent).map((r) => `${r.KeypressEvent.payload.eventType.slice(10)} ${r.KeypressEvent.payload.key}`);
+  await until("helper", () => keys().length >= 6, 5_000);
+  await wait(300);
+  check(keys().join() === "press 49,release 49,press 53,release 53,press 59,release 59", `only keys that start no Wispr dictation reach Wispr (${keys().join()})`);
+  check(fromHelper.filter((r) => r.KeypressEvent).every((r, i) => r.KeypressEvent.payload.index === i + 1), "key events reach Wispr numbered 1, 2, ...");
+  check(fromHelper.some((r) => r.AppInfoUpdate?.payload?.appName === "a|b+c"), "other helper messages arrive unchanged");
+  // While Wispr's settings record a shortcut, every key arrives.
+  ipcMain.emit("keyboard:isRecording", { sender: hub.webContents }, true);
+  fs.writeFileSync(goFile, "");
+  await until("recording keys", () => keys().length >= 8, 5_000);
+  check(keys().slice(6).join() === "press 63,release 63", `keys arrive while a shortcut is recorded (${keys().slice(6).join()})`);
+  ipcMain.emit("keyboard:isRecording", { sender: hub.webContents }, false);
+  helper.stdin.end();
+  await new Promise((r) => helper.once("exit", r));
+  const helperAcks = fs.readFileSync(ackFile, "utf8").split("|").filter(Boolean).map((m) => JSON.parse(m.replaceAll("+2", "|").replaceAll("+1", "+")).HelperAPIResponse);
+  check(helperAcks.every((a) => a.ACK === true) && helperAcks.map((a) => a.uuid).join() === "k1,k4,k8,k9", `the helper gets an ACK for each dropped key event (${helperAcks.map((a) => a.uuid).join()})`);
+  for (const f of [ackFile, goFile]) fs.rmSync(f, { force: true });
+
   console.log(failures === 0 ? "ALL PASSED" : `${failures} FAILED`);
   app.exit(failures === 0 ? 0 : 1);
 });
