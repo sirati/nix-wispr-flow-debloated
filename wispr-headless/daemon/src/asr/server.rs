@@ -4,21 +4,31 @@
 //! directory only this user can open; requests are plain HTTP/1.1, one per
 //! connection.
 //!
-//! A small shell script runs it and kills it (SIGKILL: nothing to save, and
-//! no waiting for a load to finish) once its stdin, a pipe from this
-//! process, closes: when the Server is dropped, and also when this process
-//! dies without dropping it. It exits when the server does, which is how a
-//! server that dies while loading is noticed.
+//! A small shell script runs it, in a process group of its own. Dropping
+//! the Server kills the group (SIGKILL: nothing to save, and no waiting for
+//! a load to finish). The script also kills the server once its stdin, a
+//! pipe from this process, closes, which covers this process dying without
+//! dropping the Server; a copy of the pipe that leaked into another child
+//! (on macOS a pipe is made close-on-exec only after it is made) can keep
+//! that from happening, so it is not the only way. The script exits when the
+//! server does, which is how a server that dies is noticed.
+//!
+//! There is at most one server per process: Slot (mod.rs) hands it from
+//! dictation to dictation, and `Server::spawn` stops any other it finds.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 
 use super::Settings;
 
@@ -39,18 +49,118 @@ exit "$status""#;
 const LOAD_PATIENCE: Duration = Duration::from_secs(120);
 /// How long one request may take.
 const REQUEST_PATIENCE: Duration = Duration::from_secs(120);
+/// How long a new server waits for the processes of others to go.
+const STOP_PATIENCE: Duration = Duration::from_secs(3);
 /// Lines of the server's output kept for error messages.
 const LOG_LINES: usize = 12;
 
 pub struct Server {
-    /// The watchdog script; its stdin is the pipe that keeps the server up.
-    /// Only None while dropping.
-    child: Option<Child>,
+    group: Arc<Group>,
+    /// The watchdog's stdin. Only None while dropping.
+    stdin: Option<ChildStdin>,
     dir: PathBuf,
     socket: PathBuf,
     log: Arc<Mutex<VecDeque<String>>>,
     /// Tokens of context it was started with.
     pub context: u32,
+}
+
+/// The watchdog's process group: the watchdog, llama-server and anything
+/// either started. The watchdog leads it, so the group has its pid.
+struct Group {
+    pgid: Pid,
+    watchdog: Mutex<Watchdog>,
+}
+
+struct Watchdog {
+    child: Child,
+    /// Set once it is reaped; from then on its pid may name another process
+    /// (group), so no more signals.
+    status: Option<ExitStatus>,
+    /// Its Server was dropped, or another server stopped it.
+    killed: bool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Group {
+    /// SIGKILL to each process in the group.
+    fn kill(&self) {
+        let mut w = lock(&self.watchdog);
+        w.killed = true;
+        if w.status.is_none() {
+            let _ = killpg(self.pgid, Signal::SIGKILL);
+        }
+    }
+
+    /// The watchdog's exit status, if it ended (and so reaps it).
+    fn exited(&self) -> Option<ExitStatus> {
+        let mut w = lock(&self.watchdog);
+        if w.status.is_none() {
+            w.status = w.child.try_wait().ok().flatten();
+        }
+        w.status
+    }
+
+    /// Nothing of the group is left. Once the watchdog is reaped, a group
+    /// with its pid is still ours as long as any of it lives: the pid is not
+    /// given out again until then.
+    fn gone(&self) -> bool {
+        self.exited().is_some() && killpg(self.pgid, None).is_err()
+    }
+
+    fn killed(&self) -> bool {
+        lock(&self.watchdog).killed
+    }
+}
+
+/// The groups of all servers this process started that may still have a
+/// process, stopped or not.
+static GROUPS: Mutex<Vec<Arc<Group>>> = Mutex::new(Vec::new());
+/// One spawn at a time, so two never miss each other.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+/// Kills the servers still running, as there is to be only one, and waits
+/// a little for them and for those stopped before to go.
+fn stop_others(log: &dyn Fn(String)) {
+    let others: Vec<Arc<Group>> = {
+        let mut groups = lock(&GROUPS);
+        groups.retain(|g| !g.gone());
+        groups.clone()
+    };
+    if others.is_empty() {
+        return;
+    }
+    let running = others.iter().filter(|g| !g.killed()).count();
+    if running > 0 {
+        log(format!(
+            "stopping {running} llama-server still running before starting another"
+        ));
+    }
+    for g in &others {
+        g.kill();
+    }
+    let deadline = Instant::now() + STOP_PATIENCE;
+    while others.iter().any(|g| !g.gone()) {
+        if Instant::now() > deadline {
+            log(format!(
+                "an old llama-server is still there after {} s; starting another anyway",
+                STOP_PATIENCE.as_secs()
+            ));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    lock(&GROUPS).retain(|g| !g.gone());
+}
+
+/// Tests that start servers, one at a time: a start stops the others.
+#[cfg(test)]
+pub fn one_at_a_time() -> MutexGuard<'static, ()> {
+    static TESTS: Mutex<()> = Mutex::new(());
+    lock(&TESTS)
 }
 
 /// `~/` at the start of a configured path means the home directory.
@@ -78,8 +188,15 @@ fn private_dir() -> Result<PathBuf, String> {
 }
 
 impl Server {
-    /// Starts loading the model; `ready` waits for it.
-    pub fn spawn(settings: &Settings, context: u32) -> Result<Server, String> {
+    /// Starts loading the model; `ready` waits for it. Stops any other
+    /// server first.
+    pub fn spawn(
+        settings: &Settings,
+        context: u32,
+        log: &dyn Fn(String),
+    ) -> Result<Server, String> {
+        let _one = lock(&SPAWNING);
+        stop_others(log);
         let dir = private_dir()?;
         let socket = dir.join("llama.sock");
         let program = expand(&settings.server);
@@ -102,11 +219,12 @@ impl Server {
             // prompt cache in RAM (one slot keeps its own).
             .args(["--no-warmup", "--cache-ram", "0"])
             .args(&settings.server_args)
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("cannot run {}: {e}", program.display()))?;
+            .map_err(|e| format!("cannot run {program}: {e}", program = program.display()))?;
         let log = Arc::new(Mutex::new(VecDeque::new()));
         if let Some(out) = child.stdout.take() {
             let log = log.clone();
@@ -121,8 +239,19 @@ impl Server {
                 }
             });
         }
+        let stdin = child.stdin.take();
+        let group = Arc::new(Group {
+            pgid: Pid::from_raw(child.id() as i32),
+            watchdog: Mutex::new(Watchdog {
+                child,
+                status: None,
+                killed: false,
+            }),
+        });
+        lock(&GROUPS).push(group.clone());
         Ok(Server {
-            child: Some(child),
+            group,
+            stdin,
             dir,
             socket,
             log,
@@ -131,8 +260,8 @@ impl Server {
     }
 
     /// Why the server is gone, if it is: its exit status and last lines.
-    fn ended(&mut self) -> Option<String> {
-        let status = self.child.as_mut()?.try_wait().ok()??;
+    pub fn ended(&mut self) -> Option<String> {
+        let status = self.group.exited()?;
         // Its last words may still be on their way.
         std::thread::sleep(Duration::from_millis(50));
         let log = self.log.lock().expect("log lock poisoned");
@@ -209,14 +338,19 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
-        // Closing its stdin makes the watchdog kill the server; reap it
-        // without making the caller wait.
-        if let Some(mut child) = self.child.take() {
-            drop(child.stdin.take());
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
+        drop(self.stdin.take());
+        self.group.kill();
+        // Reap the watchdog without making the caller wait.
+        let group = self.group.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !group.gone() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if group.gone() {
+                lock(&GROUPS).retain(|g| !Arc::ptr_eq(g, &group));
+            }
+        });
     }
 }
 
@@ -393,7 +527,7 @@ fn unchunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
@@ -451,7 +585,7 @@ mod tests {
         assert_eq!(expand("/abs/~/x"), PathBuf::from("/abs/~/x"));
     }
 
-    fn answer(status: &str, body: &str) -> String {
+    pub fn answer(status: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -469,7 +603,14 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let rx = answer_on(&socket, answer);
+        (dir, socket, rx)
+    }
+
+    /// Listens on `socket`, answers each request with `answer` and hands
+    /// what it got to the test.
+    pub fn answer_on(socket: &Path, answer: String) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let listener = UnixListener::bind(socket).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -477,8 +618,7 @@ mod tests {
                 // Read the head, then as much body as it announces.
                 let mut got = Vec::new();
                 let mut buf = [0u8; 4096];
-                loop {
-                    let n = s.read(&mut buf).unwrap();
+                while let Ok(n) = s.read(&mut buf) {
                     got.extend_from_slice(&buf[..n]);
                     if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
                         let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
@@ -499,7 +639,7 @@ mod tests {
                 let _ = s.write_all(answer.as_bytes());
             }
         });
-        (dir, socket, rx)
+        rx
     }
 
     #[test]
@@ -546,7 +686,7 @@ mod tests {
         }
     }
 
-    fn script(dir: &Path, body: &str) -> PathBuf {
+    pub fn script(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-llama-server");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -554,68 +694,149 @@ mod tests {
         path
     }
 
-    fn alive(pid: &str) -> bool {
-        Command::new("/bin/sh")
-            .args(["-c", &format!("kill -0 {pid}")])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+    /// Whether process `pid` runs (a zombie does not).
+    pub fn alive(pid: i32) -> bool {
+        nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok() && !zombie(pid)
     }
+
+    #[cfg(target_os = "linux")]
+    fn zombie(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| Some(s.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn zombie(pid: i32) -> bool {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| o.stdout.trim_ascii_start().starts_with(b"Z"))
+    }
+
+    /// The pid a stand-in server wrote to `path`.
+    fn pid_in(path: &Path) -> i32 {
+        for _ in 0..1_000 {
+            if let Ok(pid) = std::fs::read_to_string(path).unwrap_or_default().trim().parse() {
+                return pid;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the stand-in server did not start");
+    }
+
+    fn wait_gone(pid: i32, what: &str) {
+        for _ in 0..1_000 {
+            if !alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{what}");
+    }
+
+    fn no_log(_: String) {}
 
     #[test]
     fn dropping_the_server_kills_it() {
+        let _one = one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let fake = script(
             dir.path(),
             &format!("echo $$ > {}\nexec sleep 30", pidfile.display()),
         );
-        let server = Server::spawn(&settings(&fake), 1_024).unwrap();
-        let mut pid = String::new();
-        for _ in 0..1_000 {
-            pid = std::fs::read_to_string(&pidfile)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !pid.is_empty() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(alive(&pid), "the stand-in server runs");
+        let server = Server::spawn(&settings(&fake), 1_024, &no_log).unwrap();
+        let pid = pid_in(&pidfile);
+        assert!(alive(pid), "the stand-in server runs");
         drop(server);
-        for _ in 0..1_000 {
-            if !alive(&pid) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        panic!("the server outlived its Server");
+        wait_gone(pid, "the server outlived its Server");
+    }
+
+    #[test]
+    fn a_leaked_copy_of_its_stdin_does_not_keep_the_server() {
+        use std::os::fd::AsFd;
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let fake = script(
+            dir.path(),
+            &format!("echo $$ > {}\nexec sleep 30", pidfile.display()),
+        );
+        let server = Server::spawn(&settings(&fake), 1_024, &no_log).unwrap();
+        // The write end of the watchdog's stdin, as another child started at
+        // the same time could have inherited it: here and in a child.
+        let leaked = server
+            .stdin
+            .as_ref()
+            .unwrap()
+            .as_fd()
+            .try_clone_to_owned()
+            .unwrap();
+        let mut holder = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(leaked.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let pid = pid_in(&pidfile);
+        assert!(alive(pid), "the stand-in server runs");
+        drop(server);
+        wait_gone(pid, "the server outlived its Server");
+        let _ = holder.kill();
+        let _ = holder.wait();
+        drop(leaked);
+    }
+
+    #[test]
+    fn starting_a_server_stops_another() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let fake = script(dir.path(), "echo $$ > \"$2\"\nexec sleep 30");
+        let (first, second) = (dir.path().join("1"), dir.path().join("2"));
+        let mut s = settings(&fake);
+        s.model = first.to_string_lossy().into_owned();
+        let mut one = Server::spawn(&s, 1_024, &no_log).unwrap();
+        let first = pid_in(&first);
+        s.model = second.to_string_lossy().into_owned();
+        let logged = Mutex::new(Vec::new());
+        let _two = Server::spawn(&s, 1_024, &|m| logged.lock().unwrap().push(m)).unwrap();
+        assert!(!alive(first), "the first server was stopped first");
+        assert!(alive(pid_in(&second)));
+        assert_eq!(logged.lock().unwrap().len(), 1, "{:?}", logged.lock().unwrap());
+        assert!(one.ended().is_some(), "the first one knows");
     }
 
     #[test]
     fn a_server_that_dies_while_loading_is_reported_with_its_output() {
+        let _one = one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let fake = script(dir.path(), "echo \"error: unknown model $2\"; exit 3");
-        let mut server = Server::spawn(&settings(&fake), 1_024).unwrap();
+        let mut server = Server::spawn(&settings(&fake), 1_024, &no_log).unwrap();
         let e = server.ready(&|| false).unwrap_err();
         assert!(e.contains("unknown model /nonexistent/model.gguf"), "{e}");
     }
 
     #[test]
     fn a_missing_server_is_reported() {
-        let mut server =
-            Server::spawn(&settings(Path::new("/nonexistent/llama-server")), 1_024).unwrap();
+        let _one = one_at_a_time();
+        let mut server = Server::spawn(
+            &settings(Path::new("/nonexistent/llama-server")),
+            1_024,
+            &no_log,
+        )
+        .unwrap();
         let e = server.ready(&|| false).unwrap_err();
         assert!(e.contains("ended"), "{e}");
     }
 
     #[test]
     fn loading_stops_when_cancelled() {
+        let _one = one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let fake = script(dir.path(), "exec sleep 30");
-        let mut server = Server::spawn(&settings(&fake), 1_024).unwrap();
+        let mut server = Server::spawn(&settings(&fake), 1_024, &no_log).unwrap();
         let start = Instant::now();
         assert_eq!(
             server

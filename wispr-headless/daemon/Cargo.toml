@@ -16,8 +16,11 @@ x11rb = { version = "0.13", features = ["shape", "randr", "xkb", "xtest"] }
 fontdue = "0.9"
 # The dictation shortcut from /dev/input and typing through /dev/uinput.
 evdev = "0.13"
-# inotify on /dev/input, for devices that appear later (the version evdev uses).
-nix = { version = "0.29", default-features = false, features = ["inotify"] }
+
+[target.'cfg(unix)'.dependencies]
+# inotify on /dev/input on Linux, for devices that appear later (the
+# version evdev uses); signal to stop llama-server (asr/server.rs).
+nix = { version = "0.29", default-features = false, features = ["inotify", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
