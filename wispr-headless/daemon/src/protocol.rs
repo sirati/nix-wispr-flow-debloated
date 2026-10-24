@@ -41,6 +41,18 @@ pub enum Command {
     /// Internal, never from the shim: the system's inputs were listed again.
     #[serde(skip)]
     Relisted,
+    /// A dictation this process starts itself (its own shortcut, or a test):
+    /// transcribed by the local model, or handed to Wispr through its bar's
+    /// start button. `backend` overrides --backend for this one.
+    Dictate {
+        #[serde(default)]
+        backend: Option<Backend>,
+    },
+    /// Ends it. A local one's text follows as `transcript`.
+    DictateEnd,
+    /// Internal: a local dictation's text, or why there is none.
+    #[serde(skip)]
+    Transcribed { result: Result<String, String> },
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while
@@ -110,9 +122,38 @@ pub enum Event {
     NoticeClosed {
         reason: String,
     },
+    /// The text of a dictation transcribed here.
+    Transcript {
+        text: String,
+    },
+    /// A dictation to the local model failed: no model, no microphone, or
+    /// the model's error.
+    TranscriptFailed {
+        error: String,
+    },
     Log {
         msg: String,
     },
+}
+
+/// Where a dictation's audio goes.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Backend {
+    /// Wispr's service, as for Wispr's own dictations.
+    Wispr,
+    /// Granite Speech on this machine (asr/).
+    Local,
+}
+
+impl Backend {
+    pub fn parse(name: &str) -> Option<Backend> {
+        match name {
+            "wispr" => Some(Backend::Wispr),
+            "local" => Some(Backend::Local),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse(line: &str) -> Result<Command, serde_json::Error> {
@@ -163,6 +204,30 @@ mod tests {
             }
         );
         assert!(parse(r#"{"op":"nonsense"}"#).is_err());
+    }
+
+    #[test]
+    fn dictations_of_our_own_name_their_backend_or_not() {
+        assert_eq!(
+            parse(r#"{"op":"dictate"}"#).unwrap(),
+            Command::Dictate { backend: None }
+        );
+        assert_eq!(
+            parse(r#"{"op":"dictate","backend":"local"}"#).unwrap(),
+            Command::Dictate {
+                backend: Some(Backend::Local)
+            }
+        );
+        assert_eq!(
+            parse(r#"{"op":"dictateEnd"}"#).unwrap(),
+            Command::DictateEnd
+        );
+        assert!(parse(r#"{"op":"dictate","backend":"cloud"}"#).is_err());
+        assert!(parse(r#"{"op":"transcribed"}"#).is_err(), "internal only");
+        assert_eq!(
+            encode(&Event::TranscriptFailed { error: "x".into() }),
+            r#"{"op":"transcriptFailed","error":"x"}"#
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! Spawned by the Electron shim (wispr-headless/shim.js), which speaks to it
 //! in JSON lines on stdin/stdout. Exits when stdin closes.
 
+mod asr;
 mod bar;
 #[cfg(target_os = "macos")]
 mod mic_mac;
@@ -33,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bar::{BarEvent, PillCommand};
-use protocol::{Command, Event};
+use protocol::{Backend, Command, Event};
 use recorder::{Progress, Recording};
 
 struct Config {
@@ -47,6 +48,14 @@ struct Config {
     sounds: Option<String>,
     /// Figtree for the bar's text (Linux; macOS uses its system font).
     fonts: Option<String>,
+    /// Where dictations this process starts itself go (`dictate`), unless
+    /// one says otherwise. Default: the local model if there is one.
+    backend: Option<Backend>,
+    /// The local model's settings (asr/mod.rs).
+    asr_config: Option<String>,
+    /// The bar's fill for Wispr and for the local model.
+    fill: [u8; 3],
+    local_fill: [u8; 3],
 }
 
 fn config() -> Config {
@@ -72,6 +81,10 @@ fn config() -> Config {
     let mut sounds = None;
     let mut fonts = None;
     let mut target = None;
+    let mut backend = None;
+    let mut asr_config = None;
+    let mut fill = bar::WISPR_FILL;
+    let mut local_fill = bar::LOCAL_FILL;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -84,6 +97,14 @@ fn config() -> Config {
             "--target" => target = args.next(),
             "--sounds" => sounds = args.next(),
             "--font-dir" => fonts = args.next(),
+            // "wispr" or "local".
+            "--backend" => backend = args.next().as_deref().and_then(Backend::parse),
+            "--asr-config" => asr_config = args.next().filter(|c| !c.is_empty()),
+            // "#rrggbb".
+            "--bar-color" => fill = args.next().and_then(|c| color(&c)).unwrap_or(fill),
+            "--local-bar-color" => {
+                local_fill = args.next().and_then(|c| color(&c)).unwrap_or(local_fill)
+            }
             // Any command that writes 16 kHz s16 mono PCM to stdout: ffmpeg on
             // macOS, a stand-in microphone in tests.
             "--capture-cmd" => {
@@ -118,7 +139,21 @@ fn config() -> Config {
         player,
         sounds,
         fonts,
+        backend,
+        asr_config,
+        fill,
+        local_fill,
     }
+}
+
+/// "#rrggbb" (or without "#") as red, green, blue.
+fn color(hex: &str) -> Option<[u8; 3]> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
 /// The capture command for one recording, and the device name Wispr is told:
@@ -269,6 +304,38 @@ fn play(cfg: &Config, name: &str, out: &Out) {
     }
 }
 
+/// A dictation transcribed here: its recording and its transcription.
+struct Local {
+    recording: Recording,
+    dictation: asr::Dictation,
+}
+
+/// Ends a local dictation: the rest of its audio goes to the model, and the
+/// text comes back as Command::Transcribed.
+fn end_local(
+    local: Local,
+    commands: &mpsc::Sender<Option<Command>>,
+    pill_tx: &mpsc::Sender<PillCommand>,
+) {
+    let Local {
+        recording,
+        mut dictation,
+    } = local;
+    dictation.feed(&recording.finish_pcm());
+    let _ = pill_tx.send(PillCommand::Status("processing".into()));
+    let commands = commands.clone();
+    std::thread::spawn(move || {
+        let result = dictation.finish();
+        let _ = commands.send(Some(Command::Transcribed { result }));
+    });
+}
+
+/// A local dictation that produced no text.
+fn local_failed(out: &Out, pill_tx: &mpsc::Sender<PillCommand>, error: String) {
+    let _ = pill_tx.send(PillCommand::Status("error".into()));
+    out.send(&Event::TranscriptFailed { error });
+}
+
 fn main() {
     let cfg = config();
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
@@ -276,6 +343,10 @@ fn main() {
     // The flow bar keeps the main thread (AppKit needs it on macOS); commands
     // and the recorder run on their own, and the process ends with them.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
+    let _ = pill_tx.send(PillCommand::Fills {
+        wispr: cfg.fill,
+        local: cfg.local_fill,
+    });
     let fonts = cfg.fonts.clone();
     {
         let out = Out(out.0.clone());
@@ -347,6 +418,31 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     };
     prepare(&mut ready, &ranked);
 
+    // Local transcription, if configured; nothing is loaded until it is used.
+    let asr = cfg
+        .asr_config
+        .as_deref()
+        .and_then(|path| match asr::Settings::load(path) {
+            Ok(settings) => {
+                let log_out = Out(out.0.clone());
+                Some(asr::Asr::new(settings, move |msg| {
+                    log_out.send(&Event::Log { msg })
+                }))
+            }
+            Err(e) => {
+                out.send(&Event::Log {
+                    msg: format!("no local transcription: {e}"),
+                });
+                None
+            }
+        });
+    let backend = cfg.backend.unwrap_or(if asr.is_some() {
+        Backend::Local
+    } else {
+        Backend::Wispr
+    });
+    let internal = cmd_tx.clone();
+
     {
         let log_out = Out(out.0.clone());
         std::thread::spawn(move || {
@@ -376,12 +472,16 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     // it asks to record (about 25 ms later): handed over with everything it
     // heard, or dropped if no request comes.
     let mut early: Option<(Recording, Instant)> = None;
+    // A dictation of our own (`dictate`) that the local model transcribes.
+    let mut local: Option<Local> = None;
+    // A dictation of our own that Wispr runs: its bar's start was clicked.
+    let mut clicked = false;
     let chosen = |ranked: &[mics::Ranked]| {
         let inputs = inputs.lock().expect("inputs lock poisoned");
         mics::choose(ranked, &inputs).cloned()
     };
     loop {
-        let wait = if recording.is_some() {
+        let wait = if recording.is_some() || local.is_some() {
             Duration::from_millis(5)
         } else if early.is_some() {
             Duration::from_millis(25)
@@ -391,6 +491,11 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
         match cmd_rx.recv_timeout(wait) {
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Some(Command::Start { uuid })) => {
+                // Wispr's own dictation takes the microphone: a local one
+                // ends with what it heard.
+                if let Some(l) = local.take() {
+                    end_local(l, &internal, pill_tx);
+                }
                 // A new start replaces an unfinished recording, as Wispr's Hub does.
                 if let Some(old) = recording.take() {
                     for e in old.stop(clock_ms()) {
@@ -428,14 +533,14 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 let _ = relist.send(());
             }
             Ok(Some(Command::Relisted)) => {
-                if recording.is_none() {
+                if recording.is_none() && local.is_none() {
                     prepare(&mut ready, &ranked);
                 }
             }
             // The shortcut went down, or Wispr's dictation began without it
             // (a click on the bar): start ahead of Wispr's request.
             Ok(Some(Command::Early)) => {
-                if recording.is_none() && early.is_none() {
+                if recording.is_none() && early.is_none() && local.is_none() {
                     let mic = chosen(&ranked);
                     if let Ok(r) =
                         start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
@@ -447,7 +552,7 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             Ok(Some(Command::EarlyCancel)) => early = None,
             Ok(Some(Command::Status { value })) => {
                 match value.as_str() {
-                    "initializing" if recording.is_none() && early.is_none() => {
+                    "initializing" if recording.is_none() && early.is_none() && local.is_none() => {
                         let mic = chosen(&ranked);
                         if let Ok(r) =
                             start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
@@ -499,6 +604,62 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             Ok(Some(Command::NotifyClear)) => {
                 let _ = pill_tx.send(PillCommand::NotifyClear);
             }
+            Ok(Some(Command::Dictate { backend: wanted })) => match wanted.unwrap_or(backend) {
+                Backend::Wispr => {
+                    if !clicked && recording.is_none() && local.is_none() {
+                        clicked = true;
+                        out.send(&Event::Click {
+                            action: "start".into(),
+                        });
+                    }
+                }
+                // One dictation at a time.
+                Backend::Local if recording.is_some() || local.is_some() || clicked => {}
+                Backend::Local => match &asr {
+                    None => local_failed(out, pill_tx, "no local model (--asr-config)".into()),
+                    Some(asr) => {
+                        early = None;
+                        let mic = chosen(&ranked);
+                        match start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready) {
+                            Ok(r) => {
+                                local = Some(Local {
+                                    recording: r,
+                                    dictation: asr.start(),
+                                });
+                                let _ = pill_tx.send(PillCommand::Local);
+                                let _ = pill_tx.send(PillCommand::Status("listening".into()));
+                                let _ = pill_tx.send(PillCommand::Mic(true));
+                            }
+                            Err(error) => local_failed(out, pill_tx, error),
+                        }
+                    }
+                },
+            },
+            Ok(Some(Command::DictateEnd)) => {
+                if std::mem::take(&mut clicked) {
+                    out.send(&Event::Click {
+                        action: "stop".into(),
+                    });
+                }
+                if let Some(l) = local.take() {
+                    end_local(l, &internal, pill_tx);
+                    let _ = relist.send(());
+                }
+            }
+            Ok(Some(Command::Transcribed { result })) => {
+                // The bar belongs to the next dictation if one started meanwhile.
+                let quiet = recording.is_none() && local.is_none() && !clicked;
+                match result {
+                    Ok(text) => {
+                        if quiet {
+                            let _ = pill_tx.send(PillCommand::Status("idle".into()));
+                        }
+                        out.send(&Event::Transcript { text });
+                    }
+                    Err(error) if quiet => local_failed(out, pill_tx, error),
+                    Err(error) => out.send(&Event::TranscriptFailed { error }),
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         // No request to record followed: stop and forget what it heard.
@@ -522,6 +683,19 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 }
             }
         }
+        if let Some(l) = local.as_mut() {
+            match l.recording.poll_pcm(Duration::from_millis(15)) {
+                Ok(pcm) if pcm.is_empty() => {}
+                Ok(pcm) => {
+                    let _ = pill_tx.send(PillCommand::Level(recorder::volume_db(&pcm)));
+                    l.dictation.feed(&pcm);
+                }
+                Err(error) => {
+                    local = None;
+                    local_failed(out, pill_tx, error);
+                }
+            }
+        }
     }
     if let Some(r) = recording.take() {
         let _ = r.uuid();
@@ -540,6 +714,10 @@ mod tests {
             player: Vec::new(),
             sounds: None,
             fonts: None,
+            backend: None,
+            asr_config: None,
+            fill: bar::WISPR_FILL,
+            local_fill: bar::LOCAL_FILL,
         }
     }
 
@@ -564,6 +742,15 @@ mod tests {
         let (capture, device) = capture_for(&c, Some(&jabra()));
         assert_eq!(capture.join(" "), "pw-cat --record --raw --target my-mic -");
         assert_eq!(device, "my-mic");
+    }
+
+    #[test]
+    fn bar_colours_are_hex_triplets() {
+        assert_eq!(color("#c81414"), Some([0xc8, 0x14, 0x14]));
+        assert_eq!(color("15803d"), Some([0x15, 0x80, 0x3d]));
+        assert_eq!(color("#c8141"), None);
+        assert_eq!(color("#gg0000"), None);
+        assert_eq!(color("#ä00000"), None);
     }
 
     #[test]

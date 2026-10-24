@@ -16,6 +16,7 @@ cp -r "$here/app" "$work/app"
 mkdir -p "$work/app/wispr-shim"
 sed -e "s#@daemon@#$daemon#" -e "s#@pwcat@#/bin/true#" -e "s#@micTarget@##" \
 	-e "s#@captureCmd@##" -e "s#@deviceName@##" -e "s#@playerCmd@##" -e "s#@fontDir@#${WISPR_TEST_FONT_DIR:-}#" \
+	-e "s#@backend@##" -e "s#@asrConfig@##" -e "s#@barColor@##" -e "s#@localBarColor@##" \
 	"$here/../../shim.js" > "$work/app/wispr-shim/index.js"
 printf '{"name":"wispr-like","main":"wispr-shim/index.js","wisprOriginalMain":"main.js"}\n' > "$work/app/package.json"
 

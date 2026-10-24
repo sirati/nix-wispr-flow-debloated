@@ -80,12 +80,35 @@ let
   patchDir = "${wispr-flow-linux}/scripts/patches";
 
   headlessDaemon = pkgs.callPackage ./wispr-headless/daemon { };
+  local = cfg.headless.localAsr;
+  # The flow bar's fills (--bar-color).
+  colour = lib.types.strMatching "#[0-9a-fA-F]{6}";
+  # wispr-headless/daemon/src/asr/mod.rs, Settings; unset paths take the
+  # daemon's defaults.
+  asrConfig = pkgs.writeText "wispr-headless-asr.json" (
+    builtins.toJSON (
+      {
+        server = lib.getExe' local.llamaCpp "llama-server";
+        inherit (local)
+          idleSeconds
+          serverArgs
+          targetSeconds
+          maxSeconds
+          ;
+      }
+      // lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
+    )
+  );
   headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
     micTarget = cfg.headless.micTarget;
     # The flow bar's text: Figtree, the font of Wispr's own page.
     fontDir = "${pkgs.figtree}/share/fonts/truetype";
+    backend = lib.optionalString local.enable local.backend;
+    asrConfig = lib.optionalString local.enable "${asrConfig}";
+    barColor = cfg.headless.barColor;
+    localBarColor = local.barColor;
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -203,6 +226,121 @@ in
           PipeWire node to record dictation from; empty for the default
           input. Wispr's own microphone setting does not apply here.
         '';
+      };
+
+      barColor = lib.mkOption {
+        type = colour;
+        default = "#000000";
+        example = "#c81414";
+        description = ''
+          Fill of the flow bar wispr-headless draws, at rest and for Wispr's
+          dictations. Wispr's own is black; another colour shows whether
+          wispr-headless or Wispr's page draws the bar.
+        '';
+      };
+
+      localAsr = {
+        enable = lib.mkEnableOption ''
+          transcribing the dictations wispr-headless starts itself (its
+          `dictate` command) with IBM's Granite Speech on this machine,
+          through llama.cpp, instead of Wispr's service. The model is loaded
+          when such a dictation starts and freed after it. Dictations Wispr
+          starts (its own shortcut) still go to Wispr''
+        ;
+        backend = lib.mkOption {
+          type = lib.types.enum [
+            "local"
+            "wispr"
+          ];
+          default = "local";
+          description = ''
+            Where the dictations wispr-headless starts itself go, unless one
+            names its own: the local model, or Wispr (through its bar's start
+            and stop buttons).
+          '';
+        };
+        barColor = lib.mkOption {
+          type = colour;
+          default = "#15803d";
+          description = "Fill of the flow bar while a dictation goes to the local model.";
+        };
+        llamaCpp = lib.mkOption {
+          type = lib.types.package;
+          description = ''
+            llama.cpp with its llama-server, build b11852 or later (older
+            ones lack Granite Speech's chat template).
+          '';
+        };
+        model = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "/var/lib/models/granite-speech-5.0-2b-Q4_K_M.gguf";
+          description = ''
+            Granite Speech 5.0's language model (GGUF); `~/` means the home
+            directory. Null: ~/.local/share/wispr-headless/granite-speech-5.0-2b-Q4_K_M.gguf.
+          '';
+        };
+        mmproj = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Its audio encoder (GGUF). Null:
+            ~/.local/share/wispr-headless/mmproj-model-q4_k-convdw-f32.gguf,
+            the F16 encoder quantized with `llama-quantize --tensor-type
+            conv_dw=f32 mmproj-model-f16.gguf <out> Q4_K` (318 MB). The
+            depthwise convolutions must stay F32: llama.cpp aborts on F16 ones.
+          '';
+        };
+        keywords = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "~/.config/wispr-flow/keywords.txt";
+          description = ''
+            File of terms the transcription should spell as listed (names,
+            jargon), one per line or separated by commas. Read when each
+            dictation starts, so edits need no rebuild. Keep it short: 200
+            terms cost nothing measurable, but 1800 made the model invent
+            sentences (8.5 % of words wrong instead of 1 % on LibriSpeech),
+            took twice as long and need a bigger context, so more memory.
+          '';
+        };
+        targetSeconds = lib.mkOption {
+          type = lib.types.numbers.between 1 30;
+          default = 5;
+          description = ''
+            The model transcribes a dictation in pieces while it is spoken;
+            a piece ends at the first pause after this many seconds. When the
+            dictation ends, only the last piece is left to transcribe (about
+            a quarter of its length on the Mac). Longer pieces give the model
+            more context but leave more to wait for.
+          '';
+        };
+        maxSeconds = lib.mkOption {
+          type = lib.types.numbers.between 1 30;
+          default = 10;
+          description = ''
+            A piece without a pause ends here, at its quietest moment (at
+            least `targetSeconds`).
+          '';
+        };
+        idleSeconds = lib.mkOption {
+          type = lib.types.ints.unsigned;
+          default = 0;
+          description = ''
+            How long the model stays loaded after a dictation, for the next
+            one. 0 frees its memory (1.5 GB and more) as soon as the text is
+            out.
+          '';
+        };
+        serverArgs = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [
+            "--flash-attn"
+            "on"
+          ];
+          description = "More arguments for llama-server.";
+        };
       };
     };
 

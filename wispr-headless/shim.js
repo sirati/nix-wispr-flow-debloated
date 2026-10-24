@@ -37,7 +37,8 @@ const childProcess = require("child_process");
 const readline = require("readline");
 
 // Filled in by the Nix build; empty when unused (pw-cat and the PipeWire
-// target on Linux, the capture and player commands on macOS).
+// target on Linux, the capture and player commands on macOS, the local
+// model's settings without one).
 const DAEMON = "@daemon@";
 const PW_CAT = "@pwcat@";
 const MIC_TARGET = "@micTarget@";
@@ -45,6 +46,10 @@ const CAPTURE_CMD = "@captureCmd@";
 const DEVICE_NAME = "@deviceName@";
 const PLAYER_CMD = "@playerCmd@";
 const FONT_DIR = "@fontDir@";
+const BACKEND = "@backend@";
+const ASR_CONFIG = "@asrConfig@";
+const BAR_COLOR = "@barColor@";
+const LOCAL_BAR_COLOR = "@localBarColor@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
@@ -187,6 +192,10 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   if (given(DEVICE_NAME)) args.push("--device-name", DEVICE_NAME);
   if (given(PLAYER_CMD)) args.push("--player-cmd", PLAYER_CMD);
   if (given(FONT_DIR)) args.push("--font-dir", FONT_DIR);
+  if (given(BACKEND)) args.push("--backend", BACKEND);
+  if (given(ASR_CONFIG)) args.push("--asr-config", ASR_CONFIG);
+  if (given(BAR_COLOR)) args.push("--bar-color", BAR_COLOR);
+  if (given(LOCAL_BAR_COLOR)) args.push("--local-bar-color", LOCAL_BAR_COLOR);
   // Tests only: a stand-in microphone.
   if (process.env.WISPR_HEADLESS_TEST_CAPTURE) args.push("--capture-cmd", process.env.WISPR_HEADLESS_TEST_CAPTURE);
   let child;
@@ -421,6 +430,13 @@ function build(electron) {
         trace({ ev: "daemon.micFailed", error: String(msg.error).slice(0, 200) });
         emitFrom(hub, "dictation:micAcquisitionFailed", { transcriptionEntityUuid: uuid });
         if (session === uuid) session = null;
+        break;
+      // A dictation the daemon transcribed itself; Wispr never sees it.
+      case "transcript":
+        trace({ ev: "local.transcript", chars: String(msg.text).length });
+        break;
+      case "transcriptFailed":
+        trace({ ev: "local.failed", error: String(msg.error).slice(0, 200) });
         break;
     }
   }
