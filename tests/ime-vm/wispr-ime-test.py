@@ -1,5 +1,6 @@
 # Test script for tests/ime-vm/wispr-ime.nix, appended to the harness's baseline.
-# Provided before this: HELPER (path of the patched Wispr helper) and everything in prelude.py.
+# Provided before this: HELPER (path of the patched Wispr helper), HEADLESS (wispr-headless) and
+# everything in prelude.py.
 
 import json
 
@@ -117,6 +118,17 @@ with subtest("the real helper's PasteText goes through wispr-ime (stand-in for W
     assert "committed through wispr-ime" in helper_err, "helper did not use wispr-ime"
     assert text.startswith(SPOKEN), repr(text)
     assert "ACK" in machine.succeed("cat /tmp/fd3.out"), "helper did not acknowledge PasteText"
+
+with subtest("wispr-headless types its own transcripts through wispr-ime too"):
+    out, unit = start_terminal("kgx", "headless")
+    said = run_in_session(
+        f"printf %s {shlex.quote(SPOKEN)} | WISPR_HEADLESS_TEST_TYPE_DELAY_MS=0 {HEADLESS} --type-test",
+        timeout=90,
+        check=False,
+    )
+    log("wispr-headless:\n" + said)
+    text = finish_terminal(out, unit)
+    assert text.startswith(SPOKEN), repr(text)
 
 with subtest("an open terminal keeps working after fcitx5 (and so wispr-ime) restarts, as on a switch"):
     out, unit = start_terminal("kgx", "restart")

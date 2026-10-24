@@ -22,7 +22,8 @@
 //!   auto-closed brackets), but terminals want Ctrl+Shift+V.
 //!
 //! A new line is typed as Shift+Enter, so chat apps add a line instead of
-//! sending; other control characters are left out (`pieces`).
+//! sending; terminals get no new line from it (Konsole sends ESC O M, as the
+//! KDE VM test shows). Other control characters are left out (`pieces`).
 
 #[cfg(target_os = "linux")]
 mod dbus;

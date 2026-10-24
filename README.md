@@ -96,3 +96,7 @@ certificate keeps them for later versions.
       WISPR_ASR_WAVS=a.wav:b.wav cargo test real_model -- --ignored --nocapture
     wispr-headless/tests/electron/run.sh <wispr-headless binary>
     tests/ime-vm/run-wispr-ime.sh
+    tests/kde-vm/run.sh
+
+The KDE test runs Plasma on Wayland in a VM with a stand-in keyboard: the
+shortcut from /dev/input and typing through /dev/uinput.
