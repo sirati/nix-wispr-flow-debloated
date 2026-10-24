@@ -54,7 +54,12 @@
 #            ~/Library/Application Support/wispr-headless/cleanup-1-q8_0.gguf);
 #            serverArgs ? [ ]; timeoutSeconds ? 5; minWords ? 3 } to clean up
 #            each transcript with Spokenly's Cleanup 1 in a second
-#            llama-server (headless.localAsr.cleanup) }
+#            llama-server (headless.localAsr.cleanup);
+#            coreml ? null, or { encoder (a granite_speech_audio_*.mlpackage
+#            on the Mac); frames ? [ ] (which of its functions to load: 250,
+#            375, 500; all if empty) } to run the audio encoder on the
+#            Neural Engine through Core ML, with mmproj only for pieces it
+#            declines (needs the llama-server built here) }
 #   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
 #            whose cc is an aarch64-apple-darwin clang, and the macOS SDK it
 #            uses; only for llama.cpp, so only with localAsr and no
@@ -112,6 +117,7 @@ let
     startSound = "${localSounds}/local-start.wav";
     stopSound = "${localSounds}/local-stop.wav";
     cleanup = null;
+    coreml = null;
   }
   // (if localAsr == null then { } else localAsr);
   cleanup =
@@ -174,6 +180,12 @@ let
           inherit (cleanup) serverArgs timeoutSeconds minWords;
         }
         // native.lib.filterAttrs (_: v: v != null) { inherit (cleanup) model; };
+      }
+      // native.lib.optionalAttrs (local.coreml != null) {
+        coreml = {
+          frames = [ ];
+        }
+        // local.coreml;
       }
     )
   );

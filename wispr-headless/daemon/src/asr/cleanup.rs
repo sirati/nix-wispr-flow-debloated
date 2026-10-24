@@ -698,6 +698,7 @@ mod tests {
             server: env("WISPR_ASR_SERVER"),
             model: String::new(),
             mmproj: String::new(),
+            coreml: None,
             keywords: None,
             // Kept between the texts, as for dictations in a row.
             idle_seconds: 60.0,

@@ -63,6 +63,11 @@ pub struct Settings {
     /// 318 MB instead of 1.2 GB at F16.
     #[serde(default = "default_mmproj")]
     pub mmproj: String,
+    /// Run the audio encoder on Core ML (the Neural Engine) instead, with
+    /// mmproj only for what Core ML declines (macOS, with llama.cpp's
+    /// patch 0003).
+    #[serde(default)]
+    pub coreml: Option<CoreMl>,
     /// Terms the text should spell as listed, one per line (prompt.rs).
     /// Read when a dictation starts, so edits apply to the next one.
     #[serde(default)]
@@ -84,6 +89,20 @@ pub struct Settings {
     /// this, it is typed as Granite wrote it.
     #[serde(default)]
     pub cleanup: Option<CleanupSettings>,
+}
+
+/// `Settings.coreml`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CoreMl {
+    /// A granite_speech_audio_*.mlpackage (compiled on first use into
+    /// ~/Library/Caches/llama-mtmd-coreml).
+    pub encoder: String,
+    /// Which of its functions to load, by length in frames of 20 ms: 250,
+    /// 375 and 500 (5, 7.5 and 10 s). Each piece pads to the smallest that
+    /// holds it; fewer load faster and may take less memory. Empty for all.
+    #[serde(default)]
+    pub frames: Vec<u32>,
 }
 
 fn default_server() -> String {
@@ -858,6 +877,7 @@ mod tests {
                 .into_owned(),
             model: String::new(),
             mmproj: String::new(),
+            coreml: None,
             keywords: None,
             idle_seconds,
             server_args: Vec::new(),
@@ -1088,6 +1108,12 @@ mod tests {
             .unwrap();
         assert_eq!((c.timeout_seconds, c.min_words), (2.0, 3));
         assert!(c.model.ends_with("/cleanup-1-q8_0.gguf"), "{}", c.model);
+        std::fs::write(&path, r#"{"coreml":{"encoder":"~/e.mlpackage"}}"#).unwrap();
+        let c = Settings::load(path.to_str().unwrap())
+            .unwrap()
+            .coreml
+            .unwrap();
+        assert_eq!((c.encoder.as_str(), c.frames.len()), ("~/e.mlpackage", 0));
     }
 
     /// A stand-in llama-server for both models: it writes its pid to
@@ -1134,6 +1160,7 @@ mod tests {
                     .into(),
                 model: "speech".into(),
                 mmproj: String::new(),
+                coreml: None,
                 keywords: None,
                 idle_seconds: 0.0,
                 server_args: Vec::new(),
@@ -1515,6 +1542,7 @@ mod tests {
             server: env("WISPR_ASR_SERVER"),
             model: env("WISPR_ASR_MODEL"),
             mmproj: env("WISPR_ASR_MMPROJ"),
+            coreml: None,
             keywords: std::env::var("WISPR_ASR_KEYWORDS")
                 .ok()
                 .filter(|k| !k.is_empty()),
@@ -1579,6 +1607,7 @@ mod tests {
             server: env("WISPR_ASR_SERVER"),
             model: env("WISPR_ASR_MODEL"),
             mmproj: env("WISPR_ASR_MMPROJ"),
+            coreml: None,
             keywords: None,
             idle_seconds: 0.0,
             server_args: Vec::new(),

@@ -233,11 +233,23 @@ impl Server {
             "--mmproj".into(),
             expand(&settings.mmproj),
         ];
+        // Read by patch 0003 in ../../../../llama-cpp.
+        let coreml = settings.coreml.as_ref().map(|c| {
+            let frames = c.frames.iter().map(u32::to_string);
+            [
+                ("MTMD_COREML_AUDIO", expand(&c.encoder).into_os_string()),
+                (
+                    "MTMD_COREML_AUDIO_FRAMES",
+                    frames.collect::<Vec<_>>().join(",").into(),
+                ),
+            ]
+        });
         launch(
             Kind::Speech,
             &settings.server,
             &model,
             &settings.server_args,
+            coreml.as_ref().map_or(&[][..], |c| &c[..]),
             context,
             log,
         )
@@ -256,6 +268,7 @@ impl Server {
             &settings.server,
             &["--model".into(), expand(&cleanup.model)],
             &cleanup.server_args,
+            &[],
             context,
             log,
         )
@@ -269,6 +282,7 @@ fn launch(
     program: &str,
     model: &[PathBuf],
     more: &[String],
+    env: &[(&str, std::ffi::OsString)],
     context: u32,
     log: &dyn Fn(String),
 ) -> Result<Server, String> {
@@ -293,6 +307,7 @@ fn launch(
         // prompt cache in RAM (one slot keeps its own).
         .args(["--no-warmup", "--cache-ram", "0"])
         .args(more)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -839,6 +854,7 @@ pub mod tests {
             server: server.to_string_lossy().into_owned(),
             model: "/nonexistent/model.gguf".into(),
             mmproj: "/nonexistent/mmproj.gguf".into(),
+            coreml: None,
             keywords: None,
             idle_seconds: 0.0,
             server_args: Vec::new(),
@@ -918,6 +934,35 @@ pub mod tests {
         assert!(alive(pid), "the stand-in server runs");
         drop(server);
         wait_gone(pid, "the server outlived its Server");
+    }
+
+    #[test]
+    fn the_core_ml_encoder_is_passed_to_the_speech_server() {
+        let _one = one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env");
+        let fake = script(
+            dir.path(),
+            &format!(
+                "echo \"$MTMD_COREML_AUDIO|$MTMD_COREML_AUDIO_FRAMES\" > {}.tmp\n\
+                 mv {0}.tmp {0}\nexec sleep 30",
+                out.display()
+            ),
+        );
+        let mut s = settings(&fake);
+        s.coreml = Some(super::super::CoreMl {
+            encoder: "/m/encoder.mlpackage".into(),
+            frames: vec![375, 500],
+        });
+        let _server = Server::spawn(&s, 1_024, &no_log).unwrap();
+        for _ in 0..1_000 {
+            if let Ok(env) = std::fs::read_to_string(&out) {
+                assert_eq!(env.trim(), "/m/encoder.mlpackage|375,500");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the stand-in server did not start");
     }
 
     #[test]
