@@ -48,7 +48,7 @@
 #            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
 #            targetSeconds ? 5; maxSeconds ? 10;
 #            barColor ? "#15803d", the bar for dictations to the local model;
-#            startSound, stopSound ? two notes going up / down, played when
+#            startSound, stopSound ? macOS's Morse and Bottle, played when
 #            one starts and stops recording (null: silent) }
 #   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
 #            whose cc is an aarch64-apple-darwin clang, and the macOS SDK it
@@ -104,11 +104,10 @@ let
     maxSeconds = 10;
     serverArgs = [ ];
     barColor = "#15803d";
-    startSound = "${localSounds}/local-start.wav";
-    stopSound = "${localSounds}/local-stop.wav";
+    startSound = "/System/Library/Sounds/Morse.aiff";
+    stopSound = "/System/Library/Sounds/Bottle.aiff";
   }
   // (if localAsr == null then { } else localAsr);
-  localSounds = native.callPackage ../wispr-headless/local-sounds.nix { };
   llamaServer =
     local.llamaServer or (
       if stdenv == null || sdk == null then

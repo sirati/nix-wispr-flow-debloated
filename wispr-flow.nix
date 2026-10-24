@@ -127,7 +127,7 @@ let
       ]
     )
   );
-  localSounds = pkgs.callPackage ./wispr-headless/local-sounds.nix { };
+  freedesktopSounds = "${pkgs.sound-theme-freedesktop}/share/sounds/freedesktop/stereo";
   # Wispr's key codes on Linux: Windows virtual-key codes, which the port's
   # helper reports (its keymap.rs, evdev KEY_F13..KEY_F24).
   wisprKeyCodes = lib.listToAttrs (
@@ -324,8 +324,8 @@ in
         };
         startSound = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
-          default = "${localSounds}/local-start.wav";
-          defaultText = lib.literalMD "two notes going up (./wispr-headless/local-sounds.nix)";
+          default = "${freedesktopSounds}/message.oga";
+          defaultText = lib.literalMD "the freedesktop sound theme's message.oga";
           description = ''
             Played when a dictation to the local model starts recording; it
             differs from Wispr's own so the key pressed can be heard. Null:
@@ -334,8 +334,8 @@ in
         };
         stopSound = lib.mkOption {
           type = lib.types.nullOr lib.types.str;
-          default = "${localSounds}/local-stop.wav";
-          defaultText = lib.literalMD "the same two notes going down";
+          default = "${freedesktopSounds}/complete.oga";
+          defaultText = lib.literalMD "the freedesktop sound theme's complete.oga";
           description = "Played when it stops recording. Null: silent.";
         };
         llamaCpp = lib.mkOption {
