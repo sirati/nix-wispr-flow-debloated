@@ -217,11 +217,13 @@ pub enum PillCommand {
     /// Whether Wispr shows its resting bar (its hideFlowBarPermanently and
     /// snooze preferences).
     RestingBar(bool),
-    /// Show a notification: title, button labels, timeout.
+    /// Show a notification: title, button labels, timeout, and whether it
+    /// is a local dictation's (drawn in its fill).
     Notify {
         title: String,
         actions: Vec<String>,
         timeout: Duration,
+        local: bool,
     },
     /// Main closed the notification.
     NotifyClear,
@@ -326,6 +328,8 @@ struct Notice {
     clicked: Option<(usize, Instant)>,
     /// Button areas in the last frame.
     buttons: Vec<Shape>,
+    /// A local dictation's: the local fill.
+    local: bool,
 }
 
 /// The bar's state, fed with commands; the drawing code asks it what to show.
@@ -454,6 +458,7 @@ impl BarState {
                 title,
                 actions,
                 timeout,
+                local,
             } => {
                 self.notice = Some(Notice {
                     title,
@@ -462,6 +467,7 @@ impl BarState {
                     progress: 0.0,
                     clicked: None,
                     buttons: Vec::new(),
+                    local,
                 })
             }
             PillCommand::NotifyClear => self.notice = None,
@@ -545,7 +551,11 @@ impl BarState {
             }
             Mode::Notice => match self.notice.as_mut() {
                 Some(n) => {
-                    let [r, g, b] = self.wispr_fill;
+                    let [r, g, b] = if n.local {
+                        self.local_fill
+                    } else {
+                        self.wispr_fill
+                    };
                     let fill = [r, g, b, 0xff];
                     (
                         n.draw(measure, pointer, fill, &mut shapes, &mut texts),
@@ -978,6 +988,7 @@ mod tests {
             title: "Transcript cancelled".into(),
             actions: vec!["Undo".into()],
             timeout: Duration::from_secs(3),
+            local: false,
         });
     }
 

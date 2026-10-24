@@ -969,6 +969,7 @@ fn serve(
                     title,
                     actions,
                     timeout: Duration::from_secs_f64(timeout.max(0.0) / 1000.0),
+                    local: false,
                 });
             }
             Ok(Some(Command::NotifyClear)) => {
@@ -1206,6 +1207,7 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                     title: "Transcript cancelled".into(),
                     actions: vec!["Undo".into()],
                     timeout: UNDO_FOR,
+                    local: true,
                 });
                 let _ = e.relist.send(());
             }
