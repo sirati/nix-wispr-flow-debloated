@@ -153,9 +153,26 @@ impl Tap {
             // The changed key first, in case its flags cannot tell.
             let held = self.modifiers.contains(&key);
             match mac_modifier_down(key, flags) {
+                // It changed and is down, so its release was missed (the
+                // tap was off, or events were coalesced): report it, so a
+                // dictation the release should have ended ends now.
+                Some(true) if held => {
+                    (self.log)("shortcut: a modifier's release was missed".into());
+                    self.modifier(key, false);
+                    self.modifier(key, true);
+                }
                 Some(down) => self.modifier(key, down),
-                // A kind bit without a side bit: the key flipped.
-                None if MAC_MODIFIERS.iter().any(|m| m.0 == key) => self.modifier(key, !held),
+                // A kind bit without a side bit: ask the system. (Guessing
+                // that it flipped turns press and release round for good
+                // once one event is missed.)
+                None if MAC_MODIFIERS.iter().any(|m| m.0 == key) => {
+                    let down =
+                        CGEventSource::key_state(CGEventSourceStateID::HIDSystemState, key);
+                    if down && held {
+                        self.modifier(key, false);
+                    }
+                    self.modifier(key, down);
+                }
                 None => {}
             }
             for &(m, ..) in MAC_MODIFIERS {

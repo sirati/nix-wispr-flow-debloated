@@ -67,6 +67,15 @@ pub enum Command {
     Bar { visible: bool },
     /// `status:micActive`.
     Mic { active: bool },
+    /// Tests (`--hotkey-source stdin`): a key went down or up, as the
+    /// keyboard would report it (this platform's code, hotkey/keys.rs).
+    Key { key: u16, down: bool },
+    /// Internal: what the dictation shortcut did (control.rs).
+    #[serde(skip)]
+    Hotkey(Vec<crate::control::Input>),
+    /// Internal: a click on the flow bar: start, stop or cancel.
+    #[serde(skip)]
+    BarClick(String),
 }
 
 /// Timing figures Wispr's Hub reports with `dictation:recordingDone`, in
@@ -136,6 +145,18 @@ pub enum Event {
     },
     Log {
         msg: String,
+    },
+    /// Press (`down`) or release Wispr's shortcut key for `action`: "ptt"
+    /// (push-to-talk) or "popo" (hands-free). The shim injects it into the
+    /// key events of Wispr's helper.
+    WisprKey {
+        action: String,
+        down: bool,
+    },
+    /// Keys (Wispr's codes) of our shortcuts for Wispr: the shim keeps them
+    /// from Wispr, so the keys Wispr sees held match its shortcut exactly.
+    HideKeys {
+        keys: Vec<u16>,
     },
 }
 

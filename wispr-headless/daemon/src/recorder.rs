@@ -18,6 +18,8 @@ pub const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2;
 pub const SAMPLE_RATE: f64 = 16_000.0;
 /// How long the capture command may take to deliver its first audio.
 pub const FIRST_AUDIO_PATIENCE: Duration = Duration::from_millis(2_500);
+/// How long a stopped capture command's output may take to close.
+const READER_PATIENCE: Duration = Duration::from_millis(300);
 
 /// Loudness of a chunk in dBFS, the way Wispr reports it; -200 for silence.
 pub fn volume_db(pcm: &[u8]) -> f64 {
@@ -98,8 +100,18 @@ impl Source {
             Source::Process { child, reader } => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // The reader ends when the pipe closes, which another
+                // process holding a copy of its write end (inherited by a
+                // child started at the same moment) can delay for good. Wait
+                // a little, then let it go: nothing may hang a dictation's end.
                 if let Some(reader) = reader.take() {
-                    let _ = reader.join();
+                    let until = Instant::now() + READER_PATIENCE;
+                    while !reader.is_finished() && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    if reader.is_finished() {
+                        let _ = reader.join();
+                    }
                 }
             }
             #[cfg(target_os = "macos")]

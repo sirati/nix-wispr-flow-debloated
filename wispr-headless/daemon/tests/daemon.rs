@@ -73,7 +73,7 @@ impl Daemon {
     fn next_op(&mut self, op: &str) -> Value {
         loop {
             let v = self.next();
-            if v["op"] == "log" {
+            if v["op"] == "log" || (v["op"] == "hideKeys" && op != "hideKeys") {
                 continue;
             }
             assert_eq!(v["op"], op, "unexpected message {v}");
@@ -269,6 +269,19 @@ fn an_early_start_without_a_request_is_dropped() {
     assert_eq!(got, pcm);
 }
 
+/// A local model whose server never gets ready.
+fn sleeping_asr_config() -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let server = dir.path().join("llama-server");
+    std::fs::write(&server, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.path().join("asr.json");
+    std::fs::write(&path, format!(r#"{{"server":"{}"}}"#, server.display())).unwrap();
+    let p = path.to_string_lossy().into_owned();
+    (dir, p)
+}
+
 /// A local model whose server cannot start.
 fn broken_asr_config() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -279,27 +292,32 @@ fn broken_asr_config() -> (tempfile::TempDir, String) {
 }
 
 #[test]
-fn a_dictation_of_our_own_for_wispr_clicks_its_start_and_stop() {
+fn a_dictation_of_our_own_for_wispr_holds_its_push_to_talk_key() {
     let mut d = Daemon::start("true");
     d.send(r#"{"op":"dictate","backend":"wispr"}"#);
-    assert_eq!(d.next_op("click")["action"], "start");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
     d.send(r#"{"op":"dictateEnd"}"#);
-    assert_eq!(d.next_op("click")["action"], "stop");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
+}
+
+fn wispr_key(action: &str, down: bool) -> Value {
+    serde_json::json!({"op": "wisprKey", "action": action, "down": down})
 }
 
 #[test]
-fn a_cancelled_dictation_for_wispr_clicks_its_cancel() {
+fn a_cancelled_dictation_for_wispr_clicks_its_cancel_then_lets_go() {
     let mut d = Daemon::start("true");
     d.send(r#"{"op":"dictate","backend":"wispr"}"#);
-    assert_eq!(d.next_op("click")["action"], "start");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
     d.send(r#"{"op":"dictateCancel"}"#);
     assert_eq!(d.next_op("click")["action"], "cancel");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
 }
 
 #[test]
 fn a_cancelled_local_dictation_is_not_transcribed() {
     let (_tone_dir, tone, _) = tone_file(16_000);
-    let (_dir, config) = broken_asr_config();
+    let (_dir, config) = sleeping_asr_config();
     let mut d = Daemon::start_with(&format!("cat {tone}"), &["--asr-config", &config]);
     // As the shortcut does it: recording from the key going down.
     d.send(r#"{"op":"early"}"#);
@@ -308,14 +326,14 @@ fn a_cancelled_local_dictation_is_not_transcribed() {
     d.send(r#"{"op":"dictateCancel"}"#);
     // The next thing said is about the next dictation, not a transcript.
     d.send(r#"{"op":"dictate","backend":"wispr"}"#);
-    assert_eq!(d.next_op("click")["action"], "start");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
 }
 
 #[test]
 fn without_a_local_model_our_dictations_go_to_wispr() {
     let mut d = Daemon::start("true");
     d.send(r#"{"op":"dictate"}"#);
-    assert_eq!(d.next_op("click")["action"], "start");
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
 }
 
 #[test]
@@ -356,4 +374,235 @@ fn wispr_s_own_dictations_are_unchanged_with_a_local_model() {
     d.send(r#"{"op":"stop"}"#);
     let (got, _) = collect_session(&mut d, "w-1");
     assert_eq!(got, pcm);
+}
+
+/// Key codes as the shortcut reads them on this platform.
+#[cfg(target_os = "macos")]
+const KEYS: (u16, u16, u16) = (61, 54, 53);
+#[cfg(not(target_os = "macos"))]
+const KEYS: (u16, u16, u16) = (100, 126, 1);
+const RIGHT_ALT: u16 = KEYS.0;
+const RIGHT_META: u16 = KEYS.1;
+const ESCAPE: u16 = KEYS.2;
+
+impl Daemon {
+    /// With the shortcut wispr:RightAlt + local:RightCommand fed from stdin.
+    fn with_keys(capture: &str, more: &[&str]) -> Daemon {
+        let mut args = vec![
+            "--hotkey-source",
+            "stdin",
+            "--hotkey",
+            "wispr:RightAlt",
+            "--hotkey",
+            "local:RightCommand",
+            "--log-file",
+            "",
+        ];
+        args.extend_from_slice(more);
+        Daemon::start_with(capture, &args)
+    }
+
+    fn key(&mut self, key: u16, down: bool) {
+        self.send(&format!(r#"{{"op":"key","key":{key},"down":{down}}}"#));
+    }
+
+    fn tap(&mut self, key: u16) {
+        self.key(key, true);
+        std::thread::sleep(Duration::from_millis(60));
+        self.key(key, false);
+    }
+
+    /// No message but logs for `ms`.
+    fn quiet(&mut self, ms: u64) {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while let Some(left) = end.checked_duration_since(std::time::Instant::now()) {
+            match self.lines.recv_timeout(left) {
+                Ok(v) if v["op"] == "log" || v["op"] == "hideKeys" => {}
+                Ok(v) => panic!("unexpected message {v}"),
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+#[test]
+fn wispr_s_shortcut_keys_are_hidden_from_wispr() {
+    let mut d = Daemon::with_keys("true", &[]);
+    let hidden = d.next_op("hideKeys");
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(hidden["keys"], serde_json::json!([0xa5]), "Right Alt's VK code");
+    #[cfg(target_os = "macos")]
+    assert_eq!(hidden["keys"], serde_json::json!([61]));
+}
+
+#[test]
+fn holding_the_wispr_shortcut_holds_wispr_s_push_to_talk_key() {
+    let mut d = Daemon::with_keys("true", &[]);
+    d.key(RIGHT_ALT, true);
+    // Not before the press is a dictation (200 ms).
+    d.quiet(120);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.key(RIGHT_ALT, false);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
+    // A tap: nothing at all.
+    d.tap(RIGHT_ALT);
+    d.quiet(700);
+}
+
+#[test]
+fn a_double_press_presses_wispr_s_hands_free_key_and_any_shortcut_ends_it() {
+    let mut d = Daemon::with_keys("true", &[]);
+    d.tap(RIGHT_ALT);
+    std::thread::sleep(Duration::from_millis(80));
+    d.key(RIGHT_ALT, true);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", true));
+    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", false));
+    d.key(RIGHT_ALT, false);
+    // Wispr reports its dictation as it would.
+    d.send(r#"{"op":"status","value":"initializing"}"#);
+    d.send(r#"{"op":"popo"}"#);
+    d.send(r#"{"op":"status","value":"listening"}"#);
+    d.quiet(500);
+    // The local shortcut stops it, as Wispr's own key would, and starts
+    // nothing of its own.
+    d.key(RIGHT_META, true);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", true));
+    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", false));
+    std::thread::sleep(Duration::from_millis(400));
+    d.key(RIGHT_META, false);
+    d.send(r#"{"op":"status","value":"processing"}"#);
+    d.send(r#"{"op":"status","value":"idle"}"#);
+    d.quiet(600);
+}
+
+#[test]
+fn escape_cancels_a_local_hands_free_dictation() {
+    let (_tone_dir, tone, _) = tone_file(16_000 * 5);
+    // A model that never loads: only a cancel ends this without text.
+    let (_dir, config) = sleeping_asr_config();
+    let mut d = Daemon::with_keys(&format!("cat {tone}"), &["--asr-config", &config]);
+    d.tap(RIGHT_META);
+    std::thread::sleep(Duration::from_millis(80));
+    d.tap(RIGHT_META);
+    d.quiet(500);
+    d.key(ESCAPE, true);
+    d.key(ESCAPE, false);
+    // No transcript, no failure: dropped.
+    d.quiet(800);
+}
+
+#[test]
+fn a_local_dictation_ends_itself_at_the_time_limit() {
+    let (_tone_dir, tone, _) = tone_file(16_000 * 5);
+    let (_dir, config) = broken_asr_config();
+    let mut d = Daemon::with_keys(
+        &format!("cat {tone}"),
+        &["--asr-config", &config, "--max-dictation-seconds", "0.5"],
+    );
+    d.tap(RIGHT_META);
+    std::thread::sleep(Duration::from_millis(80));
+    d.tap(RIGHT_META);
+    // The model cannot start, so the dictation fails; the time limit or the
+    // failure ends it, and the next press is a new dictation.
+    let f = d.next_op("transcriptFailed");
+    assert!(f["error"].as_str().unwrap().contains("llama-server"), "{f}");
+    d.key(RIGHT_ALT, true);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.key(RIGHT_ALT, false);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
+}
+
+#[test]
+fn the_log_file_records_the_dictations() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("logs/wispr-headless.log");
+    let mut d = Daemon::start_with(
+        "true",
+        &[
+            "--hotkey-source",
+            "stdin",
+            "--hotkey",
+            "wispr:RightAlt",
+            "--log-file",
+            log.to_str().unwrap(),
+        ],
+    );
+    d.key(RIGHT_ALT, true);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.key(RIGHT_ALT, false);
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("started (pid"), "{text}");
+    assert!(text.contains("shortcut: down"), "{text}");
+    assert!(text.contains("control: Start"), "{text}");
+}
+
+/// Whether `pid` runs (a zombie does not count).
+fn running(pid: &str) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spamming_both_shortcuts_never_runs_two_model_servers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tone_dir, tone, _) = tone_file(16_000 * 30);
+    let dir = tempfile::tempdir().unwrap();
+    let pids = dir.path().join("pids");
+    std::fs::create_dir(&pids).unwrap();
+    let server = dir.path().join("llama-server");
+    std::fs::write(
+        &server,
+        format!("#!/bin/sh\necho > {}/$$\nexec sleep 60\n", pids.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.path().join("asr.json");
+    std::fs::write(&config, format!(r#"{{"server":"{}"}}"#, server.display())).unwrap();
+    let mut d = Daemon::with_keys(&format!("cat {tone}"), &["--asr-config", config.to_str().unwrap()]);
+    let alive = || {
+        std::fs::read_dir(&pids)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| running(&e.file_name().to_string_lossy()))
+            .count()
+    };
+    let mut most = 0;
+    let mut seed: u64 = 0x1234_5678_9abc_def1;
+    let mut rand = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    let keys = [RIGHT_META, RIGHT_META, RIGHT_ALT, ESCAPE];
+    let mut held = std::collections::BTreeSet::new();
+    let end = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < end {
+        let key = keys[rand(keys.len() as u64) as usize];
+        let down = held.insert(key);
+        if !down {
+            held.remove(&key);
+        }
+        d.key(key, down);
+        std::thread::sleep(Duration::from_millis(rand(300)));
+        most = most.max(alive());
+    }
+    for key in held {
+        d.key(key, false);
+    }
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(50));
+        most = most.max(alive());
+    }
+    assert!(most <= 1, "{most} model servers at once");
+    assert!(
+        std::fs::read_dir(&pids).unwrap().count() > 0,
+        "the spam started local dictations"
+    );
 }

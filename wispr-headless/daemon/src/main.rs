@@ -13,7 +13,9 @@
 
 mod asr;
 mod bar;
+mod control;
 mod hotkey;
+mod log;
 #[cfg(target_os = "macos")]
 mod mic_mac;
 mod mics;
@@ -41,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bar::{BarEvent, PillCommand};
+use control::{Action, Control};
 use hotkey::Hotkey;
 use protocol::{Backend, Command, Event};
 use recorder::{Progress, Recording};
@@ -79,6 +82,21 @@ struct Config {
     /// The bar's fill for Wispr and for the local model.
     fill: [u8; 3],
     local_fill: [u8; 3],
+    /// Two presses of a hold shortcut this close make a hands-free dictation.
+    double_press: Duration,
+    /// The longest a local dictation records.
+    max_dictation: Duration,
+    /// The daemon's log file (log.rs); None: none.
+    log_file: Option<std::path::PathBuf>,
+    hotkey_source: HotkeySource,
+}
+
+/// Where `--hotkey` keys come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeySource {
+    Keyboards,
+    /// Tests: `key` commands on stdin.
+    Stdin,
 }
 
 fn config() -> Config {
@@ -111,6 +129,10 @@ fn config() -> Config {
     let mut run = Run::Shim;
     let mut hotkeys = Vec::new();
     let mut typing = typing::Options::default();
+    let mut double_press = hotkey::DOUBLE_PRESS;
+    let mut max_dictation = Duration::from_secs(600);
+    let mut log_file = log::default_path();
+    let mut hotkey_source = HotkeySource::Keyboards;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -128,6 +150,28 @@ fn config() -> Config {
             }
             "--wl-copy" => typing.wl_copy = args.next(),
             "--hotkey-test" => run = Run::HotkeyTest,
+            // Milliseconds between a tap and the second press that make a
+            // hands-free dictation; 0 turns double presses off.
+            "--double-press-ms" => {
+                if let Some(ms) = args.next().and_then(|v| v.parse().ok()) {
+                    double_press = Duration::from_millis(ms);
+                }
+            }
+            "--max-dictation-seconds" => {
+                if let Some(s) = args.next().and_then(|v| v.parse::<f64>().ok()) {
+                    if s > 0.0 && s.is_finite() {
+                        max_dictation = Duration::from_secs_f64(s);
+                    }
+                }
+            }
+            // "" for none.
+            "--log-file" => log_file = args.next().filter(|f| !f.is_empty()).map(Into::into),
+            // Tests: keys come as `key` commands on stdin.
+            "--hotkey-source" => {
+                if args.next().as_deref() == Some("stdin") {
+                    hotkey_source = HotkeySource::Stdin;
+                }
+            }
             "--type-test" => run = Run::TypeTest,
             "--pw-cat" => {
                 if let Some(p) = args.next() {
@@ -187,6 +231,10 @@ fn config() -> Config {
         asr_config,
         fill,
         local_fill,
+        double_press,
+        max_dictation,
+        log_file,
+        hotkey_source,
     }
 }
 
@@ -319,6 +367,9 @@ struct Out(Arc<Mutex<std::io::Stdout>>);
 
 impl Out {
     fn send(&self, event: &Event) {
+        if let Event::Log { msg } = event {
+            log::write(msg);
+        }
         let mut out = self.0.lock().expect("stdout lock poisoned");
         let _ = writeln!(out, "{}", protocol::encode(event));
         let _ = out.flush();
@@ -369,17 +420,12 @@ struct Local {
 
 /// Ends a local dictation: the rest of its audio goes to the model, and the
 /// text comes back as Command::Transcribed.
-fn end_local(
-    local: Local,
-    commands: &mpsc::Sender<Option<Command>>,
-    pill_tx: &mpsc::Sender<PillCommand>,
-) {
+fn end_local(local: Local, commands: &mpsc::Sender<Option<Command>>) {
     let Local {
         recording,
         mut dictation,
     } = local;
     dictation.feed(&recording.finish_pcm());
-    let _ = pill_tx.send(PillCommand::Status("processing".into()));
     let commands = commands.clone();
     std::thread::spawn(move || {
         let result = dictation.finish();
@@ -410,12 +456,6 @@ fn typing_thread(cfg: &Config, out: &Out) -> Option<mpsc::Sender<String>> {
     Some(tx)
 }
 
-/// A local dictation that produced no text.
-fn local_failed(out: &Out, pill_tx: &mpsc::Sender<PillCommand>, error: String) {
-    let _ = pill_tx.send(PillCommand::Status("error".into()));
-    out.send(&Event::TranscriptFailed { error });
-}
-
 /// `--hotkey-test`: prints each key going down and up, by the name a
 /// binding would use, and what the `--hotkey` bindings make of it. Without
 /// bindings every device with keys is read, to find a key's name.
@@ -427,7 +467,11 @@ fn hotkey_test(cfg: &Config) -> ! {
     let wanted: Vec<hotkey::Key> = if bindings.is_empty() {
         (1..0x300).collect()
     } else {
-        bindings.iter().flat_map(|b| b.keys.clone()).collect()
+        bindings
+            .iter()
+            .flat_map(|b| b.keys.clone())
+            .chain(hotkey::parse_key("Escape"))
+            .collect()
     };
     let (tx, rx) = mpsc::channel();
     let log: hotkey::Log = Arc::new(|msg| eprintln!("{msg}"));
@@ -436,8 +480,11 @@ fn hotkey_test(cfg: &Config) -> ! {
         std::process::exit(1);
     }
     let out = std::cell::RefCell::new(std::io::stdout().lock());
+    let escape = hotkey::parse_key("Escape").ok();
     hotkey::drive(
-        hotkey::Chord::new(bindings, hotkey::ARM),
+        hotkey::Chord::new(bindings, hotkey::ARM)
+            .double_press(cfg.double_press)
+            .escape(escape),
         rx,
         |key, down| {
             let mut out = out.borrow_mut();
@@ -445,12 +492,14 @@ fn hotkey_test(cfg: &Config) -> ! {
             let _ = writeln!(out, "{} {state}", hotkey::key_name(key));
             let _ = out.flush();
         },
-        |e, binding| {
+        |events, binding| {
             let mut out = out.borrow_mut();
-            let _ = match &binding.backend {
-                Some(backend) => writeln!(out, "  {} {backend}", e.name()),
-                None => writeln!(out, "  {}", e.name()),
-            };
+            for e in events {
+                let _ = match &binding.backend {
+                    Some(backend) => writeln!(out, "  {} {backend}", e.name()),
+                    None => writeln!(out, "  {}", e.name()),
+                };
+            }
             let _ = out.flush();
         },
     );
@@ -493,20 +542,24 @@ fn main() {
         Run::TypeTest => type_test(&cfg),
         Run::Shim => {}
     }
+    log::init(cfg.log_file.clone());
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
 
     // The flow bar keeps the main thread (AppKit needs it on macOS); commands
     // and the recorder run on their own, and the process ends with them.
+    // There is one bar and only serve() tells it what to show.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
     let _ = pill_tx.send(PillCommand::Fills {
         wispr: cfg.fill,
         local: cfg.local_fill,
     });
     let fonts = cfg.fonts.clone();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
+    let clicks = cmd_tx.clone();
     {
         let out = Out(out.0.clone());
         std::thread::spawn(move || {
-            serve(&cfg, &out, &pill_tx);
+            serve(&cfg, &out, &pill_tx, cmd_tx, cmd_rx);
             std::process::exit(0);
         });
     }
@@ -516,17 +569,16 @@ fn main() {
         pill_rx,
         fonts.as_deref(),
         move |msg| log_out.send(&Event::Log { msg }),
-        // Clicks and notification results go straight to the shim.
-        move |e| {
-            event_out.send(&match e {
-                BarEvent::Click(action) => Event::Click {
-                    action: action.to_string(),
-                },
-                BarEvent::NoticeAction(index) => Event::NoticeAction { index },
-                BarEvent::NoticeClosed(reason) => Event::NoticeClosed {
-                    reason: reason.to_string(),
-                },
-            })
+        move |e| match e {
+            // The bar's buttons may be a local dictation's: serve() decides.
+            BarEvent::Click(action) => {
+                let _ = clicks.send(Some(Command::BarClick(action.to_string())));
+            }
+            // Notification results go straight to the shim.
+            BarEvent::NoticeAction(index) => event_out.send(&Event::NoticeAction { index }),
+            BarEvent::NoticeClosed(reason) => event_out.send(&Event::NoticeClosed {
+                reason: reason.to_string(),
+            }),
         },
     );
     // The bar only stops once serve() is done and about to exit.
@@ -535,26 +587,64 @@ fn main() {
     }
 }
 
-fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
+/// What a batch of shortcut events means for control.rs: a press that is
+/// at once hands-free (a double press, a toggle binding) is one start.
+fn hotkey_inputs(events: &[Hotkey], backend: Backend) -> Vec<control::Input> {
+    let mut inputs = Vec::new();
+    let mut i = 0;
+    while i < events.len() {
+        inputs.push(match events[i] {
+            Hotkey::Down => control::Input::Down(backend),
+            Hotkey::Pressed => {
+                let hands_free = events.get(i + 1) == Some(&Hotkey::HandsFree);
+                i += usize::from(hands_free);
+                control::Input::Start {
+                    backend,
+                    hands_free,
+                }
+            }
+            Hotkey::HandsFree => control::Input::HandsFree,
+            Hotkey::Released => control::Input::End,
+            Hotkey::Cancelled => control::Input::Cancel,
+        });
+        i += 1;
+    }
+    inputs
+}
+
+/// How long a recording started ahead of a dictation may wait: for Wispr's
+/// request after its dictation began, for the shortcut to decide whether a
+/// press is a dictation (a hold or a double press), and for Wispr's request
+/// after our shortcut pressed Wispr's.
+const EARLY_FOR_WISPR: Duration = EARLY_START_PATIENCE;
+const EARLY_FOR_SHORTCUT: Duration = Duration::from_secs(3);
+const EARLY_FOR_WISPR_KEY: Duration = Duration::from_millis(1_500);
+
+fn serve(
+    cfg: &Config,
+    out: &Out,
+    pill_tx: &mpsc::Sender<PillCommand>,
+    cmd_tx: mpsc::Sender<Option<Command>>,
+    cmd_rx: mpsc::Receiver<Option<Command>>,
+) {
     let clock = Instant::now();
     let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
+    let log = |msg: String| out.send(&Event::Log { msg });
 
     // The system's inputs, listed in the background (ffmpeg takes a moment)
     // at start, when Wispr's ranking changes and after each recording, so a
     // start never waits for it.
-    let backend = mics::Backend::of(&cfg.capture);
-    // Commands arrive on their own thread so audio can be polled in between.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Option<Command>>();
+    let mic_backend = mics::Backend::of(&cfg.capture);
     let inputs = Arc::new(Mutex::new(Vec::<mics::Native>::new()));
     let (relist, relist_rx) = mpsc::channel::<()>();
-    if cfg.target.is_none() && backend != mics::Backend::Fixed {
+    if cfg.target.is_none() && mic_backend != mics::Backend::Fixed {
         let inputs = inputs.clone();
         let program = cfg.capture.first().cloned().unwrap_or_default();
         let done = cmd_tx.clone();
         std::thread::spawn(move || {
             while relist_rx.recv().is_ok() {
                 while relist_rx.try_recv().is_ok() {}
-                let found = mics::list(backend, &program);
+                let found = mics::list(mic_backend, &program);
                 *inputs.lock().expect("inputs lock poisoned") = found;
                 // So the next recording's input gets prepared.
                 if done.send(Some(Command::Relisted)).is_err() {
@@ -585,9 +675,7 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 }))
             }
             Err(e) => {
-                out.send(&Event::Log {
-                    msg: format!("no local transcription: {e}"),
-                });
+                log(format!("no local transcription: {e}"));
                 None
             }
         });
@@ -598,12 +686,14 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     });
     let internal = cmd_tx.clone();
 
-    // Our own dictation shortcut (--hotkey), as dictate commands. A hold
-    // starts recording as it goes down, for whichever backend it turns out
-    // to be for; Wispr adopts that recording as it does Early's.
+    // Our own dictation shortcut (--hotkey). A hold records from the moment
+    // it goes down, for whichever backend it turns out to be for; Wispr
+    // adopts that recording as it does Early's.
+    let mut shortcut: Option<hotkey::Control> = None;
+    let mut hidden: Vec<u16> = Vec::new();
     if !cfg.hotkeys.is_empty() {
         let log_out = Out(out.0.clone());
-        let log: hotkey::Log = Arc::new(move |msg| log_out.send(&Event::Log { msg }));
+        let hotkey_log: hotkey::Log = Arc::new(move |msg| log_out.send(&Event::Log { msg }));
         let to_serve = cmd_tx.clone();
         let started = hotkey::parse_bindings(&cfg.hotkeys).and_then(|bindings| {
             for b in &bindings {
@@ -611,25 +701,36 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                     Backend::parse(name).ok_or(format!("{name}: no such backend"))?;
                 }
             }
+            let for_wispr = |b: &hotkey::Binding| {
+                b.backend.as_deref().and_then(Backend::parse).unwrap_or(backend) == Backend::Wispr
+            };
+            hidden = bindings
+                .iter()
+                .filter(|b| for_wispr(b))
+                .flat_map(|b| b.keys.iter().filter_map(|&k| hotkey::wispr_code(k)))
+                .collect();
+            hidden.sort_unstable();
+            hidden.dedup();
+            let source = match cfg.hotkey_source {
+                HotkeySource::Keyboards => hotkey::Source::Keyboards,
+                HotkeySource::Stdin => hotkey::Source::Fed,
+            };
             hotkey::spawn(
                 bindings,
-                move |h, binding| {
-                    let command = match h {
-                        Hotkey::Down => Command::Early,
-                        Hotkey::Pressed => Command::Dictate {
-                            backend: binding.backend.as_deref().and_then(Backend::parse),
-                        },
-                        Hotkey::HandsFree => return,
-                        Hotkey::Released => Command::DictateEnd,
-                        Hotkey::Cancelled => Command::DictateCancel,
-                    };
-                    let _ = to_serve.send(Some(command));
+                cfg.double_press,
+                source,
+                move |events, binding| {
+                    let b = binding.backend.as_deref().and_then(Backend::parse).unwrap_or(backend);
+                    let names: Vec<&str> = events.iter().map(|e| e.name()).collect();
+                    log::write(&format!("shortcut: {} ({b:?})", names.join(" ")));
+                    let _ = to_serve.send(Some(Command::Hotkey(hotkey_inputs(events, b))));
                 },
-                log.clone(),
+                hotkey_log.clone(),
             )
         });
-        if let Err(e) = started {
-            log(format!("no dictation shortcut: {e}"));
+        match started {
+            Ok(control) => shortcut = Some(control),
+            Err(e) => hotkey_log(format!("no dictation shortcut: {e}")),
         }
     }
 
@@ -661,19 +762,25 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     }
 
     out.send(&Event::Ready);
+    if shortcut.is_some() {
+        out.send(&Event::HideKeys {
+            keys: hidden.clone(),
+        });
+    }
+    let mut ctl = Control::new(cfg.max_dictation);
     let mut recording: Option<Recording> = None;
-    // Started early, when Wispr's dictation begins ("initializing"), before
-    // it asks to record (about 25 ms later): handed over with everything it
-    // heard, or dropped if no request comes.
+    // Started ahead of a dictation: when Wispr's begins ("initializing"),
+    // before it asks to record (about 25 ms later), or when our shortcut goes
+    // down. Handed over with everything it heard, or dropped at its deadline.
     let mut early: Option<(Recording, Instant)> = None;
-    // A dictation of our own (`dictate`) that the local model transcribes.
+    // A dictation of our own that the local model transcribes.
     let mut local: Option<Local> = None;
-    // A dictation of our own that Wispr runs: its bar's start was clicked.
-    let mut clicked = false;
     let chosen = |ranked: &[mics::Ranked]| {
         let inputs = inputs.lock().expect("inputs lock poisoned");
         mics::choose(ranked, &inputs).cloned()
     };
+    // What control.rs is told; its answers may tell it more.
+    let mut pending: std::collections::VecDeque<control::Input> = Default::default();
     loop {
         let wait = if recording.is_some() || local.is_some() {
             Duration::from_millis(5)
@@ -682,36 +789,49 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
         } else {
             Duration::from_secs(3600)
         };
-        match cmd_rx.recv_timeout(wait) {
+        // A start Wispr asked for and control.rs refused.
+        let mut refused = false;
+        // Wispr's bar status, for the bar if its dictation has it.
+        let mut forward: Option<PillCommand> = None;
+        let command = cmd_rx.recv_timeout(wait);
+        match command {
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Some(Command::Start { uuid })) => {
-                // Wispr's own dictation takes the microphone: a local one
-                // ends with what it heard.
-                if let Some(l) = local.take() {
-                    end_local(l, &internal, pill_tx);
+                let before = ctl.describe();
+                for a in ctl.input(control::Input::WisprStart, Instant::now()) {
+                    refused |= a == Action::RefuseWisprStart;
                 }
-                // A new start replaces an unfinished recording, as Wispr's Hub does.
-                if let Some(old) = recording.take() {
-                    for e in old.stop(clock_ms()) {
-                        out.send(&e);
+                if refused {
+                    log(format!("Wispr asked to record while {before}: refused"));
+                    out.send(&Event::MicFailed {
+                        uuid,
+                        error: "the microphone is taken by a local dictation".into(),
+                    });
+                } else {
+                    // A new start replaces an unfinished recording, as Wispr's
+                    // Hub does.
+                    if let Some(old) = recording.take() {
+                        for e in old.stop(clock_ms()) {
+                            out.send(&e);
+                        }
                     }
-                }
-                let started = match early.take() {
-                    Some((mut r, _)) => {
-                        r.adopt(uuid.clone());
-                        Ok(r)
+                    let started = match early.take() {
+                        Some((mut r, _)) => {
+                            r.adopt(uuid.clone());
+                            Ok(r)
+                        }
+                        None => {
+                            let mic = chosen(&ranked);
+                            start_recording(cfg, &uuid, mic.as_ref(), clock_ms(), out, &mut ready)
+                        }
+                    };
+                    match started {
+                        Ok(r) => {
+                            out.send(&Event::Started { uuid });
+                            recording = Some(r);
+                        }
+                        Err(error) => out.send(&Event::MicFailed { uuid, error }),
                     }
-                    None => {
-                        let mic = chosen(&ranked);
-                        start_recording(cfg, &uuid, mic.as_ref(), clock_ms(), out, &mut ready)
-                    }
-                };
-                match started {
-                    Ok(r) => {
-                        out.send(&Event::Started { uuid });
-                        recording = Some(r);
-                    }
-                    Err(error) => out.send(&Event::MicFailed { uuid, error }),
                 }
             }
             Ok(Some(Command::Stop)) => {
@@ -731,50 +851,73 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                     prepare(&mut ready, &ranked);
                 }
             }
-            // The shortcut went down, or Wispr's dictation began without it
-            // (a click on the bar): start ahead of Wispr's request.
+            // Wispr's own shortcut went down (the shim saw it): start ahead
+            // of Wispr's request.
             Ok(Some(Command::Early)) => {
-                if recording.is_none() && early.is_none() && local.is_none() {
+                if recording.is_none() && early.is_none() && local.is_none() && !ctl.busy() {
                     let mic = chosen(&ranked);
-                    early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready);
+                    early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready)
+                        .map(|(r, at)| (r, at + EARLY_FOR_WISPR));
                 }
             }
-            Ok(Some(Command::EarlyCancel)) => early = None,
+            Ok(Some(Command::EarlyCancel)) => {
+                if !ctl.busy() {
+                    early = None;
+                }
+            }
             Ok(Some(Command::Status { value })) => {
-                match value.as_str() {
-                    "initializing" if recording.is_none() && early.is_none() && local.is_none() => {
-                        let mic = chosen(&ranked);
-                        early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready);
-                    }
-                    "idle" | "dismissed" | "error" => early = None,
-                    _ => {}
+                if value == "initializing"
+                    && recording.is_none()
+                    && early.is_none()
+                    && local.is_none()
+                {
+                    let mic = chosen(&ranked);
+                    early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready)
+                        .map(|(r, at)| (r, at + EARLY_FOR_WISPR));
                 }
-                let _ = pill_tx.send(PillCommand::Status(value));
+                if matches!(value.as_str(), "idle" | "dismissed" | "error") && !ctl.busy() {
+                    early = None;
+                }
+                pending.push_back(control::Input::WisprStatus(value.clone()));
+                // After control.rs heard it: Wispr's start takes the bar.
+                forward = Some(PillCommand::Status(value));
             }
+            Ok(Some(Command::Popo)) => {
+                pending.push_back(control::Input::WisprPopo);
+                forward = Some(PillCommand::Popo);
+            }
+            // Wispr's indicator: only while its dictation has the bar.
             Ok(Some(Command::Level { value })) => {
-                let _ = pill_tx.send(PillCommand::Level(value));
+                if ctl.wispr_owns_bar() {
+                    let _ = pill_tx.send(PillCommand::Level(value));
+                }
+            }
+            Ok(Some(Command::Mic { active })) => {
+                if ctl.wispr_owns_bar() {
+                    let _ = pill_tx.send(PillCommand::Mic(active));
+                }
+            }
+            Ok(Some(Command::Silence { value })) => {
+                if ctl.wispr_owns_bar() {
+                    let _ = pill_tx.send(PillCommand::Silence(value));
+                }
+            }
+            Ok(Some(Command::Commanding { active })) => {
+                if ctl.wispr_owns_bar() {
+                    let _ = pill_tx.send(PillCommand::CommandMode(active));
+                }
+            }
+            Ok(Some(Command::Indicator { state })) => {
+                if ctl.wispr_owns_bar() {
+                    let _ = pill_tx.send(PillCommand::Indicator(state));
+                }
             }
             Ok(Some(Command::Pill { enabled })) => {
                 let _ = pill_tx.send(PillCommand::Enabled(enabled));
             }
             Ok(Some(Command::Sound { name })) => play(cfg, &name, out),
-            Ok(Some(Command::Mic { active })) => {
-                let _ = pill_tx.send(PillCommand::Mic(active));
-            }
             Ok(Some(Command::Bar { visible })) => {
                 let _ = pill_tx.send(PillCommand::RestingBar(visible));
-            }
-            Ok(Some(Command::Popo)) => {
-                let _ = pill_tx.send(PillCommand::Popo);
-            }
-            Ok(Some(Command::Silence { value })) => {
-                let _ = pill_tx.send(PillCommand::Silence(value));
-            }
-            Ok(Some(Command::Commanding { active })) => {
-                let _ = pill_tx.send(PillCommand::CommandMode(active));
-            }
-            Ok(Some(Command::Indicator { state })) => {
-                let _ = pill_tx.send(PillCommand::Indicator(state));
             }
             Ok(Some(Command::Notify {
                 title,
@@ -790,96 +933,86 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             Ok(Some(Command::NotifyClear)) => {
                 let _ = pill_tx.send(PillCommand::NotifyClear);
             }
-            Ok(Some(Command::Dictate { backend: wanted })) => match wanted.unwrap_or(backend) {
-                Backend::Wispr => {
-                    if !clicked && recording.is_none() && local.is_none() {
-                        // A recording the shortcut started waits for
-                        // Wispr's request from now on.
-                        if let Some((_, at)) = early.as_mut() {
-                            *at = Instant::now();
-                        }
-                        clicked = true;
-                        out.send(&Event::Click {
-                            action: "start".into(),
-                        });
-                    }
-                }
-                // One dictation at a time.
-                Backend::Local if recording.is_some() || local.is_some() || clicked => {}
-                Backend::Local => match &asr {
-                    None => local_failed(out, pill_tx, "no local model (--asr-config)".into()),
-                    Some(asr) => {
-                        // What the shortcut recorded since it went down.
-                        let started = match early.take() {
-                            Some((r, _)) => Ok(r),
-                            None => {
-                                let mic = chosen(&ranked);
-                                start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
-                            }
-                        };
-                        match started {
-                            Ok(r) => {
-                                local = Some(Local {
-                                    recording: r,
-                                    dictation: asr.start(),
-                                });
-                                let _ = pill_tx.send(PillCommand::Local);
-                                let _ = pill_tx.send(PillCommand::Status("listening".into()));
-                                let _ = pill_tx.send(PillCommand::Mic(true));
-                            }
-                            Err(error) => local_failed(out, pill_tx, error),
-                        }
-                    }
-                },
-            },
-            Ok(Some(Command::DictateEnd)) => {
-                if std::mem::take(&mut clicked) {
-                    out.send(&Event::Click {
-                        action: "stop".into(),
-                    });
-                }
-                if let Some(l) = local.take() {
-                    end_local(l, &internal, pill_tx);
-                    let _ = relist.send(());
+            Ok(Some(Command::Key { key, down })) => {
+                if let (Some(s), HotkeySource::Stdin) = (&shortcut, cfg.hotkey_source) {
+                    s.key(key, down);
                 }
             }
-            Ok(Some(Command::DictateCancel)) => {
-                early = None;
-                if std::mem::take(&mut clicked) {
-                    out.send(&Event::Click {
-                        action: "cancel".into(),
-                    });
-                }
-                if local.take().is_some() {
-                    let _ = pill_tx.send(PillCommand::Mic(false));
-                    let _ = pill_tx.send(PillCommand::Status("idle".into()));
-                    let _ = relist.send(());
-                }
+            Ok(Some(Command::Hotkey(inputs))) => pending.extend(inputs),
+            Ok(Some(Command::BarClick(action))) => {
+                pending.push_back(control::Input::BarClick(action));
             }
+            Ok(Some(Command::Dictate { backend: wanted })) => {
+                pending.push_back(control::Input::Start {
+                    backend: wanted.unwrap_or(backend),
+                    hands_free: false,
+                });
+            }
+            Ok(Some(Command::DictateEnd)) => pending.push_back(control::Input::End),
+            Ok(Some(Command::DictateCancel)) => pending.push_back(control::Input::Cancel),
             Ok(Some(Command::Transcribed { result })) => {
-                // The bar belongs to the next dictation if one started meanwhile.
-                let quiet = recording.is_none() && local.is_none() && !clicked;
+                pending.push_back(control::Input::Transcribed {
+                    ok: result.is_ok(),
+                });
                 match result {
                     Ok(text) => {
-                        if quiet {
-                            let _ = pill_tx.send(PillCommand::Status("idle".into()));
-                        }
                         if let Some(typist) = &typist {
                             let _ = typist.send(text.clone());
                         }
                         out.send(&Event::Transcript { text });
                     }
-                    Err(error) if quiet => local_failed(out, pill_tx, error),
-                    Err(error) => out.send(&Event::TranscriptFailed { error }),
+                    Err(error) => {
+                        log(format!("local transcription failed: {error}"));
+                        out.send(&Event::TranscriptFailed { error });
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
+        if let Some(l) = local.as_mut() {
+            match l.recording.poll_pcm(Duration::from_millis(15)) {
+                Ok(pcm) if pcm.is_empty() => {}
+                Ok(pcm) => {
+                    if ctl.local_recording() && !ctl.wispr_owns_bar() {
+                        let _ = pill_tx.send(PillCommand::Level(recorder::volume_db(&pcm)));
+                    }
+                    l.dictation.feed(&pcm);
+                }
+                Err(error) => pending.push_back(control::Input::LocalFailed(error)),
+            }
+            // The model (llama-server) died while it recorded.
+            if let Some(error) = l.dictation.failure() {
+                pending.push_back(control::Input::LocalFailed(error));
+            }
+        }
+        if ctl.local_recording() {
+            pending.push_back(control::Input::Tick);
+        }
+        if !pending.is_empty() {
+            let mut effects = Effects {
+                cfg,
+                out,
+                pill_tx,
+                asr: asr.as_ref(),
+                internal: &internal,
+                relist: &relist,
+                shortcut: shortcut.as_ref(),
+                ranked: &ranked,
+                chosen: &chosen,
+                clock_ms: clock_ms(),
+                ready: &mut ready,
+                early: &mut early,
+                local: &mut local,
+            };
+            run_control(&mut ctl, &mut pending, &mut |a| act(a, &mut effects));
+        }
+        if let Some(p) = forward {
+            if ctl.wispr_owns_bar() {
+                let _ = pill_tx.send(p);
+            }
+        }
         // No request to record followed: stop and forget what it heard.
-        if early
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() > EARLY_START_PATIENCE)
-        {
+        if early.as_ref().is_some_and(|(_, until)| Instant::now() > *until) {
             early = None;
             let _ = relist.send(());
         }
@@ -896,24 +1029,162 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                 }
             }
         }
-        if let Some(l) = local.as_mut() {
-            match l.recording.poll_pcm(Duration::from_millis(15)) {
-                Ok(pcm) if pcm.is_empty() => {}
-                Ok(pcm) => {
-                    let _ = pill_tx.send(PillCommand::Level(recorder::volume_db(&pcm)));
-                    l.dictation.feed(&pcm);
-                }
-                Err(error) => {
-                    local = None;
-                    local_failed(out, pill_tx, error);
-                }
-            }
-        }
     }
     if let Some(r) = recording.take() {
         let _ = r.uuid();
     }
 }
+
+/// Feeds control.rs until it has nothing more to say, logging how its state
+/// changes. Its answers can feed it again (a local dictation that cannot
+/// start fails), through `pending`.
+fn run_control(
+    ctl: &mut Control,
+    pending: &mut std::collections::VecDeque<control::Input>,
+    act: &mut dyn FnMut(Action) -> Option<control::Input>,
+) {
+    while let Some(input) = pending.pop_front() {
+        let before = ctl.describe();
+        let quiet = input == control::Input::Tick;
+        let label = format!("{input:?}");
+        let actions = ctl.input(input, Instant::now());
+        let after = ctl.describe();
+        if !quiet || !actions.is_empty() {
+            if before != after || !actions.is_empty() {
+                log::write(&format!("control: {label}: {before} -> {after}; {actions:?}"));
+            }
+        }
+        for a in actions {
+            if let Some(more) = act(a) {
+                pending.push_back(more);
+            }
+        }
+    }
+}
+
+/// What control.rs's answers act on.
+struct Effects<'a> {
+    cfg: &'a Config,
+    out: &'a Out,
+    pill_tx: &'a mpsc::Sender<PillCommand>,
+    asr: Option<&'a asr::Asr>,
+    internal: &'a mpsc::Sender<Option<Command>>,
+    relist: &'a mpsc::Sender<()>,
+    shortcut: Option<&'a hotkey::Control>,
+    ranked: &'a [mics::Ranked],
+    chosen: &'a dyn Fn(&[mics::Ranked]) -> Option<mics::Native>,
+    clock_ms: f64,
+    ready: &'a mut Ready,
+    early: &'a mut Option<(Recording, Instant)>,
+    local: &'a mut Option<Local>,
+}
+
+/// Carries out one of control.rs's answers; may have news for it.
+fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
+    match action {
+        Action::StartEarly => {
+            if e.early.is_none() && e.local.is_none() {
+                let mic = (e.chosen)(e.ranked);
+                *e.early = start_early(e.cfg, mic.as_ref(), e.clock_ms, e.out, e.ready)
+                    .map(|(r, at)| (r, at + EARLY_FOR_SHORTCUT));
+            }
+        }
+        Action::DropEarly => {
+            if e.early.take().is_some() {
+                let _ = e.relist.send(());
+            }
+        }
+        Action::StartLocal { hands_free } => {
+            let Some(asr) = e.asr else {
+                *e.early = None;
+                return Some(control::Input::LocalFailed(
+                    "no local model (--asr-config)".into(),
+                ));
+            };
+            // What the shortcut recorded since it went down.
+            let started = match e.early.take() {
+                Some((r, _)) => Ok(r),
+                None => {
+                    let mic = (e.chosen)(e.ranked);
+                    start_recording(e.cfg, "", mic.as_ref(), e.clock_ms, e.out, e.ready)
+                }
+            };
+            match started {
+                Ok(r) => {
+                    *e.local = Some(Local {
+                        recording: r,
+                        dictation: asr.start(),
+                    });
+                    let _ = e.pill_tx.send(PillCommand::Local);
+                    let _ = e.pill_tx.send(PillCommand::Status("listening".into()));
+                    if hands_free {
+                        let _ = e.pill_tx.send(PillCommand::Popo);
+                    }
+                    let _ = e.pill_tx.send(PillCommand::Mic(true));
+                }
+                Err(error) => return Some(control::Input::LocalFailed(error)),
+            }
+        }
+        Action::EndLocal => {
+            if let Some(l) = e.local.take() {
+                end_local(l, e.internal);
+                let _ = e.relist.send(());
+            }
+        }
+        Action::CancelLocal => {
+            if e.local.take().is_some() {
+                let _ = e.relist.send(());
+            }
+        }
+        Action::FailLocal(error) => {
+            *e.local = None;
+            let _ = e.relist.send(());
+            e.out.send(&Event::TranscriptFailed { error });
+        }
+        Action::WisprKey(key, down) => {
+            // Wispr asks to record within a moment; the early recording
+            // waits that long.
+            if down {
+                if let Some((_, until)) = e.early.as_mut() {
+                    *until = Instant::now() + EARLY_FOR_WISPR_KEY;
+                }
+            }
+            e.out.send(&Event::WisprKey {
+                action: key.name().into(),
+                down,
+            });
+        }
+        Action::WisprClick(action) => {
+            if action == "start" {
+                if let Some((_, until)) = e.early.as_mut() {
+                    *until = Instant::now() + EARLY_FOR_WISPR_KEY;
+                }
+            }
+            e.out.send(&Event::Click {
+                action: action.into(),
+            });
+        }
+        // Answered where Wispr's request is handled.
+        Action::RefuseWisprStart => {}
+        Action::BarStatus(status) => {
+            if status == "processing" || status == "idle" || status == "error" {
+                let _ = e.pill_tx.send(PillCommand::Mic(false));
+            }
+            let _ = e.pill_tx.send(PillCommand::Status(status.into()));
+        }
+        Action::BarHandsFree => {
+            let _ = e.pill_tx.send(PillCommand::Popo);
+        }
+        Action::ResetShortcut => {
+            if let Some(s) = e.shortcut {
+                s.reset();
+            }
+        }
+        Action::Log(msg) => e.out.send(&Event::Log { msg }),
+    }
+    None
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -934,6 +1205,10 @@ mod tests {
             asr_config: None,
             fill: bar::WISPR_FILL,
             local_fill: bar::LOCAL_FILL,
+            double_press: hotkey::DOUBLE_PRESS,
+            max_dictation: Duration::from_secs(600),
+            log_file: None,
+            hotkey_source: HotkeySource::Keyboards,
         }
     }
 

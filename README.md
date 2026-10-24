@@ -62,7 +62,20 @@ from /dev/input on any desktop, for example
 `[ "wispr:RightAlt" "local:RightCtrl" ]`: hold Right Alt to dictate with
 Wispr, Right Ctrl with the local model, whose text is then typed into the
 focused window. A held key becomes a dictation after 200 ms alone; another
-key while it is held makes it an ordinary shortcut. On macOS,
+key while it is held makes it an ordinary shortcut. A short tap does
+nothing, but two presses close together (350 ms between the first release
+and the second press, `doublePressMs`) start a hands-free dictation, which
+goes on without the key; a press of any of these shortcuts ends it, and
+Escape cancels it. Only one dictation records at a time, for Wispr or the
+local model, and the one flow bar shows the newest: a press while one
+records ends it (and starts nothing), a press while Wispr's own dictation
+records starts nothing (it stops a hands-free one of Wispr's), and a press
+while one is only being transcribed starts the next one. A local dictation
+also ends after `maxDictationSeconds` (600), or with an error if its model
+server dies. wispr-headless logs what it does, without what was said, to
+`~/Library/Logs/wispr-headless.log` on macOS and
+`$XDG_STATE_HOME/wispr-headless/log` on Linux (1 MB, then one older file).
+On macOS,
 `lib.macWisprFlow` holds Right Option for Wispr and, with `localAsr`, Right
 Command for the local model (`hotkeys` changes that). A `wispr:` shortcut
 drives Wispr through its own push to talk and hands-free, so Wispr shows and
