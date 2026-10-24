@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stand-in for Wispr's helper (named like it, so the shim watches it): sends
 # key events and another message on fd 3 in the helper's framing, and writes
-# what it is sent on stdin to $1. The second part waits for the file $2.
+# what it is sent on stdin to $1. Later parts wait for the files $2 and $22.
 set -eu
 exec 4<&0
 cat <&4 >"$1" &
@@ -25,4 +25,10 @@ key k10 release 59 10
 while [ ! -e "$2" ]; do sleep 0.05; done
 key k11 press 63 11
 key k12 release 63 12
+# A key the daemon hides (165, Right Alt), around one it does not.
+while [ ! -e "${2}2" ]; do sleep 0.05; done
+key k13 press 165 13
+key k14 press 53 14
+key k15 release 53 15
+key k16 release 165 16
 wait

@@ -17,6 +17,7 @@ mkdir -p "$work/app/wispr-shim"
 sed -e "s#@daemon@#$daemon#" -e "s#@pwcat@#/bin/true#" -e "s#@micTarget@##" \
 	-e "s#@captureCmd@##" -e "s#@deviceName@##" -e "s#@playerCmd@##" -e "s#@fontDir@#${WISPR_TEST_FONT_DIR:-}#" \
 	-e "s#@backend@##" -e "s#@asrConfig@##" -e "s#@barColor@##" -e "s#@localBarColor@##" -e "s#@daemonArgs@##" -e "s#@suppressWisprShortcut@#1#" \
+	-e "s#@wisprPushToTalkCode@#131#" -e "s#@wisprHandsFreeCode@#130#" -e "s#@rebindWisprShortcuts@#1#" \
 	"$here/../../shim.js" > "$work/app/wispr-shim/index.js"
 printf '{"name":"wispr-like","main":"wispr-shim/index.js","wisprOriginalMain":"main.js"}\n' > "$work/app/package.json"
 
@@ -28,6 +29,8 @@ node -e '
 
 export WISPR_HEADLESS_TEST_CAPTURE="cat $work/tone.raw"
 export WISPR_HEADLESS_TEST_IDLE_MS=1500
+# Lets the stand-in app play daemon messages (globalThis.wisprHeadlessDaemonEvent).
+export WISPR_HEADLESS_TEST_HOOKS=1
 export XDG_CACHE_HOME="$work/cache"
 unset DISPLAY WAYLAND_DISPLAY
 xvfb-run -a --server-args="-screen 0 1280x800x24" electron "$work/app"
