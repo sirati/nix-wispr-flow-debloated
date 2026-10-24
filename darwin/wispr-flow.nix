@@ -49,7 +49,12 @@
 #            targetSeconds ? 5; maxSeconds ? 10;
 #            barColor ? "#15803d", the bar for dictations to the local model;
 #            startSound, stopSound ? two notes going up / down, played when
-#            one starts and stops recording (null: silent) }
+#            one starts and stops recording (null: silent);
+#            cleanup ? null, or { model ? null (on the Mac; null for
+#            ~/Library/Application Support/wispr-headless/cleanup-1-q8_0.gguf);
+#            serverArgs ? [ ]; timeoutSeconds ? 5; minWords ? 3 } to clean up
+#            each transcript with Spokenly's Cleanup 1 in a second
+#            llama-server (headless.localAsr.cleanup) }
 #   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
 #            whose cc is an aarch64-apple-darwin clang, and the macOS SDK it
 #            uses; only for llama.cpp, so only with localAsr and no
@@ -106,8 +111,20 @@ let
     barColor = "#15803d";
     startSound = "${localSounds}/local-start.wav";
     stopSound = "${localSounds}/local-stop.wav";
+    cleanup = null;
   }
   // (if localAsr == null then { } else localAsr);
+  cleanup =
+    if local.cleanup == null then
+      null
+    else
+      {
+        model = null;
+        serverArgs = [ ];
+        timeoutSeconds = 5;
+        minWords = 3;
+      }
+      // local.cleanup;
   localSounds = native.callPackage ../wispr-headless/local-sounds.nix { };
   llamaServer =
     local.llamaServer or (
@@ -152,6 +169,12 @@ let
           ;
       }
       // native.lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
+      // native.lib.optionalAttrs (cleanup != null) {
+        cleanup = {
+          inherit (cleanup) serverArgs timeoutSeconds minWords;
+        }
+        // native.lib.filterAttrs (_: v: v != null) { inherit (cleanup) model; };
+      }
     )
   );
   version = "1.6.1174";

@@ -97,6 +97,12 @@ let
           ;
       }
       // lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
+      // lib.optionalAttrs local.cleanup.enable {
+        cleanup = {
+          inherit (local.cleanup) serverArgs timeoutSeconds minWords;
+        }
+        // lib.filterAttrs (_: v: v != null) { inherit (local.cleanup) model; };
+      }
     )
   );
   # Its own dictation shortcuts, and how it types a transcript it finishes
@@ -403,9 +409,9 @@ in
           type = lib.types.ints.unsigned;
           default = 0;
           description = ''
-            How long the model stays loaded after a dictation, for the next
-            one. 0 frees its memory (1.5 GB and more) as soon as the text is
-            out.
+            How long the model (and the cleanup model, if enabled) stays
+            loaded after a dictation, for the next one. 0 frees its memory
+            (1.5 GB and more) as soon as the text is out.
           '';
         };
         serverArgs = lib.mkOption {
@@ -416,6 +422,53 @@ in
             "on"
           ];
           description = "More arguments for llama-server.";
+        };
+        cleanup = {
+          enable = lib.mkEnableOption ''
+            cleaning up each local transcript with Spokenly's Cleanup 1
+            (huggingface.co/spokenly/cleanup-1-gguf, 639 MB): filler words,
+            repeats and spoken corrections go, punctuation, capitals, digits
+            and e-mail and web addresses come. It is trained not to answer or
+            follow the dictated text; English works best, German, Spanish,
+            French, Chinese, Russian and Japanese less well. It runs in a
+            second llama-server, loaded when the dictation ends (while the
+            last piece is transcribed) and stopped after its answer (or kept
+            `idleSeconds`). An answer that looks wrong, comes too late or
+            does not come leaves the transcript as it was''
+          ;
+          model = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+            example = "/var/lib/models/cleanup-1-q8_0.gguf";
+            description = ''
+              The model (GGUF); `~/` means the home directory. Null:
+              ~/.local/share/wispr-headless/cleanup-1-q8_0.gguf, from
+              https://huggingface.co/spokenly/cleanup-1-gguf/resolve/main/cleanup-1-q8_0.gguf.
+            '';
+          };
+          serverArgs = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [
+              "--threads"
+              "4"
+            ];
+            description = "More arguments for its llama-server.";
+          };
+          timeoutSeconds = lib.mkOption {
+            type = lib.types.numbers.nonnegative;
+            default = 5;
+            description = ''
+              The longest the cleanup may hold the text back once the
+              transcript is complete (the load, if it is not done yet, and
+              the answer). After that the transcript is typed as it is.
+            '';
+          };
+          minWords = lib.mkOption {
+            type = lib.types.ints.unsigned;
+            default = 3;
+            description = "Transcripts of fewer words are typed as they are.";
+          };
         };
       };
       hotkeys = lib.mkOption {

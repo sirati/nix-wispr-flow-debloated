@@ -55,7 +55,14 @@ model files are not packaged: put `granite-speech-5.0-2b-Q4_K_M.gguf` and
 in `~/.local/share/wispr-headless`, or set `model` and `mmproj`. `keywords`
 names a file of terms to spell as listed. The model works through the
 dictation in pieces of about 5 s while it is spoken (`targetSeconds`,
-`maxSeconds`), so only the last piece is left when it ends. The flow bar is
+`maxSeconds`), so only the last piece is left when it ends.
+`localAsr.cleanup.enable` cleans up each transcript with Spokenly's Cleanup 1
+(`cleanup-1-q8_0.gguf` from huggingface.co/spokenly/cleanup-1-gguf, in the
+same directory or at `cleanup.model`): fillers, repeats and spoken
+corrections go; punctuation, capitals and digits come. It runs in a second
+llama-server that loads while the last piece is transcribed and stops after
+its answer. An answer that looks wrong or takes longer than
+`cleanup.timeoutSeconds` leaves the transcript as Granite wrote it. The flow bar is
 green while a dictation goes to the local model (`localAsr.barColor`) and
 black otherwise (`headless.barColor`).
 

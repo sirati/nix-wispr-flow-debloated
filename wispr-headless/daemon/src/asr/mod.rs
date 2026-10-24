@@ -13,11 +13,21 @@
 //! load, and when the dictation ends only its last few seconds are left. The
 //! texts are joined with spaces.
 //!
+//! With `cleanup` set, the joined text is cleaned up by a second, smaller
+//! model in a llama-server of its own (cleanup.rs). It starts loading when
+//! the dictation ends, while the last piece is transcribed; Granite's server
+//! stops as soon as that piece is done (Granite and the cleanup model are
+//! both in memory only for that while), and the cleanup server after its
+//! answer, `idleSeconds` again keeping either for the next dictation. If
+//! the cleanup fails or its answer looks wrong, the text is typed as Granite
+//! wrote it.
+//!
 //! Use: `Asr::start` when a dictation starts, `Dictation::feed` with its
 //! audio as it arrives, `Dictation::finish` for the text when it ends.
 //! Dropping an unfinished Dictation cancels it. `Dictation::failure` tells
 //! early that it failed (the server died while the user still speaks).
 
+mod cleanup;
 mod prompt;
 mod segment;
 mod server;
@@ -28,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
+use cleanup::{CleanupSettings, Pending};
 use segment::{next_job, Limits, Segmenter, RATE};
 use server::Server;
 
@@ -56,7 +67,7 @@ pub struct Settings {
     /// Read when a dictation starts, so edits apply to the next one.
     #[serde(default)]
     pub keywords: Option<String>,
-    /// How long the model stays loaded after a dictation, for the next.
+    /// How long the models stay loaded after a dictation, for the next.
     #[serde(default)]
     pub idle_seconds: f64,
     /// More arguments for llama-server.
@@ -69,6 +80,10 @@ pub struct Settings {
     /// And cut here, pause or not.
     #[serde(default = "default_max")]
     pub max_seconds: f64,
+    /// Clean up each transcript with a second model (cleanup.rs); without
+    /// this, it is typed as Granite wrote it.
+    #[serde(default)]
+    pub cleanup: Option<CleanupSettings>,
 }
 
 fn default_server() -> String {
@@ -314,14 +329,20 @@ impl Drop for Lease {
 pub struct Asr {
     settings: Arc<Settings>,
     slot: Arc<Slot>,
+    /// The cleanup model's server, handed on the same way.
+    cleanup_slot: Arc<Slot>,
     log: Log,
 }
+
+/// Starts the cleanup of a dictation of so many samples, when it ends.
+type BeginCleanup = Box<dyn FnOnce(usize) -> Pending + Send>;
 
 impl Asr {
     pub fn new(settings: Settings, log: impl Fn(String) + Send + Sync + 'static) -> Asr {
         Asr {
             settings: Arc::new(settings),
             slot: Arc::default(),
+            cleanup_slot: Arc::default(),
             log: Arc::new(log),
         }
     }
@@ -329,10 +350,19 @@ impl Asr {
     /// A dictation starts: the model starts loading now.
     pub fn start(&self) -> Dictation {
         let (settings, slot, log) = (self.settings.clone(), self.slot.clone(), self.log.clone());
+        let cleanup = self.settings.cleanup.is_some().then(|| {
+            let (settings, slot, log) = (
+                self.settings.clone(),
+                self.cleanup_slot.clone(),
+                self.log.clone(),
+            );
+            Box::new(move |samples| Pending::begin(settings, slot, log, samples)) as BeginCleanup
+        });
         Dictation::spawn(
             move |cancelled: &dyn Fn() -> bool| Llama::load(&settings, &slot, &log, cancelled),
             self.settings.limits(),
             self.log.clone(),
+            cleanup,
         )
     }
 }
@@ -369,6 +399,8 @@ pub struct Dictation {
     /// The odd byte of the last feed.
     carry: Option<u8>,
     finished: bool,
+    /// Started when it ends, if the text is to be cleaned up.
+    cleanup: Option<BeginCleanup>,
 }
 
 impl Dictation {
@@ -378,6 +410,7 @@ impl Dictation {
         load: impl FnOnce(&dyn Fn() -> bool) -> Result<E, String> + Send + 'static,
         limits: Limits,
         log: Log,
+        cleanup: Option<BeginCleanup>,
     ) -> Dictation {
         let shared = Arc::new(Shared {
             limits,
@@ -391,9 +424,9 @@ impl Dictation {
         let worker = shared.clone();
         std::thread::spawn(move || {
             let (text, engine) = work(&worker, load, &log);
-            // The text first, then the memory.
-            let _ = tx.send(text);
+            // The memory first, for the cleanup model (stopping is quick).
             drop(engine);
+            let _ = tx.send(text);
         });
         Dictation {
             shared,
@@ -401,6 +434,7 @@ impl Dictation {
             outcome: None,
             carry: None,
             finished: false,
+            cleanup,
         }
     }
 
@@ -427,19 +461,30 @@ impl Dictation {
     }
 
     /// The dictation ended: waits for the rest to be transcribed and returns
-    /// the whole text.
+    /// the whole text, cleaned up if so configured.
     pub fn finish(mut self) -> Result<String, String> {
         self.finished = true;
-        {
+        let total = {
             let mut state = self.shared.state();
             state.ended = Some(Instant::now());
             let total = state.audio.len();
             state.segmenter.finish(total);
-        }
+            total
+        };
         self.shared.wake.notify_all();
-        match self.outcome.take() {
+        // Loads while the last piece is transcribed; dropped (and stopped)
+        // if the transcription fails.
+        let pending = match self.outcome {
+            Some(Err(_)) => None,
+            _ => self.cleanup.take().map(|begin| begin(total)),
+        };
+        let raw = match self.outcome.take() {
             Some(outcome) => outcome,
             None => self.result.recv().unwrap_or_else(|_| Err(stopped())),
+        };
+        match (raw, pending) {
+            (Ok(raw), Some(pending)) => Ok(pending.clean(raw)),
+            (raw, _) => raw,
         }
     }
 
@@ -567,6 +612,7 @@ mod tests {
     use super::segment::tests::{audio, Part::*};
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn bytes(samples: &[i16]) -> Vec<u8> {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
@@ -640,6 +686,7 @@ mod tests {
             },
             Limits::default(),
             Arc::new(|_| {}),
+            None,
         );
         (d, calls)
     }
@@ -751,6 +798,7 @@ mod tests {
             |_: &dyn Fn() -> bool| Err::<Fake, _>("no such model".to_string()),
             Limits::default(),
             Arc::new(|_| {}),
+            None,
         );
         assert_eq!(d.finish().unwrap_err(), "no such model");
     }
@@ -815,6 +863,7 @@ mod tests {
             server_args: Vec::new(),
             target_seconds: 5.0,
             max_seconds: 10.0,
+            cleanup: None,
         }
     }
 
@@ -993,7 +1042,10 @@ mod tests {
             start.elapsed()
         );
         let e = d.failure().unwrap();
-        assert!(e.contains("llama-server ended") && e.contains("out of memory"), "{e}");
+        assert!(
+            e.contains("llama-server ended") && e.contains("out of memory"),
+            "{e}"
+        );
         assert_eq!(d.finish().unwrap_err(), e);
     }
 
@@ -1028,6 +1080,406 @@ mod tests {
             s.mmproj
         );
         assert_eq!(s.idle_seconds, 0.0, "the model is freed at once");
+        assert_eq!(s.cleanup, None, "no cleanup unless asked for");
+        std::fs::write(&path, r#"{"cleanup":{"timeoutSeconds":2}}"#).unwrap();
+        let c = Settings::load(path.to_str().unwrap())
+            .unwrap()
+            .cleanup
+            .unwrap();
+        assert_eq!((c.timeout_seconds, c.min_words), (2.0, 3));
+        assert!(c.model.ends_with("/cleanup-1-q8_0.gguf"), "{}", c.model);
+    }
+
+    /// A stand-in llama-server for both models: it writes its pid to
+    /// `pids/<model>-<pid>` and its socket to `host-<model>`, and waits.
+    /// The test serves the socket. Speech's model is "speech", the cleanup
+    /// model "cleanup".
+    struct Pair {
+        dir: tempfile::TempDir,
+        pids: PathBuf,
+        logged: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Pair {
+        /// `speech`: what Granite's stand-in does once it has said where it
+        /// listens (`exec sleep 30` to wait to be served).
+        fn new(speech: &str) -> Pair {
+            let speech = if speech.is_empty() { ":" } else { speech };
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            std::fs::create_dir(&pids).unwrap();
+            let body = format!(
+                "cd '{d}'\nwhile [ $# -gt 0 ]; do case \"$1\" in --model) model=$2;; \
+                 --host) host=$2;; esac; shift; done\n\
+                 echo $$ > pids/$model-$$\necho \"$host\" > host-$model.new\n\
+                 mv host-$model.new host-$model\n\
+                 if [ \"$model\" = speech ]; then {speech}; fi\nexec sleep 30",
+                d = dir.path().display()
+            );
+            server::tests::script(dir.path(), &body);
+            Pair {
+                dir,
+                pids,
+                logged: Arc::default(),
+            }
+        }
+
+        fn settings(&self, timeout_seconds: f64) -> Settings {
+            Settings {
+                server: self
+                    .dir
+                    .path()
+                    .join("fake-llama-server")
+                    .to_string_lossy()
+                    .into(),
+                model: "speech".into(),
+                mmproj: String::new(),
+                keywords: None,
+                idle_seconds: 0.0,
+                server_args: Vec::new(),
+                target_seconds: 5.0,
+                max_seconds: 10.0,
+                cleanup: Some(CleanupSettings {
+                    model: "cleanup".into(),
+                    server_args: Vec::new(),
+                    timeout_seconds,
+                    min_words: 3,
+                }),
+            }
+        }
+
+        fn asr(&self, settings: Settings) -> Asr {
+            let logged = self.logged.clone();
+            Asr::new(settings, move |m| logged.lock().unwrap().push(m))
+        }
+
+        /// Where the server of `model` listens, once it has started.
+        fn socket(&self, model: &str) -> PathBuf {
+            let path = self.dir.path().join(format!("host-{model}"));
+            let mut text = String::new();
+            wait_for(&format!("the {model} server"), || {
+                text = std::fs::read_to_string(&path).unwrap_or_default();
+                text.ends_with('\n')
+            });
+            PathBuf::from(text.trim_end())
+        }
+
+        fn started(&self, model: &str) -> bool {
+            self.dir.path().join(format!("host-{model}")).exists()
+        }
+
+        /// How many servers of `model` run, and how many started.
+        fn running(&self, model: &str) -> (usize, usize) {
+            let pids: Vec<i32> = std::fs::read_dir(&self.pids)
+                .unwrap()
+                .filter_map(|e| {
+                    let name = e.ok()?.file_name().into_string().ok()?;
+                    name.strip_prefix(&format!("{model}-"))?.parse().ok()
+                })
+                .collect();
+            let alive = pids.iter().filter(|&&p| server::tests::alive(p)).count();
+            (alive, pids.len())
+        }
+
+        fn log(&self) -> String {
+            self.logged.lock().unwrap().join("\n")
+        }
+
+        fn none_left(&self) {
+            wait_for("every server to go", || {
+                self.running("speech").0 == 0 && self.running("cleanup").0 == 0
+            });
+        }
+    }
+
+    fn reply(body: &str) -> String {
+        server::tests::answer("200 OK", body)
+    }
+
+    /// Answers Granite's requests: `text` for a piece, after `before_piece`.
+    fn speech_answers(
+        text: &'static str,
+        before_piece: impl Fn() + Send + Sync + 'static,
+    ) -> impl Fn(&[u8]) -> String + Send + Sync + 'static {
+        move |req| {
+            let all = String::from_utf8_lossy(req);
+            if all.starts_with("GET /health") {
+                reply("{}")
+            } else if all.starts_with("POST /tokenize") {
+                reply(r#"{"tokens":[1,2]}"#)
+            } else if all.contains("name=\"max_tokens\"\r\n\r\n1\r\n") {
+                // The prompt, primed.
+                reply(r#"{"text":""}"#)
+            } else {
+                before_piece();
+                reply(&serde_json::json!({ "text": text }).to_string())
+            }
+        }
+    }
+
+    /// Answers the cleanup model's requests: `answer` (/completion's JSON)
+    /// after `before`.
+    fn cleanup_answers(
+        answer: &'static str,
+        before: impl Fn() + Send + Sync + 'static,
+    ) -> impl Fn(&[u8]) -> String + Send + Sync + 'static {
+        move |req| {
+            let all = String::from_utf8_lossy(req);
+            if all.starts_with("GET /health") {
+                reply("{}")
+            } else if all.starts_with("POST /tokenize") {
+                reply(r#"{"tokens":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}"#)
+            } else {
+                before();
+                reply(answer)
+            }
+        }
+    }
+
+    const RAW: &str = "so we we should meet at three no at four tomorrow";
+    const CLEAN: &str =
+        r#"{"content":" So we should meet at 4 tomorrow.","stop_type":"eos","tokens_predicted":9}"#;
+
+    /// A dictation of a second and a half with the stand-ins: Granite
+    /// answers RAW, the cleanup model `answer` after `delay`. Returns what
+    /// finish gave.
+    fn clean_with(
+        pair: &Pair,
+        settings: Settings,
+        answer: Option<&'static str>,
+        delay: Duration,
+    ) -> Result<String, String> {
+        let asr = pair.asr(settings);
+        let mut d = asr.start();
+        server::tests::serve_on(&pair.socket("speech"), speech_answers(RAW, || {}));
+        if let Some(answer) = answer {
+            let (dir, pids) = (pair.dir.path().to_path_buf(), pair.pids.clone());
+            std::thread::spawn(move || {
+                let host = dir.join("host-cleanup");
+                while !host.exists() && pids.exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let socket = std::fs::read_to_string(&host).unwrap_or_default();
+                if socket.ends_with('\n') {
+                    let socket = PathBuf::from(socket.trim_end());
+                    server::tests::serve_on(
+                        &socket,
+                        cleanup_answers(answer, move || std::thread::sleep(delay)),
+                    );
+                }
+            });
+        }
+        d.feed(&bytes(&audio(&[Speech(1_500)])));
+        d.finish()
+    }
+
+    #[test]
+    fn cleanup_loads_during_the_last_piece_and_its_text_is_typed() {
+        let _one = server::one_at_a_time();
+        let pair = Pair::new("");
+        let asr = pair.asr(pair.settings(5.0));
+        let mut d = asr.start();
+        // The last piece takes until the cleanup server has started: it
+        // started when the dictation ended, not after the piece.
+        let overlapped = Arc::new(AtomicBool::new(false));
+        let (o, dir) = (overlapped.clone(), pair.dir.path().to_path_buf());
+        server::tests::serve_on(
+            &pair.socket("speech"),
+            speech_answers(RAW, move || {
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(5) {
+                    if dir.join("host-cleanup").exists() {
+                        o.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }),
+        );
+        d.feed(&bytes(&audio(&[Speech(1_500)])));
+        assert!(!pair.started("cleanup"), "nothing to clean yet");
+        let finished = std::thread::spawn(move || d.finish());
+        // Granite's server has stopped by the time the cleanup is asked
+        // (killed: allow a moment for the kill to land, under load).
+        let speech_left = Arc::new(Mutex::new(None));
+        let (left, pids) = (speech_left.clone(), pair.pids.clone());
+        let speech_running = move || {
+            std::fs::read_dir(&pids)
+                .unwrap()
+                .filter_map(|e| {
+                    let name = e.ok()?.file_name().into_string().ok()?;
+                    name.strip_prefix("speech-")?.parse::<i32>().ok()
+                })
+                .filter(|&p| server::tests::alive(p))
+                .count()
+        };
+        let asked = server::tests::serve_on(
+            &pair.socket("cleanup"),
+            cleanup_answers(CLEAN, move || {
+                let mut n = speech_running();
+                for _ in 0..20 {
+                    if n == 0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                    n = speech_running();
+                }
+                *left.lock().unwrap() = Some(n);
+            }),
+        );
+        let text = finished.join().unwrap().unwrap();
+        assert_eq!(text, "So we should meet at 4 tomorrow.");
+        assert!(
+            overlapped.load(Ordering::Relaxed),
+            "loaded while transcribing"
+        );
+        assert_eq!(
+            *speech_left.lock().unwrap(),
+            Some(0),
+            "Granite was stopped first"
+        );
+        let completion = std::iter::from_fn(|| asked.try_recv().ok())
+            .map(|r| String::from_utf8_lossy(&r).into_owned())
+            .find(|r| r.starts_with("POST /completion"))
+            .expect("asked for a completion");
+        let body = &completion[completion.find("\r\n\r\n").unwrap() + 4..];
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["prompt"], format!("text: {RAW}\nout:"));
+        assert_eq!(v["temperature"], 0);
+        assert_eq!(v["n_predict"], 15 * 3 / 2 + 16);
+        assert!(
+            pair.log().contains(RAW),
+            "the raw text is logged: {}",
+            pair.log()
+        );
+        pair.none_left();
+        assert_eq!(pair.running("cleanup").1, 1);
+    }
+
+    #[test]
+    fn a_slow_cleanup_gives_the_raw_text_in_time() {
+        let _one = server::one_at_a_time();
+        let pair = Pair::new("");
+        let start = Instant::now();
+        let text = clean_with(
+            &pair,
+            pair.settings(0.5),
+            Some(CLEAN),
+            Duration::from_secs(3),
+        );
+        assert_eq!(text.unwrap(), RAW);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(
+            pair.log().contains("no answer within 0.5 s"),
+            "{}",
+            pair.log()
+        );
+        pair.none_left();
+    }
+
+    #[test]
+    fn a_cleanup_model_that_never_loads_gives_the_raw_text() {
+        let _one = server::one_at_a_time();
+        let pair = Pair::new("");
+        let text = clean_with(&pair, pair.settings(0.3), None, Duration::ZERO);
+        assert_eq!(text.unwrap(), RAW);
+        assert!(pair.log().contains("still loading"), "{}", pair.log());
+        assert_eq!(pair.running("cleanup").1, 1, "it was started");
+        pair.none_left();
+    }
+
+    #[test]
+    fn bad_answers_give_the_raw_text() {
+        let _one = server::one_at_a_time();
+        for (answer, why) in [
+            (
+                r#"{"content":" Sure! Here is the cleaned text: we meet at 4.","stop_type":"eos"}"#,
+                "reply",
+            ),
+            (r#"{"content":"   ","stop_type":"eos"}"#, "empty"),
+            (
+                r#"{"content":" So we should meet at 4 tomorrow. So we","stop_type":"limit"}"#,
+                "limit",
+            ),
+            (
+                r#"{"content":" The weather tomorrow will be sunny and warm.","stop_type":"eos"}"#,
+                "words",
+            ),
+            (r#"{"error":{"message":"out of cheese"}}"#, "out of cheese"),
+        ] {
+            let pair = Pair::new("");
+            let text = clean_with(&pair, pair.settings(5.0), Some(answer), Duration::ZERO);
+            assert_eq!(text.unwrap(), RAW, "{answer}");
+            assert!(pair.log().contains(why), "{why}: {}", pair.log());
+            pair.none_left();
+        }
+    }
+
+    #[test]
+    fn short_texts_are_not_cleaned() {
+        let _one = server::one_at_a_time();
+        let pair = Pair::new("");
+        let asr = pair.asr(pair.settings(5.0));
+        let mut d = asr.start();
+        server::tests::serve_on(&pair.socket("speech"), speech_answers("Yes.", || {}));
+        d.feed(&bytes(&audio(&[Speech(500)])));
+        assert_eq!(d.finish().unwrap(), "Yes.");
+        assert!(pair.log().contains("skipped, 1 words"), "{}", pair.log());
+        pair.none_left();
+    }
+
+    #[test]
+    fn a_failed_transcription_is_not_cleaned_and_stops_both() {
+        let _one = server::one_at_a_time();
+        let pair = Pair::new("sleep 0.3; echo 'error: no such model'; exit 1");
+        let asr = pair.asr(pair.settings(5.0));
+        let mut d = asr.start();
+        d.feed(&bytes(&audio(&[Speech(1_000)])));
+        let e = d.finish().unwrap_err();
+        assert!(e.contains("no such model"), "{e}");
+        pair.none_left();
+    }
+
+    #[test]
+    fn there_is_never_more_than_one_server_of_each_kind() {
+        let _one = server::one_at_a_time();
+        // Granite fails after a while; the cleanup model never loads.
+        let pair = Arc::new(Pair::new("sleep 0.2; exit 1"));
+        let asr = Arc::new(pair.asr(pair.settings(5.0)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor = {
+            let (pair, stop) = (pair.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut speech, mut cleanup) = (0, 0);
+                while !stop.load(Ordering::Relaxed) {
+                    speech = pair.running("speech").0.max(speech);
+                    cleanup = pair.running("cleanup").0.max(cleanup);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                (speech, cleanup)
+            })
+        };
+        let finishing: Vec<_> = (0..12)
+            .map(|i| {
+                let mut d = asr.start();
+                d.feed(&bytes(&audio(&[Speech(300)])));
+                std::thread::sleep(Duration::from_millis(30 * (i % 4)));
+                std::thread::spawn(move || d.finish())
+            })
+            .collect();
+        for f in finishing {
+            assert!(f.join().unwrap().is_err());
+        }
+        pair.none_left();
+        stop.store(true, Ordering::Relaxed);
+        let (speech, cleanup) = monitor.join().unwrap();
+        assert!(pair.running("cleanup").1 > 1, "cleanup servers started");
+        assert!(speech <= 1, "{speech} speech servers at once");
+        assert!(cleanup <= 1, "{cleanup} cleanup servers at once");
     }
 
     /// The samples of a 16-bit mono WAV file.
@@ -1070,6 +1522,7 @@ mod tests {
             server_args: Vec::new(),
             target_seconds: 5.0,
             max_seconds: 10.0,
+            cleanup: None,
         };
         let speed: f64 = std::env::var("WISPR_ASR_SPEED")
             .ok()
@@ -1131,6 +1584,7 @@ mod tests {
             server_args: Vec::new(),
             target_seconds: 30.0,
             max_seconds: 30.0,
+            cleanup: None,
         };
         let keywords = std::env::var("WISPR_ASR_KEYWORDS")
             .ok()

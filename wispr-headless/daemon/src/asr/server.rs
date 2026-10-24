@@ -13,8 +13,10 @@
 //! that from happening, so it is not the only way. The script exits when the
 //! server does, which is how a server that dies is noticed.
 //!
-//! There is at most one server per process: Slot (mod.rs) hands it from
-//! dictation to dictation, and `Server::spawn` stops any other it finds.
+//! There is at most one server of each Kind per process: Slot (mod.rs)
+//! hands it from dictation to dictation, and spawning one stops any other
+//! of its kind it finds. The speech model's server and the cleanup model's
+//! (cleanup.rs) may run at the same time.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -31,6 +33,24 @@ use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 
 use super::Settings;
+
+/// Which model a server has; there is at most one server of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Granite Speech, with its audio encoder.
+    Speech = 0,
+    /// The text model that cleans up the transcript (cleanup.rs).
+    Cleanup = 1,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Speech => "llama-server",
+            Kind::Cleanup => "the cleanup llama-server",
+        }
+    }
+}
 
 /// Runs the server ("$@") and kills it when stdin closes. A background
 /// list reads /dev/null unless told otherwise, hence fd 3.
@@ -63,6 +83,15 @@ pub struct Server {
     log: Arc<Mutex<VecDeque<String>>>,
     /// Tokens of context it was started with.
     pub context: u32,
+    kind: Kind,
+}
+
+/// What `Server::complete` got back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    pub text: String,
+    /// It stopped at `n_predict` tokens rather than at the end of the text.
+    pub at_limit: bool,
 }
 
 /// The watchdog's process group: the watchdog, llama-server and anything
@@ -116,17 +145,18 @@ impl Group {
     }
 }
 
-/// The groups of all servers this process started that may still have a
-/// process, stopped or not.
-static GROUPS: Mutex<Vec<Arc<Group>>> = Mutex::new(Vec::new());
-/// One spawn at a time, so two never miss each other.
-static SPAWNING: Mutex<()> = Mutex::new(());
+/// For each Kind, the groups of all servers of that kind this process
+/// started that may still have a process, stopped or not.
+static GROUPS: [Mutex<Vec<Arc<Group>>>; 2] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
+/// One spawn of each kind at a time, so two never miss each other.
+static SPAWNING: [Mutex<()>; 2] = [Mutex::new(()), Mutex::new(())];
 
-/// Kills the servers still running, as there is to be only one, and waits
-/// a little for them and for those stopped before to go.
-fn stop_others(log: &dyn Fn(String)) {
+/// Kills the servers of `kind` still running, as there is to be only one,
+/// and waits a little for them and for those stopped before to go.
+fn stop_others(kind: Kind, log: &dyn Fn(String)) {
+    let groups = &GROUPS[kind as usize];
     let others: Vec<Arc<Group>> = {
-        let mut groups = lock(&GROUPS);
+        let mut groups = lock(groups);
         groups.retain(|g| !g.gone());
         groups.clone()
     };
@@ -136,7 +166,8 @@ fn stop_others(log: &dyn Fn(String)) {
     let running = others.iter().filter(|g| !g.killed()).count();
     if running > 0 {
         log(format!(
-            "stopping {running} llama-server still running before starting another"
+            "stopping {running} {} still running before starting another",
+            kind.name()
         ));
     }
     for g in &others {
@@ -146,14 +177,15 @@ fn stop_others(log: &dyn Fn(String)) {
     while others.iter().any(|g| !g.gone()) {
         if Instant::now() > deadline {
             log(format!(
-                "an old llama-server is still there after {} s; starting another anyway",
+                "an old {} is still there after {} s; starting another anyway",
+                kind.name(),
                 STOP_PATIENCE.as_secs()
             ));
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    lock(&GROUPS).retain(|g| !g.gone());
+    lock(groups).retain(|g| !g.gone());
 }
 
 /// Tests that start servers, one at a time: a start stops the others.
@@ -188,77 +220,121 @@ fn private_dir() -> Result<PathBuf, String> {
 }
 
 impl Server {
-    /// Starts loading the model; `ready` waits for it. Stops any other
-    /// server first.
+    /// Starts loading Granite Speech; `ready` waits for it. Stops any other
+    /// speech server first.
     pub fn spawn(
         settings: &Settings,
         context: u32,
         log: &dyn Fn(String),
     ) -> Result<Server, String> {
-        let _one = lock(&SPAWNING);
-        stop_others(log);
-        let dir = private_dir()?;
-        let socket = dir.join("llama.sock");
-        let program = expand(&settings.server);
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(WATCHDOG)
-            .arg("sh")
-            .arg(&program)
-            .arg("--model")
-            .arg(expand(&settings.model))
-            .arg("--mmproj")
-            .arg(expand(&settings.mmproj))
-            .arg("--host")
-            .arg(&socket)
-            // Ignored for a socket, but must not be 0.
-            .args(["--port", "1"])
-            .args(["--ctx-size", &context.to_string()])
-            .args(["--parallel", "1", "--n-gpu-layers", "99", "--temp", "0"])
-            // Warming up only delays the first request; no copies of the
-            // prompt cache in RAM (one slot keeps its own).
-            .args(["--no-warmup", "--cache-ram", "0"])
-            .args(&settings.server_args)
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("cannot run {program}: {e}", program = program.display()))?;
-        let log = Arc::new(Mutex::new(VecDeque::new()));
-        if let Some(out) = child.stdout.take() {
-            let log = log.clone();
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines() {
-                    let Ok(line) = line else { break };
-                    let mut log = log.lock().expect("log lock poisoned");
-                    if log.len() == LOG_LINES {
-                        log.pop_front();
-                    }
-                    log.push_back(line);
-                }
-            });
-        }
-        let stdin = child.stdin.take();
-        let group = Arc::new(Group {
-            pgid: Pid::from_raw(child.id() as i32),
-            watchdog: Mutex::new(Watchdog {
-                child,
-                status: None,
-                killed: false,
-            }),
-        });
-        lock(&GROUPS).push(group.clone());
-        Ok(Server {
-            group,
-            stdin,
-            dir,
-            socket,
-            log,
+        let model = [
+            "--model".into(),
+            expand(&settings.model),
+            "--mmproj".into(),
+            expand(&settings.mmproj),
+        ];
+        launch(
+            Kind::Speech,
+            &settings.server,
+            &model,
+            &settings.server_args,
             context,
-        })
+            log,
+        )
     }
 
+    /// Starts loading the cleanup model (`settings.cleanup`, which must be
+    /// set) with the same llama-server. Stops any other cleanup server first.
+    pub fn spawn_cleanup(
+        settings: &Settings,
+        context: u32,
+        log: &dyn Fn(String),
+    ) -> Result<Server, String> {
+        let cleanup = settings.cleanup.as_ref().ok_or("no cleanup model")?;
+        launch(
+            Kind::Cleanup,
+            &settings.server,
+            &["--model".into(), expand(&cleanup.model)],
+            &cleanup.server_args,
+            context,
+            log,
+        )
+    }
+}
+
+/// Starts llama-server (`program`) with `model` (its arguments) under the
+/// watchdog, after stopping any other server of `kind`.
+fn launch(
+    kind: Kind,
+    program: &str,
+    model: &[PathBuf],
+    more: &[String],
+    context: u32,
+    log: &dyn Fn(String),
+) -> Result<Server, String> {
+    let _one = lock(&SPAWNING[kind as usize]);
+    stop_others(kind, log);
+    let dir = private_dir()?;
+    let socket = dir.join("llama.sock");
+    let program = expand(program);
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(WATCHDOG)
+        .arg("sh")
+        .arg(&program)
+        .args(model)
+        .arg("--host")
+        .arg(&socket)
+        // Ignored for a socket, but must not be 0.
+        .args(["--port", "1"])
+        .args(["--ctx-size", &context.to_string()])
+        .args(["--parallel", "1", "--n-gpu-layers", "99", "--temp", "0"])
+        // Warming up only delays the first request; no copies of the
+        // prompt cache in RAM (one slot keeps its own).
+        .args(["--no-warmup", "--cache-ram", "0"])
+        .args(more)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {program}: {e}", program = program.display()))?;
+    let log = Arc::new(Mutex::new(VecDeque::new()));
+    if let Some(out) = child.stdout.take() {
+        let log = log.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { break };
+                let mut log = log.lock().expect("log lock poisoned");
+                if log.len() == LOG_LINES {
+                    log.pop_front();
+                }
+                log.push_back(line);
+            }
+        });
+    }
+    let stdin = child.stdin.take();
+    let group = Arc::new(Group {
+        pgid: Pid::from_raw(child.id() as i32),
+        watchdog: Mutex::new(Watchdog {
+            child,
+            status: None,
+            killed: false,
+        }),
+    });
+    lock(&GROUPS[kind as usize]).push(group.clone());
+    Ok(Server {
+        group,
+        stdin,
+        dir,
+        socket,
+        log,
+        context,
+        kind,
+    })
+}
+
+impl Server {
     /// Why the server is gone, if it is: its exit status and last lines.
     pub fn ended(&mut self) -> Option<String> {
         let status = self.group.exited()?;
@@ -307,6 +383,11 @@ impl Server {
 
     /// How many tokens `text` takes.
     pub fn tokens(&self, text: &str) -> Result<u32, String> {
+        self.tokens_within(text, REQUEST_PATIENCE)
+    }
+
+    /// The same, giving up after `patience`.
+    pub fn tokens_within(&self, text: &str, patience: Duration) -> Result<u32, String> {
         let body = serde_json::json!({ "content": text }).to_string();
         let (status, body) = exchange(
             &self.socket,
@@ -314,7 +395,7 @@ impl Server {
             "/tokenize",
             Some("application/json"),
             body.as_bytes(),
-            REQUEST_PATIENCE,
+            patience,
         )?;
         let v: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| format!("tokenize: bad answer ({status}): {e}"))?;
@@ -333,6 +414,56 @@ impl Server {
     ) -> Result<String, String> {
         transcribe(&self.socket, pcm, prompt, max_tokens).map_err(|e| self.ended().unwrap_or(e))
     }
+
+    /// Greedy continuation of `prompt` (llama-server's `/completion`), at
+    /// most `n_predict` tokens, giving up after `patience`.
+    pub fn complete(
+        &mut self,
+        prompt: &str,
+        n_predict: u32,
+        patience: Duration,
+    ) -> Result<Completion, String> {
+        complete(&self.socket, prompt, n_predict, patience).map_err(|e| self.ended().unwrap_or(e))
+    }
+}
+
+/// `/completion` with a plain-text prompt and greedy decoding.
+fn complete(
+    socket: &Path,
+    prompt: &str,
+    n_predict: u32,
+    patience: Duration,
+) -> Result<Completion, String> {
+    let body = serde_json::json!({
+        "prompt": prompt,
+        "n_predict": n_predict,
+        "temperature": 0,
+        "cache_prompt": false,
+    })
+    .to_string();
+    let (status, body) = exchange(
+        socket,
+        "POST",
+        "/completion",
+        Some("application/json"),
+        body.as_bytes(),
+        patience,
+    )?;
+    let v: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| format!("completion: bad answer ({status}): {e}"))?;
+    match (status, v["content"].as_str()) {
+        (200, Some(text)) => Ok(Completion {
+            text: text.to_string(),
+            at_limit: v["stop_type"] == "limit"
+                || v["tokens_predicted"]
+                    .as_u64()
+                    .is_some_and(|n| n >= u64::from(n_predict)),
+        }),
+        _ => Err(format!(
+            "completion failed ({status}): {}",
+            v["error"]["message"].as_str().unwrap_or("no message")
+        )),
+    }
 }
 
 impl Drop for Server {
@@ -341,14 +472,14 @@ impl Drop for Server {
         drop(self.stdin.take());
         self.group.kill();
         // Reap the watchdog without making the caller wait.
-        let group = self.group.clone();
+        let (group, kind) = (self.group.clone(), self.kind);
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !group.gone() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
             if group.gone() {
-                lock(&GROUPS).retain(|g| !Arc::ptr_eq(g, &group));
+                lock(&GROUPS[kind as usize]).retain(|g| !Arc::ptr_eq(g, &group));
             }
         });
     }
@@ -435,7 +566,8 @@ pub fn wav(pcm: &[i16]) -> Vec<u8> {
     out
 }
 
-/// One request on a new connection: the status and body of the answer.
+/// One request on a new connection: the status and body of the answer,
+/// within `patience` in all.
 fn exchange(
     socket: &Path,
     method: &str,
@@ -459,8 +591,22 @@ fn exchange(
     let io = |e: std::io::Error| format!("llama-server {path}: {e}");
     stream.write_all(head.as_bytes()).map_err(io)?;
     stream.write_all(body).map_err(io)?;
+    let deadline = Instant::now() + patience;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(io)?;
+    let mut buf = [0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("llama-server {path}: no answer in {patience:.1?}"));
+        }
+        let _ = stream.set_read_timeout(Some(left));
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
     parse_response(&raw)
 }
 
@@ -610,33 +756,48 @@ pub mod tests {
     /// Listens on `socket`, answers each request with `answer` and hands
     /// what it got to the test.
     pub fn answer_on(socket: &Path, answer: String) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        serve_on(socket, move |_| answer.clone())
+    }
+
+    /// Listens on `socket`, answers each request with what `answer` makes
+    /// of it (on a thread of its own, so it may take its time) and hands
+    /// what it got to the test.
+    pub fn serve_on(
+        socket: &Path,
+        answer: impl Fn(&[u8]) -> String + Send + Sync + 'static,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let answer = Arc::new(answer);
         let listener = UnixListener::bind(socket).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut s) = stream else { break };
-                // Read the head, then as much body as it announces.
-                let mut got = Vec::new();
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = s.read(&mut buf) {
-                    got.extend_from_slice(&buf[..n]);
-                    if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
-                        let len: usize = head
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .map(|v| v.trim().parse().unwrap())
-                            .unwrap_or(0);
-                        if got.len() >= end + 4 + len {
+                let (tx, answer) = (tx.clone(), answer.clone());
+                std::thread::spawn(move || {
+                    // Read the head, then as much body as it announces.
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf) {
+                        got.extend_from_slice(&buf[..n]);
+                        if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&got[..end]).to_lowercase();
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .map(|v| v.trim().parse().unwrap())
+                                .unwrap_or(0);
+                            if got.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                        if n == 0 {
                             break;
                         }
                     }
-                    if n == 0 {
-                        break;
-                    }
-                }
-                let _ = tx.send(got);
-                let _ = s.write_all(answer.as_bytes());
+                    let reply = answer(&got);
+                    let _ = tx.send(got);
+                    let _ = s.write_all(reply.as_bytes());
+                });
             }
         });
         rx
@@ -683,6 +844,7 @@ pub mod tests {
             server_args: Vec::new(),
             target_seconds: 5.0,
             max_seconds: 10.0,
+            cleanup: None,
         }
     }
 
@@ -718,7 +880,11 @@ pub mod tests {
     /// The pid a stand-in server wrote to `path`.
     fn pid_in(path: &Path) -> i32 {
         for _ in 0..1_000 {
-            if let Ok(pid) = std::fs::read_to_string(path).unwrap_or_default().trim().parse() {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .trim()
+                .parse()
+            {
                 return pid;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -804,7 +970,12 @@ pub mod tests {
         let _two = Server::spawn(&s, 1_024, &|m| logged.lock().unwrap().push(m)).unwrap();
         assert!(!alive(first), "the first server was stopped first");
         assert!(alive(pid_in(&second)));
-        assert_eq!(logged.lock().unwrap().len(), 1, "{:?}", logged.lock().unwrap());
+        assert_eq!(
+            logged.lock().unwrap().len(),
+            1,
+            "{:?}",
+            logged.lock().unwrap()
+        );
         assert!(one.ended().is_some(), "the first one knows");
     }
 
