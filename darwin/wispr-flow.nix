@@ -35,6 +35,13 @@
 #   user     the macOS user who runs Wispr
 #   signingIdentity  name of the local code-signing certificate; created on
 #            first activation, and kept so macOS keeps Wispr's permissions
+#   localAsr transcription on the Mac for the dictations wispr-headless
+#            starts itself (see programs.wisprFlow.headless.localAsr in
+#            ../wispr-flow.nix for the meaning of each): { llamaServer, the
+#            path of an aarch64-darwin llama-server (b11852 or later);
+#            backend ? "local"; model, mmproj, keywords ? null (paths on the
+#            Mac; null for the daemon's defaults in ~/Library/Application
+#            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ]; }
 {
   native,
   builders,
@@ -42,8 +49,28 @@
   daemon,
   user,
   signingIdentity ? "Wispr Flow local code signing (Nix)",
+  localAsr ? null,
 }:
 let
+  local = {
+    backend = "local";
+    model = null;
+    mmproj = null;
+    keywords = null;
+    idleSeconds = 0;
+    serverArgs = [ ];
+  }
+  // (if localAsr == null then { } else localAsr);
+  # wispr-headless/daemon/src/asr/mod.rs, Settings.
+  asrConfig = native.writeText "wispr-headless-asr.json" (
+    builtins.toJSON (
+      {
+        server = local.llamaServer;
+        inherit (local) idleSeconds serverArgs;
+      }
+      // native.lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
+    )
+  );
   version = "1.6.1174";
   release = native.fetchurl {
     name = "wispr-flow-darwin-arm64-${version}.zip";
@@ -69,6 +96,8 @@ let
     # The bar uses the system font.
     fontDir = "";
     playerCmd = "/usr/bin/afplay";
+    backend = native.lib.optionalString (localAsr != null) local.backend;
+    asrConfig = native.lib.optionalString (localAsr != null) "${asrConfig}";
   };
 
   profile = "/nix/var/nix/profiles/mac-wispr-flow";

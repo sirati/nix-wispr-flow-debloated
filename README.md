@@ -41,6 +41,17 @@ text through the input method instead. Other desktops work without it.
 `services.dictationButtons` turns mouse or headset buttons into a dictation
 key.
 
+`headless.localAsr` transcribes on the machine instead of in Wispr's
+service, with IBM's Granite Speech 5.0 (2B) through llama.cpp's
+llama-server. It applies to the dictations wispr-headless starts itself
+(its `dictate` command); Wispr's own shortcut still goes to Wispr. The model
+loads when such a dictation starts and is freed once its text is out. The
+model files are not packaged: put `granite-speech-5.0-2b-Q4_K_M.gguf` and
+`mmproj-model-q4_k-convdw-f32.gguf` (the encoder, quantized with
+`llama-quantize --tensor-type conv_dw=f32 mmproj-model-f16.gguf <out> Q4_K`)
+in `~/.local/share/wispr-headless`, or set `model` and `mmproj`. `keywords`
+names a file of terms to spell as listed.
+
 On macOS, `lib.macWisprFlow` cross-builds the app on Linux. The caller
 provides an Apple SDK toolchain:
 
@@ -51,6 +62,9 @@ wispr-flow-debloated.lib.macWisprFlow {
   darwin = import nixpkgs { system = "aarch64-darwin"; };
   daemon = crossRustPlatformPackage ./wispr-headless/daemon;
   user = "alice";           # the macOS user who runs Wispr
+  # Optional: local transcription, models in
+  # ~/Library/Application Support/wispr-headless.
+  localAsr.llamaServer = "${llamaCppForMac}/bin/llama-server";
 }
 ```
 
@@ -64,5 +78,8 @@ certificate keeps them for later versions.
 
     nix flake check
     cd wispr-headless/daemon && cargo test
+    # Local transcription with the real model, in real time:
+    WISPR_ASR_SERVER=.../llama-server WISPR_ASR_MODEL=... WISPR_ASR_MMPROJ=... \
+      WISPR_ASR_WAVS=a.wav:b.wav cargo test real_model -- --ignored --nocapture
     wispr-headless/tests/electron/run.sh <wispr-headless binary>
     tests/ime-vm/run-wispr-ime.sh

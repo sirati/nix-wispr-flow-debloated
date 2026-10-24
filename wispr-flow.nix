@@ -80,12 +80,26 @@ let
   patchDir = "${wispr-flow-linux}/scripts/patches";
 
   headlessDaemon = pkgs.callPackage ./wispr-headless/daemon { };
+  local = cfg.headless.localAsr;
+  # wispr-headless/daemon/src/asr/mod.rs, Settings; unset paths take the
+  # daemon's defaults.
+  asrConfig = pkgs.writeText "wispr-headless-asr.json" (
+    builtins.toJSON (
+      {
+        server = lib.getExe' local.llamaCpp "llama-server";
+        inherit (local) idleSeconds serverArgs;
+      }
+      // lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
+    )
+  );
   headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
     micTarget = cfg.headless.micTarget;
     # The flow bar's text: Figtree, the font of Wispr's own page.
     fontDir = "${pkgs.figtree}/share/fonts/truetype";
+    backend = lib.optionalString local.enable local.backend;
+    asrConfig = lib.optionalString local.enable "${asrConfig}";
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -203,6 +217,84 @@ in
           PipeWire node to record dictation from; empty for the default
           input. Wispr's own microphone setting does not apply here.
         '';
+      };
+
+      localAsr = {
+        enable = lib.mkEnableOption ''
+          transcribing the dictations wispr-headless starts itself (its
+          `dictate` command) with IBM's Granite Speech on this machine,
+          through llama.cpp, instead of Wispr's service. The model is loaded
+          when such a dictation starts and freed after it. Dictations Wispr
+          starts (its own shortcut) still go to Wispr''
+        ;
+        backend = lib.mkOption {
+          type = lib.types.enum [
+            "local"
+            "wispr"
+          ];
+          default = "local";
+          description = ''
+            Where the dictations wispr-headless starts itself go, unless one
+            names its own: the local model, or Wispr (through its bar's start
+            and stop buttons).
+          '';
+        };
+        llamaCpp = lib.mkOption {
+          type = lib.types.package;
+          description = ''
+            llama.cpp with its llama-server, build b11852 or later (older
+            ones lack Granite Speech's chat template).
+          '';
+        };
+        model = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "/var/lib/models/granite-speech-5.0-2b-Q4_K_M.gguf";
+          description = ''
+            Granite Speech 5.0's language model (GGUF); `~/` means the home
+            directory. Null: ~/.local/share/wispr-headless/granite-speech-5.0-2b-Q4_K_M.gguf.
+          '';
+        };
+        mmproj = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = ''
+            Its audio encoder (GGUF). Null:
+            ~/.local/share/wispr-headless/mmproj-model-q4_k-convdw-f32.gguf,
+            the F16 encoder quantized with `llama-quantize --tensor-type
+            conv_dw=f32 mmproj-model-f16.gguf <out> Q4_K` (318 MB). The
+            depthwise convolutions must stay F32: llama.cpp aborts on F16 ones.
+          '';
+        };
+        keywords = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          example = "~/.config/wispr-flow/keywords.txt";
+          description = ''
+            File of terms the transcription should spell as listed (names,
+            jargon), one per line or separated by commas; up to about 2000.
+            Read when each dictation starts, so edits need no rebuild. A long
+            list makes the model's context, and its memory, bigger.
+          '';
+        };
+        idleSeconds = lib.mkOption {
+          type = lib.types.ints.unsigned;
+          default = 0;
+          description = ''
+            How long the model stays loaded after a dictation, for the next
+            one. 0 frees its memory (1.5 GB and more) as soon as the text is
+            out.
+          '';
+        };
+        serverArgs = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [
+            "--flash-attn"
+            "on"
+          ];
+          description = "More arguments for llama-server.";
+        };
       };
     };
 
