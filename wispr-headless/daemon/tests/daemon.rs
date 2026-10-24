@@ -288,6 +288,30 @@ fn a_dictation_of_our_own_for_wispr_clicks_its_start_and_stop() {
 }
 
 #[test]
+fn a_cancelled_dictation_for_wispr_clicks_its_cancel() {
+    let mut d = Daemon::start("true");
+    d.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    assert_eq!(d.next_op("click")["action"], "start");
+    d.send(r#"{"op":"dictateCancel"}"#);
+    assert_eq!(d.next_op("click")["action"], "cancel");
+}
+
+#[test]
+fn a_cancelled_local_dictation_is_not_transcribed() {
+    let (_tone_dir, tone, _) = tone_file(16_000);
+    let (_dir, config) = broken_asr_config();
+    let mut d = Daemon::start_with(&format!("cat {tone}"), &["--asr-config", &config]);
+    // As the shortcut does it: recording from the key going down.
+    d.send(r#"{"op":"early"}"#);
+    d.send(r#"{"op":"dictate","backend":"local"}"#);
+    std::thread::sleep(Duration::from_millis(100));
+    d.send(r#"{"op":"dictateCancel"}"#);
+    // The next thing said is about the next dictation, not a transcript.
+    d.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    assert_eq!(d.next_op("click")["action"], "start");
+}
+
+#[test]
 fn without_a_local_model_our_dictations_go_to_wispr() {
     let mut d = Daemon::start("true");
     d.send(r#"{"op":"dictate"}"#);

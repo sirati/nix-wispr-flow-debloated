@@ -103,13 +103,27 @@ with subtest("the shortcut is read from /dev/input, from a keyboard plugged in l
     machine.wait_until_succeeds(f"grep -q 'shortcut: reading' {HOTKEY_LOG}")
     keys_since()
     got = press("+KEY_RIGHTALT", "1", "-KEY_RIGHTALT")
-    assert got == ["RightAlt down", "  pressed", "RightAlt up", "  released"], got
+    assert got == ["RightAlt down", "  down", "  pressed", "RightAlt up", "  released"], got
     machine.succeed(f"grep -q 'shortcut: reading stand-in keyboard' {HOTKEY_LOG}")
 
-with subtest("another key soon after the press cancels"):
-    got = press("+KEY_RIGHTALT", "0.1", "KEY_E", "-KEY_RIGHTALT")
+with subtest("a tap, or another key with it, is no dictation"):
+    got = press("KEY_RIGHTALT")
+    assert got == ["RightAlt down", "  down", "RightAlt up", "  cancelled"], got
+    got = press("+KEY_RIGHTALT", "0.05", "KEY_E", "-KEY_RIGHTALT")
     assert got == [
         "RightAlt down",
+        "  down",
+        "E down",
+        "  cancelled",
+        "E up",
+        "RightAlt up",
+    ], got
+
+with subtest("another key during the dictation cancels it"):
+    got = press("+KEY_RIGHTALT", "0.6", "KEY_E", "-KEY_RIGHTALT")
+    assert got == [
+        "RightAlt down",
+        "  down",
         "  pressed",
         "E down",
         "  cancelled",
@@ -118,9 +132,10 @@ with subtest("another key soon after the press cancels"):
     ], got
 
 with subtest("Space while holding goes hands-free; the next press ends it"):
-    got = press("+KEY_RIGHTALT", "0.2", "KEY_SPACE", "-KEY_RIGHTALT", "0.5", "KEY_RIGHTALT")
+    got = press("+KEY_RIGHTALT", "0.5", "KEY_SPACE", "-KEY_RIGHTALT", "0.5", "KEY_RIGHTALT")
     assert got == [
         "RightAlt down",
+        "  down",
         "  pressed",
         "Space down",
         "  handsFree",
@@ -131,9 +146,30 @@ with subtest("Space while holding goes hands-free; the next press ends it"):
         "RightAlt up",
     ], got
 
+with subtest("a binding's backend comes with its events"):
+    machine.succeed("pkill -f -- --hotkey-test")
+    in_background(f"{DAEMON} --hotkey-test --hotkey local:RightCtrl", HOTKEY_LOG)
+    seen = 0
+    machine.wait_until_succeeds(f"grep -q 'shortcut: reading' {HOTKEY_LOG}")
+    keys_since()
+    got = press("+KEY_RIGHTCTRL", "0.5", "-KEY_RIGHTCTRL")
+    assert got == [
+        "RightCtrl down",
+        "  down local",
+        "  pressed local",
+        "RightCtrl up",
+        "  released local",
+    ], got
+
 with subtest("a keyboard unplugged while held lets go of its keys"):
-    got = press("+KEY_RIGHTALT", "0.5")
-    assert got == ["RightAlt down", "  pressed", "RightAlt up", "  released"], got
+    got = press("+KEY_RIGHTCTRL", "0.5")
+    assert got == [
+        "RightCtrl down",
+        "  down local",
+        "  pressed local",
+        "RightCtrl up",
+        "  released local",
+    ], got
 
 # ---------------------------------------------------------------- typing
 TYPED = "/tmp/typed.txt"

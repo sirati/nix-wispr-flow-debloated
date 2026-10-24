@@ -1,8 +1,10 @@
 //! Key names for the dictation shortcut, and the codes they stand for: evdev
 //! codes (KEY_*, BTN_*) on Linux, virtual key codes (kVK_*) on macOS.
 //!
-//! A binding is written `[hold:|toggle:]Key[+Key...]`, e.g. `RightAlt`,
-//! `toggle:RightAlt+Space` or `Fn`. Names are matched without regard to case.
+//! A binding is written `[backend:][hold:|toggle:]Key[+Key...]`, e.g.
+//! `RightAlt`, `toggle:RightAlt+Space` or `local:RightCommand`; the backend
+//! (`wispr` or `local`) says where its dictations go. Names are matched
+//! without regard to case.
 //! Left and right modifiers are separate keys, as in Wispr's own shortcuts.
 //! On Linux any evdev name works too (`KEY_F19`, `BTN_SIDE` for a mouse
 //! button), and on both platforms `code:N` is the raw code.
@@ -11,6 +13,9 @@ use super::chord::{Binding, Key, Mode};
 
 /// Not on this platform.
 const NONE: u16 = u16::MAX;
+
+/// Where a binding's dictations can go (protocol.rs, Backend).
+const BACKENDS: &[&str] = &["wispr", "local"];
 
 /// Name, evdev code, macOS virtual key code.
 const KEYS: &[(&str, u16, u16)] = &[
@@ -215,13 +220,21 @@ pub fn key_name(key: Key) -> String {
     format!("code:{key}")
 }
 
-/// One binding: `[hold:|toggle:]Key[+Key...]`.
+/// One binding: `[backend:][hold:|toggle:]Key[+Key...]`.
 pub fn parse_binding(spec: &str) -> Result<Binding, String> {
-    let (mode, keys) = match spec.split_once(':') {
-        Some(("hold", keys)) => (Mode::Hold, keys),
-        Some(("toggle", keys)) => (Mode::Toggle, keys),
-        _ => (Mode::Hold, spec),
-    };
+    let mut mode = Mode::Hold;
+    let mut backend = None;
+    let mut keys = spec;
+    while let Some((word, rest)) = keys.split_once(':') {
+        match word {
+            "hold" => mode = Mode::Hold,
+            "toggle" => mode = Mode::Toggle,
+            b if BACKENDS.contains(&b) => backend = Some(b.to_string()),
+            // code:N
+            _ => break,
+        }
+        keys = rest;
+    }
     let mut codes = keys
         .split('+')
         .map(parse_key)
@@ -232,7 +245,11 @@ pub fn parse_binding(spec: &str) -> Result<Binding, String> {
     if codes.len() != count {
         return Err(format!("{spec}: a key appears twice"));
     }
-    Ok(Binding { keys: codes, mode })
+    Ok(Binding {
+        keys: codes,
+        mode,
+        backend,
+    })
 }
 
 /// All bindings; two may not use the same keys.
@@ -365,6 +382,12 @@ mod tests {
         assert_eq!(b.keys, keys);
         assert_eq!(parse_binding("RightCtrl").unwrap().mode, Mode::Hold);
         assert_eq!(parse_binding("hold:code:500").unwrap().keys, vec![500]);
+        assert_eq!(parse_binding("RightAlt").unwrap().backend, None);
+        let b = parse_binding("local:toggle:RightAlt+Space").unwrap();
+        assert_eq!((b.mode, b.backend.as_deref()), (Mode::Toggle, Some("local")));
+        let b = parse_binding("hold:wispr:code:61").unwrap();
+        assert_eq!((b.keys, b.backend.as_deref()), (vec![61], Some("wispr")));
+        assert!(parse_binding("cloud:RightAlt").is_err());
         assert!(parse_binding("RightAlt+rightoption").is_err());
         assert!(parse_binding("Alt").unwrap_err().contains("LeftAlt or RightAlt"));
         assert!(parse_binding("Hyper").is_err());

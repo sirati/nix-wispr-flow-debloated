@@ -359,20 +359,25 @@ in
         type = lib.types.listOf (lib.types.strMatching "[^[:space:]]+");
         default = [ ];
         example = [
-          "RightAlt"
-          "toggle:RightAlt+Space"
-          "toggle:BTN_TASK"
+          "wispr:RightAlt"
+          "local:RightCtrl"
+          "local:toggle:RightCtrl+Space"
+          "wispr:toggle:BTN_TASK"
         ];
         description = ''
           Dictation shortcuts that wispr-headless reads from /dev/input
-          itself, on any desktop (the users need to be in `users`). Wispr
-          dictates on them as if its bar were clicked. `Key+Key` holds to
-          talk; `toggle:` starts and stops hands-free; a hold that grows into
-          a toggle binding turns hands-free, like Wispr's Fn+Space. Keys
-          Wispr also binds would start it twice. Names are listed in
-          wispr-headless/daemon/src/hotkey/keys.rs; any evdev name (KEY_*,
-          BTN_* for mouse buttons) works too, and `wispr-headless
-          --hotkey-test` prints the names of the keys pressed.
+          itself, on any desktop (the users need to be in `users`). A
+          `wispr:` binding dictates with Wispr, through its bar's buttons; a
+          `local:` one with `localAsr`; without either, `localAsr.backend`
+          decides. `Key+Key` holds to talk: it records from the moment it
+          goes down, becomes a dictation when held alone for 200 ms, and any
+          other key while it is held makes it an ordinary shortcut (Right
+          Ctrl+C) and cancels it. `toggle:` starts and stops hands-free; a
+          hold that grows into a toggle binding turns hands-free, like
+          Wispr's Fn+Space. Keys Wispr's own shortcuts use would start it
+          twice. Names are listed in wispr-headless/daemon/src/hotkey/keys.rs;
+          any evdev name (KEY_*, BTN_* for mouse buttons) works too, and
+          `wispr-headless --hotkey-test` prints the names of the keys pressed.
         '';
       };
       typing = lib.mkOption {
@@ -384,10 +389,10 @@ in
         ];
         default = "auto";
         description = ''
-          How wispr-headless types a transcript it finishes itself, not
-          through Wispr (see wispr-headless/daemon/src/typing/mod.rs).
-          `auto`: wispr-ime on GNOME, else key presses through /dev/uinput
-          (Wayland) or XTEST (X11), pasting what the layout cannot type.
+          How wispr-headless types what `localAsr` transcribed (Wispr types
+          its own; see wispr-headless/daemon/src/typing/mod.rs). `auto`:
+          wispr-ime on GNOME, else key presses through /dev/uinput (Wayland)
+          or XTEST (X11), pasting what the layout cannot type.
         '';
       };
     };

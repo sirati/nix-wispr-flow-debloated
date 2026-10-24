@@ -18,11 +18,11 @@ use evdev as platform;
 #[cfg(target_os = "macos")]
 use mac as platform;
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub use chord::{Binding, Chord, Hotkey, Key, CANCEL_WINDOW};
+pub use chord::{Binding, Chord, Hotkey, Key, ARM};
 pub use keys::{key_name, parse_bindings};
 
 /// Where the sources report what they see.
@@ -38,11 +38,42 @@ pub fn watch(wanted: &[Key], keys: KeySink, log: Log) -> Result<(), String> {
     platform::watch(wanted, keys, log)
 }
 
+/// Feeds the keys from `keys` to `chord`, and its timer, until the sources
+/// end: `on_key` sees each key first, `on_event` what the chord makes of it
+/// and the binding the dictation started on.
+pub fn drive(
+    mut chord: Chord,
+    keys: Receiver<(Key, bool)>,
+    mut on_key: impl FnMut(Key, bool),
+    mut on_event: impl FnMut(Hotkey, &Binding),
+) {
+    loop {
+        let next = match chord.deadline() {
+            Some(at) => keys.recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => keys.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let events = match next {
+            Ok((key, down)) => {
+                on_key(key, down);
+                chord.key(key, down, Instant::now())
+            }
+            Err(RecvTimeoutError::Timeout) => chord.tick(Instant::now()),
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
+        for &e in events {
+            if let Some(b) = chord.owner() {
+                on_event(e, b);
+            }
+        }
+    }
+}
+
 /// Watches the keyboards for `bindings`; `on_event` runs on a thread of its
-/// own, in the order things happen.
+/// own, in the order things happen, with the binding the dictation started
+/// on.
 pub fn spawn(
     bindings: Vec<Binding>,
-    mut on_event: impl FnMut(Hotkey) + Send + 'static,
+    on_event: impl FnMut(Hotkey, &Binding) + Send + 'static,
     log: Log,
 ) -> Result<(), String> {
     let mut wanted: Vec<Key> = bindings.iter().flat_map(|b| b.keys.clone()).collect();
@@ -52,14 +83,7 @@ pub fn spawn(
     watch(&wanted, tx, log)?;
     std::thread::Builder::new()
         .name("hotkey".into())
-        .spawn(move || {
-            let mut chord = chord::Chord::new(bindings, CANCEL_WINDOW);
-            for (key, down) in rx {
-                for &e in chord.key(key, down, Instant::now()) {
-                    on_event(e);
-                }
-            }
-        })
+        .spawn(move || drive(Chord::new(bindings, ARM), rx, |_, _| {}, on_event))
         .map(|_| ())
         .map_err(|e| format!("cannot start the shortcut thread: {e}"))
 }

@@ -50,12 +50,12 @@ pub enum Command {
     },
     /// Ends it. A local one's text follows as `transcript`.
     DictateEnd,
+    /// Drops it: no text (a local one is not transcribed; Wispr's gets its
+    /// bar's cancel button). Also drops a recording started early.
+    DictateCancel,
     /// Internal: a local dictation's text, or why there is none.
     #[serde(skip)]
     Transcribed { result: Result<String, String> },
-    /// Internal: this process's own dictation shortcut (`--hotkey`).
-    #[serde(skip)]
-    Hotkey(crate::hotkey::Hotkey),
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while
@@ -134,12 +134,6 @@ pub enum Event {
     TranscriptFailed {
         error: String,
     },
-    /// The dictation shortcut this process watches (`--hotkey`): "pressed",
-    /// "handsFree", "released" or "cancelled" (see hotkey/chord.rs). The
-    /// shim dictates on it by clicking Wispr's bar.
-    Hotkey {
-        state: String,
-    },
     Log {
         msg: String,
     },
@@ -214,8 +208,11 @@ mod tests {
         );
         assert!(parse(r#"{"op":"nonsense"}"#).is_err());
         // Internal commands never come from the shim.
-        assert!(parse(r#"{"op":"hotkey"}"#).is_err());
         assert!(parse(r#"{"op":"relisted"}"#).is_err());
+        assert_eq!(
+            parse(r#"{"op":"dictateCancel"}"#).unwrap(),
+            Command::DictateCancel
+        );
     }
 
     #[test]
@@ -255,14 +252,6 @@ mod tests {
             line,
             r#"{"op":"chunk","uuid":"u","index":3,"volume":-40.0,"duration":40.0,"pcm":"AAA="}"#
         );
-    }
-
-    #[test]
-    fn hotkey_event_names_the_state() {
-        let line = encode(&Event::Hotkey {
-            state: crate::hotkey::Hotkey::HandsFree.name().into(),
-        });
-        assert_eq!(line, r#"{"op":"hotkey","state":"handsFree"}"#);
     }
 
     #[test]
