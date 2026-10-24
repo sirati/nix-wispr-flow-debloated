@@ -53,6 +53,9 @@ struct Config {
     backend: Option<Backend>,
     /// The local model's settings (asr/mod.rs).
     asr_config: Option<String>,
+    /// The bar's fill for Wispr and for the local model.
+    fill: [u8; 3],
+    local_fill: [u8; 3],
 }
 
 fn config() -> Config {
@@ -80,6 +83,8 @@ fn config() -> Config {
     let mut target = None;
     let mut backend = None;
     let mut asr_config = None;
+    let mut fill = bar::WISPR_FILL;
+    let mut local_fill = bar::LOCAL_FILL;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -95,6 +100,11 @@ fn config() -> Config {
             // "wispr" or "local".
             "--backend" => backend = args.next().as_deref().and_then(Backend::parse),
             "--asr-config" => asr_config = args.next().filter(|c| !c.is_empty()),
+            // "#rrggbb".
+            "--bar-color" => fill = args.next().and_then(|c| color(&c)).unwrap_or(fill),
+            "--local-bar-color" => {
+                local_fill = args.next().and_then(|c| color(&c)).unwrap_or(local_fill)
+            }
             // Any command that writes 16 kHz s16 mono PCM to stdout: ffmpeg on
             // macOS, a stand-in microphone in tests.
             "--capture-cmd" => {
@@ -131,7 +141,19 @@ fn config() -> Config {
         fonts,
         backend,
         asr_config,
+        fill,
+        local_fill,
     }
+}
+
+/// "#rrggbb" (or without "#") as red, green, blue.
+fn color(hex: &str) -> Option<[u8; 3]> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([byte(0)?, byte(2)?, byte(4)?])
 }
 
 /// The capture command for one recording, and the device name Wispr is told:
@@ -314,6 +336,10 @@ fn main() {
     // The flow bar keeps the main thread (AppKit needs it on macOS); commands
     // and the recorder run on their own, and the process ends with them.
     let (pill_tx, pill_rx) = mpsc::channel::<PillCommand>();
+    let _ = pill_tx.send(PillCommand::Fills {
+        wispr: cfg.fill,
+        local: cfg.local_fill,
+    });
     let fonts = cfg.fonts.clone();
     {
         let out = Out(out.0.clone());
@@ -593,6 +619,7 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
                                     recording: r,
                                     dictation: asr.start(),
                                 });
+                                let _ = pill_tx.send(PillCommand::Local);
                                 let _ = pill_tx.send(PillCommand::Status("listening".into()));
                                 let _ = pill_tx.send(PillCommand::Mic(true));
                             }
@@ -682,6 +709,8 @@ mod tests {
             fonts: None,
             backend: None,
             asr_config: None,
+            fill: bar::WISPR_FILL,
+            local_fill: bar::LOCAL_FILL,
         }
     }
 
@@ -706,6 +735,15 @@ mod tests {
         let (capture, device) = capture_for(&c, Some(&jabra()));
         assert_eq!(capture.join(" "), "pw-cat --record --raw --target my-mic -");
         assert_eq!(device, "my-mic");
+    }
+
+    #[test]
+    fn bar_colours_are_hex_triplets() {
+        assert_eq!(color("#c81414"), Some([0xc8, 0x14, 0x14]));
+        assert_eq!(color("15803d"), Some([0x15, 0x80, 0x3d]));
+        assert_eq!(color("#c8141"), None);
+        assert_eq!(color("#gg0000"), None);
+        assert_eq!(color("#ä00000"), None);
     }
 
     #[test]

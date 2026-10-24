@@ -81,6 +81,8 @@ let
 
   headlessDaemon = pkgs.callPackage ./wispr-headless/daemon { };
   local = cfg.headless.localAsr;
+  # The flow bar's fills (--bar-color).
+  colour = lib.types.strMatching "#[0-9a-fA-F]{6}";
   # wispr-headless/daemon/src/asr/mod.rs, Settings; unset paths take the
   # daemon's defaults.
   asrConfig = pkgs.writeText "wispr-headless-asr.json" (
@@ -100,6 +102,8 @@ let
     fontDir = "${pkgs.figtree}/share/fonts/truetype";
     backend = lib.optionalString local.enable local.backend;
     asrConfig = lib.optionalString local.enable "${asrConfig}";
+    barColor = cfg.headless.barColor;
+    localBarColor = local.barColor;
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -219,6 +223,17 @@ in
         '';
       };
 
+      barColor = lib.mkOption {
+        type = colour;
+        default = "#000000";
+        example = "#c81414";
+        description = ''
+          Fill of the flow bar wispr-headless draws, at rest and for Wispr's
+          dictations. Wispr's own is black; another colour shows whether
+          wispr-headless or Wispr's page draws the bar.
+        '';
+      };
+
       localAsr = {
         enable = lib.mkEnableOption ''
           transcribing the dictations wispr-headless starts itself (its
@@ -238,6 +253,11 @@ in
             names its own: the local model, or Wispr (through its bar's start
             and stop buttons).
           '';
+        };
+        barColor = lib.mkOption {
+          type = colour;
+          default = "#15803d";
+          description = "Fill of the flow bar while a dictation goes to the local model.";
         };
         llamaCpp = lib.mkOption {
           type = lib.types.package;

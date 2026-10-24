@@ -23,8 +23,10 @@
 //!
 //! The output is a list of shapes and texts in Wispr's CSS pixels relative to
 //! the pill's top left corner, y down; pill_x11.rs (Linux) and pill_mac.rs
-//! (macOS) draw them. The pill is red instead of Wispr's black, so it is
-//! clear on screen whether Rust or Wispr's page draws it.
+//! (macOS) draw them. The pill is Wispr's black unless --bar-color says
+//! otherwise (a red one makes it clear on screen whether Rust or Wispr's page
+//! draws it); while a dictation goes to the local model it has a colour of
+//! its own, green unless --local-bar-color says otherwise.
 
 use std::time::{Duration, Instant};
 
@@ -37,8 +39,10 @@ pub const FRAME: Duration = Duration::from_millis(16);
 pub const WINDOW_SIZE: (f64, f64) = (NOTICE_MAX_WIDTH, NOTICE_HEIGHT);
 const HANDS_FREE: (f64, f64) = (102.5, 30.0);
 
-/// Pill fill: red (Wispr: black, opaque while dictating, 50 % at rest).
-pub const RED: [u8; 3] = [0xc8, 0x14, 0x14];
+/// Pill fill: Wispr's black, opaque while dictating, 50 % at rest.
+pub const WISPR_FILL: [u8; 3] = [0x00, 0x00, 0x00];
+/// While a dictation goes to the local model.
+pub const LOCAL_FILL: [u8; 3] = [0x15, 0x80, 0x3d];
 const REST_OUTLINE: [u8; 4] = [0xaa, 0xaa, 0xaa, 0xc0];
 const OUTLINE: [u8; 4] = [0x30, 0x30, 0x2f, 0xff];
 const COMMAND: [u8; 3] = [0xff, 0xa9, 0x46];
@@ -197,6 +201,14 @@ pub enum PillCommand {
     },
     /// Main closed the notification.
     NotifyClear,
+    /// Pill fills: for Wispr (also at rest and for notifications) and for
+    /// dictations to the local model.
+    Fills {
+        wispr: [u8; 3],
+        local: [u8; 3],
+    },
+    /// This dictation goes to the local model: its fill until the bar rests.
+    Local,
 }
 
 /// A rectangle with rounded corners, rotated about its centre; CSS pixels,
@@ -307,6 +319,10 @@ pub struct BarState {
     start: Instant,
     /// The mode of the last frame, for clicks.
     shown: Mode,
+    wispr_fill: [u8; 3],
+    local_fill: [u8; 3],
+    /// The dictation shown goes to the local model.
+    local: bool,
 }
 
 impl Default for BarState {
@@ -325,6 +341,9 @@ impl Default for BarState {
             last_frame: now,
             start: now,
             shown: Mode::Hidden,
+            wispr_fill: WISPR_FILL,
+            local_fill: LOCAL_FILL,
+            local: false,
         }
     }
 }
@@ -334,8 +353,19 @@ impl BarState {
         matches!(self.indicator, Indicator::PushToTalk | Indicator::HandsFree)
     }
 
+    /// The pill's fill, with `alpha`.
+    fn fill(&self, alpha: u8) -> [u8; 4] {
+        let [r, g, b] = if self.local {
+            self.local_fill
+        } else {
+            self.wispr_fill
+        };
+        [r, g, b, alpha]
+    }
+
     fn rest(&mut self) {
         self.indicator = Indicator::Rest;
+        self.local = false;
         self.command_mode = false;
         self.mic_active = false;
         self.waving = false;
@@ -349,6 +379,8 @@ impl BarState {
                     self.notice = None;
                     self.indicator = Indicator::Initializing;
                     self.waving = false;
+                    // Wispr's own: a local dictation ended before it.
+                    self.local = false;
                 }
                 "listening" => {
                     if self.indicator != Indicator::HandsFree {
@@ -409,6 +441,11 @@ impl BarState {
                 })
             }
             PillCommand::NotifyClear => self.notice = None,
+            PillCommand::Fills { wispr, local } => {
+                self.wispr_fill = wispr;
+                self.local_fill = local;
+            }
+            PillCommand::Local => self.local = true,
         }
         if !self.recording() {
             self.target = 0.0;
@@ -479,16 +516,18 @@ impl BarState {
             Mode::Hidden => (mode.size(), false),
             Mode::Resting => {
                 let size = mode.size();
-                shapes.push(pill(
-                    size,
-                    [RED[0], RED[1], RED[2], 0x80],
-                    REST_OUTLINE,
-                    1.0,
-                ));
+                shapes.push(pill(size, self.fill(0x80), REST_OUTLINE, 1.0));
                 (size, false)
             }
             Mode::Notice => match self.notice.as_mut() {
-                Some(n) => (n.draw(measure, pointer, &mut shapes, &mut texts), true),
+                Some(n) => {
+                    let [r, g, b] = self.wispr_fill;
+                    let fill = [r, g, b, 0xff];
+                    (
+                        n.draw(measure, pointer, fill, &mut shapes, &mut texts),
+                        true,
+                    )
+                }
                 None => (mode.size(), false),
             },
             _ => {
@@ -498,12 +537,7 @@ impl BarState {
                     _ if self.command_mode => ([COMMAND[0], COMMAND[1], COMMAND[2], 0xff], 1.0),
                     _ => (OUTLINE, 1.0),
                 };
-                shapes.push(pill(
-                    size,
-                    [RED[0], RED[1], RED[2], 0xff],
-                    outline.0,
-                    outline.1,
-                ));
+                shapes.push(pill(size, self.fill(0xff), outline.0, outline.1));
                 (size, self.content(mode, size, t, &mut shapes))
             }
         };
@@ -588,10 +622,10 @@ impl Notice {
         &mut self,
         measure: Measure,
         pointer: Option<(f64, f64)>,
+        fill: [u8; 4],
         shapes: &mut Vec<Shape>,
         texts: &mut Vec<Text>,
     ) -> (f64, f64) {
-        let fill = [RED[0], RED[1], RED[2], 0xff];
         let title_w = measure(&self.title, TEXT_SIZE, true).ceil();
         let labels: Vec<f64> = self
             .actions
@@ -798,6 +832,32 @@ mod tests {
 
     fn mode(s: &mut BarState) -> Mode {
         s.frame(now(), &measure, None).mode
+    }
+
+    fn fill(s: &mut BarState) -> [u8; 4] {
+        s.frame(now(), &measure, None).shapes[0].fill
+    }
+
+    #[test]
+    fn the_pill_has_the_colour_of_where_the_dictation_goes() {
+        let mut s = state();
+        assert_eq!(fill(&mut s), [0, 0, 0, 0x80], "Wispr's black at rest");
+        s.apply(PillCommand::Fills {
+            wispr: [0xc8, 0x14, 0x14],
+            local: [1, 2, 3],
+        });
+        assert_eq!(fill(&mut s), [0xc8, 0x14, 0x14, 0x80]);
+        s.apply(PillCommand::Local);
+        s.apply(PillCommand::Status("listening".into()));
+        assert_eq!(fill(&mut s), [1, 2, 3, 0xff]);
+        s.apply(PillCommand::Status("processing".into()));
+        assert_eq!(fill(&mut s), [1, 2, 3, 0xff], "until the text is out");
+        s.apply(PillCommand::Status("idle".into()));
+        assert_eq!(fill(&mut s), [0xc8, 0x14, 0x14, 0x80]);
+        // Wispr's own dictation after a local one.
+        s.apply(PillCommand::Local);
+        s.apply(PillCommand::Status("initializing".into()));
+        assert_eq!(fill(&mut s), [0xc8, 0x14, 0x14, 0xff]);
     }
 
     #[test]

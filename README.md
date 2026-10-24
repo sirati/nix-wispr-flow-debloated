@@ -50,7 +50,9 @@ model files are not packaged: put `granite-speech-5.0-2b-Q4_K_M.gguf` and
 `mmproj-model-q4_k-convdw-f32.gguf` (the encoder, quantized with
 `llama-quantize --tensor-type conv_dw=f32 mmproj-model-f16.gguf <out> Q4_K`)
 in `~/.local/share/wispr-headless`, or set `model` and `mmproj`. `keywords`
-names a file of terms to spell as listed.
+names a file of terms to spell as listed. The flow bar is green while a
+dictation goes to the local model (`localAsr.barColor`) and black otherwise
+(`headless.barColor`).
 
 On macOS, `lib.macWisprFlow` cross-builds the app on Linux. The caller
 provides an Apple SDK toolchain:

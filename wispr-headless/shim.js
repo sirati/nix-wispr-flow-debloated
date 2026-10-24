@@ -48,6 +48,8 @@ const PLAYER_CMD = "@playerCmd@";
 const FONT_DIR = "@fontDir@";
 const BACKEND = "@backend@";
 const ASR_CONFIG = "@asrConfig@";
+const BAR_COLOR = "@barColor@";
+const LOCAL_BAR_COLOR = "@localBarColor@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
@@ -192,6 +194,8 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   if (given(FONT_DIR)) args.push("--font-dir", FONT_DIR);
   if (given(BACKEND)) args.push("--backend", BACKEND);
   if (given(ASR_CONFIG)) args.push("--asr-config", ASR_CONFIG);
+  if (given(BAR_COLOR)) args.push("--bar-color", BAR_COLOR);
+  if (given(LOCAL_BAR_COLOR)) args.push("--local-bar-color", LOCAL_BAR_COLOR);
   // Tests only: a stand-in microphone.
   if (process.env.WISPR_HEADLESS_TEST_CAPTURE) args.push("--capture-cmd", process.env.WISPR_HEADLESS_TEST_CAPTURE);
   let child;

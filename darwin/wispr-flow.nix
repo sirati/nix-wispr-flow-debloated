@@ -35,13 +35,16 @@
 #   user     the macOS user who runs Wispr
 #   signingIdentity  name of the local code-signing certificate; created on
 #            first activation, and kept so macOS keeps Wispr's permissions
+#   barColor fill of the flow bar wispr-headless draws ("#rrggbb"; Wispr's
+#            black by default)
 #   localAsr transcription on the Mac for the dictations wispr-headless
 #            starts itself (see programs.wisprFlow.headless.localAsr in
 #            ../wispr-flow.nix for the meaning of each): { llamaServer, the
 #            path of an aarch64-darwin llama-server (b11852 or later);
 #            backend ? "local"; model, mmproj, keywords ? null (paths on the
 #            Mac; null for the daemon's defaults in ~/Library/Application
-#            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ]; }
+#            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
+#            barColor ? "#15803d", the bar for dictations to the local model }
 {
   native,
   builders,
@@ -49,6 +52,7 @@
   daemon,
   user,
   signingIdentity ? "Wispr Flow local code signing (Nix)",
+  barColor ? "#000000",
   localAsr ? null,
 }:
 let
@@ -59,6 +63,7 @@ let
     keywords = null;
     idleSeconds = 0;
     serverArgs = [ ];
+    barColor = "#15803d";
   }
   // (if localAsr == null then { } else localAsr);
   # wispr-headless/daemon/src/asr/mod.rs, Settings.
@@ -98,6 +103,8 @@ let
     playerCmd = "/usr/bin/afplay";
     backend = native.lib.optionalString (localAsr != null) local.backend;
     asrConfig = native.lib.optionalString (localAsr != null) "${asrConfig}";
+    inherit barColor;
+    localBarColor = local.barColor;
   };
 
   profile = "/nix/var/nix/profiles/mac-wispr-flow";
