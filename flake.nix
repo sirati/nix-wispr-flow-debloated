@@ -33,7 +33,7 @@
         };
         # programs.wisprIme: dictation through fcitx5 instead of the clipboard.
         wispr-ime = ./wispr-ime.nix;
-        # services.dictationButtons: mouse and headset buttons as a dictation key.
+        # services.dictationButtons: removed; tells to use headless.hotkeys.
         dictation-buttons = ./dictation-buttons.nix;
         default.imports = [
           self.nixosModules.wispr-flow

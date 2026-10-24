@@ -1,9 +1,11 @@
 # KDE Plasma on Wayland in a VM: wispr-headless's own dictation shortcut
 # from /dev/input and its typing through a uinput keyboard, with a German
 # layout set in KDE. The keyboard is a stand-in (stand-in-keyboard.py, a
-# uinput device), the text goes into a native Wayland GTK window
-# (capture-text.py) and Konsole. Runs without Wispr: the daemon's
-# --hotkey-test and --type-test modes exercise the same code.
+# uinput device), and so are a mouse button and a speakerphone's call
+# button that only shows in raw HID reports (stand-in-buttons.py). The text
+# goes into a native Wayland GTK window (capture-text.py) and Konsole. Runs
+# without Wispr: the daemon's --hotkey-test and --type-test modes exercise
+# the same code.
 #
 #   tests/kde-vm/run.sh        # needs /dev/kvm
 #   tests/kde-vm/run.sh -i     # interactive driver
@@ -14,6 +16,11 @@ let
   standIn = pkgs.writers.writePython3Bin "stand-in-keyboard" {
     libraries = [ pkgs.python3Packages.evdev ];
   } (builtins.readFile ./stand-in-keyboard.py);
+
+  standInButtons = pkgs.writers.writePython3Bin "stand-in-buttons" {
+    libraries = [ pkgs.python3Packages.evdev ];
+    flakeIgnore = [ "E501" ];
+  } (builtins.readFile ./stand-in-buttons.py);
 
   captureText = pkgs.stdenv.mkDerivation {
     name = "capture-text";
@@ -52,8 +59,16 @@ pkgs.testers.runNixOSTest {
       };
 
       # Wispr's udev rule, for the helper's (and our) uinput keyboard.
-      boot.kernelModules = [ "uinput" ];
-      services.udev.extraRules = ''KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"'';
+      # uhid for the stand-in speaker; its raw HID node readable as
+      # programs.wisprFlow makes it for a `hid:1209:0001/...` hotkey.
+      boot.kernelModules = [
+        "uinput"
+        "uhid"
+      ];
+      services.udev.extraRules = ''
+        KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660"
+        SUBSYSTEM=="hidraw", KERNELS=="*:1209:0001.*", GROUP="input", MODE="0660"
+      '';
 
       # A German layout, set the way KDE's settings save it.
       systemd.tmpfiles.settings."10-kxkbrc" = {
@@ -73,6 +88,7 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [
         daemon
         standIn
+        standInButtons
         captureText
         pkgs.wl-clipboard
       ];

@@ -123,6 +123,24 @@ let
     lib.genList (i: lib.nameValuePair "F${toString (i + 13)}" (toString (124 + i))) 12
   );
   wisprKey = lib.types.enum (builtins.attrNames wisprKeyCodes);
+  # The `hid:VVVV:PPPP/...` buttons among the hotkeys: their raw HID nodes
+  # are root's alone by default. The hid device a hidraw node hangs off is
+  # named BUS:VENDOR:PRODUCT.N in upper-case hex, on USB and Bluetooth alike.
+  hidIds = lib.unique (
+    lib.concatMap (
+      h:
+      lib.concatMap (
+        key:
+        let
+          m = builtins.match "(.*:)?[hH][iI][dD]:([0-9a-fA-F]{4}):([0-9a-fA-F]{4})/.*" key;
+        in
+        lib.optional (m != null) (lib.toUpper "${builtins.elemAt m 1}:${builtins.elemAt m 2}")
+      ) (lib.splitString "+" h)
+    ) cfg.headless.hotkeys
+  );
+  hidrawRules = lib.concatMapStrings (id: ''
+    SUBSYSTEM=="hidraw", KERNELS=="*:${id}.*", GROUP="input", MODE="0660"
+  '') hidIds;
   headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
@@ -380,7 +398,8 @@ in
           "wispr:RightAlt"
           "local:RightCtrl"
           "local:toggle:RightCtrl+Space"
-          "wispr:toggle:BTN_TASK"
+          "wispr:BTN_TASK"
+          "wispr:toggle:hid:0b0e:0412/3:1:0"
         ];
         description = ''
           Dictation shortcuts that wispr-headless reads from /dev/input
@@ -401,6 +420,18 @@ in
           wispr-headless/daemon/src/hotkey/keys.rs;
           any evdev name (KEY_*, BTN_* for mouse buttons) works too, and
           `wispr-headless --hotkey-test` prints the names of the keys pressed.
+
+          A button that never becomes a key event (a speakerphone's call
+          button) is read from its raw HID reports:
+          `hid:DEVICE/REPORT:BYTE:BIT`, with DEVICE `vendor:product` in hex
+          or the HID name with `_` for spaces, REPORT the report's first
+          byte (its id), BYTE counted from the byte after it and BIT from 0.
+          The bit at 1 is the button held; `/latch` after it makes each
+          change of the bit one press, for a button that keeps its state.
+          A button that only pulses (the Jabra SPEAK 410's call button,
+          `hid:0b0e:0412/3:1:0`) suits `toggle:`. For `vendor:product`
+          buttons a udev rule gives the `input` group read access to the
+          device's /dev/hidraw node.
         '';
       };
       typing = lib.mkOption {
@@ -520,6 +551,8 @@ in
     # helper types through.
     services.udev.packages = [ cfg.package ];
     boot.kernelModules = [ "uinput" ];
+    # The raw HID nodes of the `hid:` hotkeys.
+    services.udev.extraRules = lib.mkIf cfg.headless.enable hidrawRules;
 
     users.users = lib.genAttrs cfg.users (_: {
       extraGroups = [ "input" ];

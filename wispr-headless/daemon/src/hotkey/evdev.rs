@@ -5,10 +5,10 @@
 //!
 //! Needs read access to the event nodes: the `input` group, which
 //! programs.wisprFlow.users grants. Keyboards are read, and any other device
-//! that has a key of the bindings (a mouse's side buttons, dictation-buttons'
-//! virtual keyboard). Devices that appear later are picked up through
-//! inotify on /dev/input, so a resting watcher has no timers. The keyboard
-//! this process types with (typing/uinput.rs) is left out.
+//! that has a key of the bindings (a mouse's side buttons, BTN_TASK). Devices
+//! that appear later are picked up through inotify on /dev/input, so a
+//! resting watcher has no timers. The keyboard this process types with
+//! (typing/uinput.rs) is left out.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
