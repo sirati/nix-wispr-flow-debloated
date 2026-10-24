@@ -248,7 +248,7 @@ fn play(cfg: &Config, name: &str, out: &Out) {
         Some(p) => p,
         None => return,
     };
-    if let Err(e) = Process::new(program)
+    match Process::new(program)
         .args(args)
         .arg(&path)
         .stdin(Stdio::null())
@@ -256,9 +256,16 @@ fn play(cfg: &Config, name: &str, out: &Out) {
         .stderr(Stdio::null())
         .spawn()
     {
-        out.send(&Event::Log {
+        // Reap the player when it exits; an unwaited child stays a zombie and
+        // each sound would use up one of the user's process slots for good.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => out.send(&Event::Log {
             msg: format!("cannot play {path}: {e}"),
-        });
+        }),
     }
 }
 
