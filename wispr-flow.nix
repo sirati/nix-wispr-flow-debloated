@@ -111,8 +111,18 @@ let
       cfg.headless.typing
       "--wl-copy"
       "${pkgs.wl-clipboard}/bin/wl-copy"
+      "--double-press-ms"
+      (toString cfg.headless.doublePressMs)
+      "--max-dictation-seconds"
+      (toString cfg.headless.maxDictationSeconds)
     ]
   );
+  # Wispr's key codes on Linux: Windows virtual-key codes, which the port's
+  # helper reports (its keymap.rs, evdev KEY_F13..KEY_F24).
+  wisprKeyCodes = lib.listToAttrs (
+    lib.genList (i: lib.nameValuePair "F${toString (i + 13)}" (toString (124 + i))) 12
+  );
+  wisprKey = lib.types.enum (builtins.attrNames wisprKeyCodes);
   headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
@@ -125,6 +135,9 @@ let
     localBarColor = local.barColor;
     inherit daemonArgs;
     suppressWisprShortcut = lib.optionalString cfg.headless.suppressWisprShortcut "1";
+    wisprPushToTalkCode = wisprKeyCodes.${cfg.headless.wisprPushToTalkKey};
+    wisprHandsFreeCode = wisprKeyCodes.${cfg.headless.wisprHandsFreeKey};
+    rebindWisprShortcuts = lib.optionalString cfg.headless.rebindWisprShortcuts "1";
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -372,15 +385,19 @@ in
         description = ''
           Dictation shortcuts that wispr-headless reads from /dev/input
           itself, on any desktop (the users need to be in `users`). A
-          `wispr:` binding dictates with Wispr, through its bar's buttons; a
+          `wispr:` binding dictates with Wispr; a
           `local:` one with `localAsr`; without either, `localAsr.backend`
           decides. `Key+Key` holds to talk: it records from the moment it
           goes down, becomes a dictation when held alone for 200 ms, and any
           other key while it is held makes it an ordinary shortcut (Right
           Ctrl+C) and cancels it. `toggle:` starts and stops hands-free; a
           hold that grows into a toggle binding turns hands-free, like
-          Wispr's Fn+Space. Wispr's own dictation shortcuts are switched off
-          (`suppressWisprShortcut`). Names are listed in
+          Wispr's Fn+Space. A `wispr:` binding drives Wispr through its own
+          push to talk and hands-free: the shim presses
+          `wisprPushToTalkKey` and `wisprHandsFreeKey` for Wispr, which
+          `rebindWisprShortcuts` binds in Wispr's settings, so Wispr shows
+          and behaves as on its own shortcut; the keys of `hotkeys` never
+          reach Wispr. Names are listed in
           wispr-headless/daemon/src/hotkey/keys.rs;
           any evdev name (KEY_*, BTN_* for mouse buttons) works too, and
           `wispr-headless --hotkey-test` prints the names of the keys pressed.
@@ -401,10 +418,41 @@ in
           or XTEST (X11), pasting what the layout cannot type.
         '';
       };
-      suppressWisprShortcut = lib.mkOption {
+      wisprPushToTalkKey = lib.mkOption {
+        type = wisprKey;
+        default = "F20";
+        description = ''
+          The key Wispr's push to talk is bound to, which the shim presses for
+          Wispr while a `wispr:` hotkey is held. A key nobody presses.
+        '';
+      };
+      wisprHandsFreeKey = lib.mkOption {
+        type = wisprKey;
+        default = "F19";
+        description = ''
+          The key Wispr's hands-free is bound to, which the shim presses for
+          Wispr to start and stop a hands-free dictation of a `wispr:`
+          hotkey. A key nobody presses.
+        '';
+      };
+      rebindWisprShortcuts = lib.mkOption {
         type = lib.types.bool;
         default = cfg.headless.hotkeys != [ ];
         defaultText = lib.literalExpression "headless.hotkeys != [ ]";
+        description = ''
+          Bind Wispr's push to talk to `wisprPushToTalkKey` and its
+          hands-free to `wisprHandsFreeKey` and nothing else, in Wispr's own
+          settings (as if set in Settings > Shortcuts), whenever the shim
+          finds them bound otherwise while wispr-headless runs. Wispr's other
+          shortcuts (command mode, Escape, paste last, ...) stay as they are.
+          Its default shortcut (Ctrl+Win) then no longer starts a dictation,
+          and changing these two in Wispr's settings does not last.
+        '';
+      };
+      suppressWisprShortcut = lib.mkOption {
+        type = lib.types.bool;
+        default = cfg.headless.hotkeys != [ ] && !cfg.headless.rebindWisprShortcuts;
+        defaultText = lib.literalExpression "headless.hotkeys != [ ] && !headless.rebindWisprShortcuts";
         description = ''
           Keep Wispr's own dictation shortcuts (push to talk, hands-free,
           command mode; Settings > Shortcuts) from starting a dictation, so
@@ -413,7 +461,25 @@ in
           before Wispr sees them; all other keys still reach Wispr, so Escape
           still cancels and its other shortcuts still work. Not while Wispr's
           settings record a new shortcut, nor when wispr-headless is not
-          running.
+          running. Off by default with `rebindWisprShortcuts`, which already
+          moves push to talk and hands-free to keys nobody presses (command
+          mode keeps its shortcut).
+        '';
+      };
+      doublePressMs = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 350;
+        description = ''
+          Two presses of a `hotkeys` key within this many milliseconds
+          count as a double press (wispr-headless's --double-press-ms).
+        '';
+      };
+      maxDictationSeconds = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 600;
+        description = ''
+          A dictation wispr-headless's `hotkeys` started ends after this many
+          seconds (wispr-headless's --max-dictation-seconds).
         '';
       };
     };

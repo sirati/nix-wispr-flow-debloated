@@ -218,34 +218,56 @@ app.whenReady().then(async () => {
   await until("woken by store", () => loaded.includes("status"), 5_000);
   check(loaded.includes("status"), "a changed subscription value loads the status page");
 
+  // Wispr's push to talk and hands-free are bound to the keys wispr-headless
+  // presses for them (here 131 and 130, F20 and F19 on Linux), keeping its
+  // other shortcuts: one SET_PREFS dispatch, then helper:updateShortcuts.
+  const dispatches = [];
+  ipcMain.on("zubridge:dispatch", (_e, a) => dispatches.push(a));
+  let shortcutUpdates = 0;
+  ipcMain.on("helper:updateShortcuts", () => shortcutUpdates++);
+  const fnShortcuts = { 63: "ptt", "49+63": "popo", "59+63": "lens", 53: "dismiss" };
   // Wispr's dictation shortcuts are kept from Wispr: the helper's key events
   // that would complete one never arrive, everything else does, numbered
   // without gaps, and the dropped ones are acknowledged to the helper.
-  hub.webContents.send("zubridge:state-update", {
-    updateId: "keys",
-    state: { prefs: { user: { shortcuts: { 63: "ptt", "49+63": "popo", "59+63": "lens", 53: "dismiss" } } } },
-  });
-  await wait(200);
+  hub.webContents.send("zubridge:state-update", { updateId: "keys", state: { prefs: { user: { shortcuts: fnShortcuts } } } });
+  await until("rebind", () => dispatches.length > 0 && shortcutUpdates > 0, 3_000);
+  const action = dispatches[0]?.action;
+  const sorted = (o) => JSON.stringify(Object.fromEntries(Object.entries(o ?? {}).sort()));
+  check(
+    dispatches.length === 1 && action?.type === "SET_PREFS" && typeof action.__id === "string" &&
+      sorted(action.payload?.user?.shortcuts) === sorted({ 131: "ptt", 130: "popo", "59+63": "lens", 53: "dismiss" }) &&
+      Object.keys(action.payload).join() === "user" && Object.keys(action.payload.user).join() === "shortcuts",
+    `Fn-based shortcuts are rebound with SET_PREFS (${JSON.stringify(dispatches)})`,
+  );
+  check(shortcutUpdates === 1, `then helper:updateShortcuts (${shortcutUpdates})`);
+  status.webContents.send("zubridge:state-update", { updateId: "keys2", state: { prefs: { user: { shortcuts: fnShortcuts } } } });
+  await wait(300);
+  check(dispatches.length === 1, `the same shortcuts are rebound once (${dispatches.length})`);
+
   const fs = require("fs");
   const ackFile = path.join(app.getPath("temp"), `wispr-test-acks-${process.pid}`);
   const goFile = `${ackFile}.go`;
   const helper = require("child_process").spawn(path.join(__dirname, "wispr-flow-linux-helper"), [ackFile, goFile], { stdio: ["pipe", "pipe", "inherit", "pipe"] });
   const fromHelper = [];
   let pendingData = "";
-  // Wispr's reader (HelperAPIClient.pushData).
+  const unescape = (m) => m.replaceAll("+2", "|").replaceAll("+1", "+");
+  const escape = (m) => m.replaceAll("+", "+1").replaceAll("|", "+2");
+  // Wispr's reader (HelperAPIClient.pushData); it acknowledges each key event.
   helper.stdio[3].on("data", (e) => {
     pendingData += e.toString("utf8");
     while (pendingData.includes("|")) {
       const m = pendingData.split("|")[0];
       pendingData = pendingData.slice(m.length + 1);
-      fromHelper.push(JSON.parse(m.replaceAll("+2", "|").replaceAll("+1", "+")).HelperAPIRequest);
+      const request = JSON.parse(unescape(m)).HelperAPIRequest;
+      fromHelper.push(request);
+      if (request.KeypressEvent) helper.stdin.write(escape(JSON.stringify({ HelperAPIResponse: { uuid: request.uuid, ACK: true } })) + "|");
     }
   });
-  const keys = () => fromHelper.filter((r) => r.KeypressEvent).map((r) => `${r.KeypressEvent.payload.eventType.slice(10)} ${r.KeypressEvent.payload.key}`);
+  const keyEvents = () => fromHelper.filter((r) => r.KeypressEvent);
+  const keys = () => keyEvents().map((r) => `${r.KeypressEvent.payload.eventType.slice(10)} ${r.KeypressEvent.payload.key}`);
   await until("helper", () => keys().length >= 6, 5_000);
   await wait(300);
   check(keys().join() === "press 49,release 49,press 53,release 53,press 59,release 59", `only keys that start no Wispr dictation reach Wispr (${keys().join()})`);
-  check(fromHelper.filter((r) => r.KeypressEvent).every((r, i) => r.KeypressEvent.payload.index === i + 1), "key events reach Wispr numbered 1, 2, ...");
   check(fromHelper.some((r) => r.AppInfoUpdate?.payload?.appName === "a|b+c"), "other helper messages arrive unchanged");
   // While Wispr's settings record a shortcut, every key arrives.
   ipcMain.emit("keyboard:isRecording", { sender: hub.webContents }, true);
@@ -253,11 +275,47 @@ app.whenReady().then(async () => {
   await until("recording keys", () => keys().length >= 8, 5_000);
   check(keys().slice(6).join() === "press 63,release 63", `keys arrive while a shortcut is recorded (${keys().slice(6).join()})`);
   ipcMain.emit("keyboard:isRecording", { sender: hub.webContents }, false);
+
+  // The daemon's own shortcut keys (hideKeys) never reach Wispr.
+  const daemonSays = globalThis.wisprHeadlessDaemonEvent;
+  daemonSays({ op: "hideKeys", keys: [165] });
+  fs.writeFileSync(`${goFile}2`, "");
+  await until("hidden keys", () => keys().length >= 10, 5_000);
+  await wait(300);
+  check(keys().slice(8).join() === "press 53,release 53", `the daemon's hotkeys are kept from Wispr (${keys().slice(8).join()})`);
+
+  // The daemon presses Wispr's push to talk and hands-free keys.
+  for (const [a, down] of [["ptt", true], ["ptt", false], ["popo", true], ["popo", false]]) daemonSays({ op: "wisprKey", action: a, down });
+  await until("injected", () => keys().length >= 14, 3_000);
+  check(keys().slice(10).join() === "press 131,release 131,press 130,release 130", `wisprKey presses and releases the configured keys (${keys().slice(10).join()})`);
+  const injected = keyEvents().slice(10);
+  check(
+    injected.every((r) => Object.keys(r).sort().join() === "KeypressEvent,uuid" && Object.keys(r.KeypressEvent).join() === "payload" &&
+      Object.keys(r.KeypressEvent.payload).every((k) => ["eventType", "key", "index", "inputType"].includes(k))),
+    `injected key events carry only Wispr's fields (${JSON.stringify(injected[0])})`,
+  );
+  check(keyEvents().every((r, i) => r.KeypressEvent.payload.index === i + 1), `key events reach Wispr numbered 1, 2, ... (${keyEvents().map((r) => r.KeypressEvent.payload.index).join()})`);
+
+  await wait(300);
   helper.stdin.end();
   await new Promise((r) => helper.once("exit", r));
-  const helperAcks = fs.readFileSync(ackFile, "utf8").split("|").filter(Boolean).map((m) => JSON.parse(m.replaceAll("+2", "|").replaceAll("+1", "+")).HelperAPIResponse);
-  check(helperAcks.every((a) => a.ACK === true) && helperAcks.map((a) => a.uuid).join() === "k1,k4,k8,k9", `the helper gets an ACK for each dropped key event (${helperAcks.map((a) => a.uuid).join()})`);
-  for (const f of [ackFile, goFile]) fs.rmSync(f, { force: true });
+  const helperAcks = fs.readFileSync(ackFile, "utf8").split("|").filter(Boolean).map((m) => JSON.parse(unescape(m)).HelperAPIResponse);
+  const ackedUuids = helperAcks.map((a) => a.uuid);
+  const realUuids = Array.from({ length: 16 }, (_, i) => `k${i + 1}`);
+  check(helperAcks.every((a) => a.ACK === true) && ["k1", "k4", "k8", "k9", "k13", "k16"].every((u) => ackedUuids.includes(u)), `the helper gets an ACK for each dropped key event (${ackedUuids.join()})`);
+  check(ackedUuids.length === 16 && realUuids.every((u) => ackedUuids.includes(u)), `the helper gets one ACK per key event it sent, none for injected ones (${ackedUuids.join()})`);
+
+  // Without a helper, a wisprKey does nothing.
+  const before = fromHelper.length;
+  daemonSays({ op: "wisprKey", action: "ptt", down: true });
+  await wait(200);
+  check(fromHelper.length === before, "wisprKey without a helper is ignored");
+  for (const f of [ackFile, goFile, `${goFile}2`]) fs.rmSync(f, { force: true });
+
+  // Shortcuts already on those keys are left alone.
+  hub.webContents.send("zubridge:state-update", { updateId: "keys3", state: { prefs: { user: { shortcuts: { 131: "ptt", 130: "popo", "59+63": "lens", 53: "dismiss" } } } } });
+  await wait(300);
+  check(dispatches.length === 1, `rebound shortcuts are not dispatched again (${dispatches.length})`);
 
   console.log(failures === 0 ? "ALL PASSED" : `${failures} FAILED`);
   app.exit(failures === 0 ? 0 : 1);

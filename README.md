@@ -64,11 +64,20 @@ Wispr, Right Ctrl with the local model, whose text is then typed into the
 focused window. A held key becomes a dictation after 200 ms alone; another
 key while it is held makes it an ordinary shortcut. On macOS,
 `lib.macWisprFlow` holds Right Option for Wispr and, with `localAsr`, Right
-Command for the local model (`hotkeys` changes that). With shortcuts of its
-own, Wispr's dictation shortcuts (Fn by default on macOS) are switched off
-without touching Wispr's settings (`suppressWisprShortcut`): the shim drops
-the key events from Wispr's helper that would start one, and passes every
-other key, so Escape, paste-last and the rest still work. To try it by hand,
+Command for the local model (`hotkeys` changes that). A `wispr:` shortcut
+drives Wispr through its own push to talk and hands-free, so Wispr shows and
+behaves as on its own shortcut: the shim presses F20 (push to talk) and F19
+(hands-free), keys nobody presses, for Wispr (`wisprPushToTalkKey`,
+`wisprHandsFreeKey`), and keeps the shortcut keys themselves from Wispr.
+While wispr-headless runs, the shim binds Wispr's push to talk and hands-free
+to those keys in Wispr's settings (`rebindWisprShortcuts`), so Wispr's
+default (Fn on macOS, Ctrl+Win on Linux) no longer starts a dictation; its
+other shortcuts stay. Nothing needs changing in Wispr's settings, and
+changing these two there does not last. `suppressWisprShortcut`, off by
+default with `rebindWisprShortcuts`, instead keeps Wispr's settings as they
+are and drops the key events from Wispr's helper that would start one of
+its dictations, passing every other key, so Escape, paste-last and the rest
+still work. To try it by hand,
 `wispr-headless --hotkey-test --hotkey RightAlt` prints the keys pressed and
 what the shortcut does, and `echo text | wispr-headless --type-test` types
 into the focused window three seconds later.

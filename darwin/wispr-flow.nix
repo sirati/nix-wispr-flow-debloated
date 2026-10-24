@@ -57,10 +57,18 @@
 #            module's headless.hotkeys). Default: hold Right Option to
 #            dictate with Wispr and, with localAsr, Right Command with the
 #            local model; the left keys stay as they are
+#   wisprPushToTalkKey, wisprHandsFreeKey  the keys ("F13".."F20") Wispr's
+#            push to talk and hands-free are bound to, which the shim presses
+#            for Wispr on a wispr: hotkey; "F20" and "F19"
+#   rebindWisprShortcuts  bind them in Wispr's settings while
+#            wispr-headless runs, so Fn no longer starts Wispr (see the NixOS
+#            module's headless.rebindWisprShortcuts); on unless hotkeys is [ ]
 #   suppressWisprShortcut  keep Wispr's own dictation shortcuts (Fn by
 #            default) from starting a dictation, without changing Wispr's
 #            settings (see the NixOS module's headless.suppressWisprShortcut);
-#            on unless hotkeys is [ ]
+#            on if hotkeys is not [ ] and rebindWisprShortcuts is off
+#   doublePressMs, maxDictationSeconds  wispr-headless's --double-press-ms
+#            (350) and --max-dictation-seconds (600) for its hotkeys
 #   typing   how wispr-headless types what the local model heard: "auto" or
 #            "paste" (Cmd+V, the clipboard put back after), "keys"
 {
@@ -76,6 +84,11 @@
   sdk ? null,
   hotkeys ? null,
   suppressWisprShortcut ? null,
+  wisprPushToTalkKey ? "F20",
+  wisprHandsFreeKey ? "F19",
+  rebindWisprShortcuts ? null,
+  doublePressMs ? 350,
+  maxDictationSeconds ? 600,
   typing ? "auto",
 }:
 let
@@ -103,7 +116,24 @@ let
       hotkeys
     else
       [ "wispr:RightOption" ] ++ native.lib.optional (localAsr != null) "local:RightCommand";
-  suppress = if suppressWisprShortcut != null then suppressWisprShortcut else hotkeyList != [ ];
+  rebind = if rebindWisprShortcuts != null then rebindWisprShortcuts else hotkeyList != [ ];
+  suppress =
+    if suppressWisprShortcut != null then suppressWisprShortcut else hotkeyList != [ ] && !rebind;
+  # Wispr's key codes on the Mac: macOS virtual keycodes, as its helper
+  # reports them (Wispr's own table in .webpack/main/index.js).
+  wisprKeyCodes = {
+    F13 = "105";
+    F14 = "107";
+    F15 = "113";
+    F16 = "106";
+    F17 = "64";
+    F18 = "79";
+    F19 = "80";
+    F20 = "90";
+  };
+  wisprKeyCode =
+    name:
+    wisprKeyCodes.${name} or (throw "macWisprFlow: no Wispr key code for ${name}; one of F13..F20");
   # wispr-headless/daemon/src/asr/mod.rs, Settings.
   asrConfig = native.writeText "wispr-headless-asr.json" (
     builtins.toJSON (
@@ -149,6 +179,9 @@ let
     inherit barColor;
     localBarColor = local.barColor;
     suppressWisprShortcut = native.lib.optionalString suppress "1";
+    wisprPushToTalkCode = wisprKeyCode wisprPushToTalkKey;
+    wisprHandsFreeCode = wisprKeyCode wisprHandsFreeKey;
+    rebindWisprShortcuts = native.lib.optionalString rebind "1";
     daemonArgs = builtins.concatStringsSep " " (
       native.lib.concatMap (h: [
         "--hotkey"
@@ -157,6 +190,10 @@ let
       ++ [
         "--type-with"
         typing
+        "--double-press-ms"
+        (toString doublePressMs)
+        "--max-dictation-seconds"
+        (toString maxDictationSeconds)
       ]
     );
   };
