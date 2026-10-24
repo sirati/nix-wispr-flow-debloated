@@ -1,4 +1,12 @@
-{ lib, rustPlatform }:
+{
+  lib,
+  stdenv,
+  rustPlatform,
+  xvfb,
+  setxkbmap,
+  xkbcomp,
+  dbus,
+}:
 
 rustPlatform.buildRustPackage {
   pname = "wispr-headless";
@@ -17,9 +25,16 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
 
   # The unit tests and the binary's own tests (a stand-in microphone) run
-  # here; the indicator is skipped without a display. The macOS build is
-  # cross-compiled on Linux by the caller (see lib.macWisprFlow); its tests
-  # run on the Mac instead.
+  # here; the indicator is skipped without a display. Typing through XTEST
+  # runs against Xvfb, and the D-Bus client against a private dbus-daemon.
+  # The macOS build is cross-compiled on Linux by the caller (see
+  # lib.macWisprFlow); its tests run on the Mac instead.
+  nativeCheckInputs = lib.optionals stdenv.hostPlatform.isLinux [
+    xvfb
+    setxkbmap
+    xkbcomp
+    dbus
+  ];
 
   meta = {
     description = "Recorder and speech indicator that stand in for Wispr Flow's hidden windows";

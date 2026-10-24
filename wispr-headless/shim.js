@@ -50,6 +50,9 @@ const BACKEND = "@backend@";
 const ASR_CONFIG = "@asrConfig@";
 const BAR_COLOR = "@barColor@";
 const LOCAL_BAR_COLOR = "@localBarColor@";
+// More daemon arguments, separated by spaces: its own dictation shortcuts
+// (--hotkey) and how it types (--type-with, --wl-copy).
+const DAEMON_ARGS = "@daemonArgs@";
 const given = (v) => Boolean(v) && !v.startsWith("@");
 
 const TRACE_MAX = 20 * 1024 * 1024;
@@ -196,6 +199,7 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   if (given(ASR_CONFIG)) args.push("--asr-config", ASR_CONFIG);
   if (given(BAR_COLOR)) args.push("--bar-color", BAR_COLOR);
   if (given(LOCAL_BAR_COLOR)) args.push("--local-bar-color", LOCAL_BAR_COLOR);
+  if (given(DAEMON_ARGS)) args.push(...DAEMON_ARGS.split(/\s+/).filter(Boolean));
   // Tests only: a stand-in microphone.
   if (process.env.WISPR_HEADLESS_TEST_CAPTURE) args.push("--capture-cmd", process.env.WISPR_HEADLESS_TEST_CAPTURE);
   let child;
@@ -355,6 +359,37 @@ function build(electron) {
     }
   };
 
+  // The bar's buttons, clicked on the Rust bar or by wispr-headless for a
+  // dictation of its own (its shortcut). A stop or cancel that comes before
+  // Wispr asks to record waits for that request, so a short press on the
+  // shortcut does not leave a dictation running that Wispr was still
+  // starting; Wispr's dictation ending first forgets it.
+  let clickedStart = false;
+  let pendingEnd = null; // the click that ends it once Wispr records
+  const endClick = (ch) => emitFrom(byRole.get("status"), ch, ch === "status:cancelClicked" ? "user_action_cancel_button" : undefined);
+  function onClick(action) {
+    if (action === "start") {
+      clickedStart = !session;
+      pendingEnd = null;
+      emitFrom(byRole.get("status"), "status:startClicked", undefined);
+      return;
+    }
+    const ch = { stop: "status:stopClicked", cancel: "status:cancelClicked" }[action];
+    if (!ch) return;
+    if (clickedStart && !session) {
+      pendingEnd = ch;
+    } else {
+      clickedStart = false;
+      endClick(ch);
+    }
+  }
+  function sawStatus(ch, a) {
+    if (ch === "status:dictationStatus" && /^(idle|dismissed|error)$/.test(String(a))) {
+      clickedStart = false;
+      pendingEnd = null;
+    }
+  }
+
   function updateMics(state) {
     const user = state?.prefs?.user;
     if (!Array.isArray(user?.rankedAudioDevices)) return;
@@ -409,13 +444,9 @@ function build(electron) {
         emitFrom(hub, "dictation:recordingDone", { ...msg.timing, transcriptionEntityUuid: uuid });
         if (session === uuid) session = null;
         break;
-      case "click": {
-        const status = byRole.get("status");
-        if (msg.action === "start") emitFrom(status, "status:startClicked", undefined);
-        else if (msg.action === "stop") emitFrom(status, "status:stopClicked", undefined);
-        else if (msg.action === "cancel") emitFrom(status, "status:cancelClicked", "user_action_cancel_button");
+      case "click":
+        onClick(msg.action);
         break;
-      }
       case "noticeAction": {
         const action = notice?.actions?.[msg.index];
         if (action) emitFrom(byRole.get("status"), "notification:callback", { callback: action.callback, type: notice.type, callbackOperationId: notice.callbackOperationId, isFirstHit: undefined });
@@ -566,6 +597,12 @@ function build(electron) {
           session = a?.transcriptionEntityUuid ?? null;
           trace({ ev: "rec.audioStart" });
           daemon.send({ op: "start", uuid: session });
+          if (pendingEnd) {
+            const ch = pendingEnd;
+            pendingEnd = null;
+            clickedStart = false;
+            setImmediate(() => endClick(ch));
+          }
           return true;
         }
         if (ch === "dictation:audioStop") {
@@ -581,6 +618,7 @@ function build(electron) {
       }
       if (this.role === "status") {
         if (ch === "status:dictationStatus" && a === "initializing") trace({ ev: "rec.initializing", sinceKey: lastKeyAt ? Date.now() - lastKeyAt : null });
+        sawStatus(ch, a);
         const cmd = barCommand(ch, a);
         if (cmd) daemon.send(cmd);
         // The page plays this one itself when it is up.
@@ -633,6 +671,7 @@ function build(electron) {
       updateBar(args[0].state);
     }
     if (lazy.role === "status") {
+      sawStatus(ch, args[0]);
       const cmd = barCommand(ch, args[0]);
       if (cmd) daemon?.send(cmd);
       if (ch === "notification:show") { lazy.notificationActive = true; lazy.checkStatusIdle(); }

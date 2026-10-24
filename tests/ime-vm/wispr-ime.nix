@@ -5,6 +5,7 @@
 let
   wisprIme = pkgs.callPackage ../../wispr-ime { };
   helper = pkgs.callPackage ../../wispr-ime/helper.nix { wispr-flow-linux = wisprFlowLinux; };
+  headless = pkgs.callPackage ../../wispr-headless/daemon { };
 in
 import ./default.nix {
   inherit pkgs;
@@ -52,6 +53,7 @@ import ./default.nix {
   extraTestScript =
     ''
       HELPER = "${helper}/bin/wispr-flow-linux-helper"
+      HEADLESS = "${headless}/bin/wispr-headless"
     ''
     + builtins.readFile ./wispr-ime-test.py;
 }

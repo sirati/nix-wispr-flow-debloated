@@ -46,6 +46,14 @@
 #            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
 #            targetSeconds ? 5; maxSeconds ? 10;
 #            barColor ? "#15803d", the bar for dictations to the local model }
+#   hotkeys  dictation shortcuts wispr-headless watches itself, through an
+#            event tap with Wispr's Accessibility permission (see the NixOS
+#            module's headless.hotkeys). Default: hold Right Option to
+#            dictate with Wispr and, with localAsr, Right Command with the
+#            local model; the left keys stay as they are. Wispr's own
+#            shortcut (Settings > Shortcuts) should then use other keys
+#   typing   how wispr-headless types what the local model heard: "auto" or
+#            "paste" (Cmd+V, the clipboard put back after), "keys"
 {
   native,
   builders,
@@ -55,6 +63,8 @@
   signingIdentity ? "Wispr Flow local code signing (Nix)",
   barColor ? "#000000",
   localAsr ? null,
+  hotkeys ? null,
+  typing ? "auto",
 }:
 let
   local = {
@@ -113,6 +123,21 @@ let
     asrConfig = native.lib.optionalString (localAsr != null) "${asrConfig}";
     inherit barColor;
     localBarColor = local.barColor;
+    daemonArgs = builtins.concatStringsSep " " (
+      native.lib.concatMap (h: [
+        "--hotkey"
+        h
+      ]) (
+        if hotkeys != null then
+          hotkeys
+        else
+          [ "wispr:RightOption" ] ++ native.lib.optional (localAsr != null) "local:RightCommand"
+      )
+      ++ [
+        "--type-with"
+        typing
+      ]
+    );
   };
 
   profile = "/nix/var/nix/profiles/mac-wispr-flow";

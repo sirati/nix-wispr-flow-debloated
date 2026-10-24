@@ -45,7 +45,8 @@
       # The Mac app (see darwin/wispr-flow.nix). Cross
       # compiling needs an Apple SDK toolchain, which the caller provides:
       #   lib.macWisprFlow { native; builders; darwin; daemon; user; localAsr ? null; }
-      # with daemon = a cross build of ./wispr-headless/daemon.
+      # with daemon = a cross build of ./wispr-headless/daemon, and
+      # optionally signingIdentity, hotkeys and typing.
       lib.macWisprFlow = import ./darwin/wispr-flow.nix;
 
       # llama.cpp for Granite Speech (see llama-cpp/default.nix), cross-built

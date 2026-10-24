@@ -56,6 +56,19 @@ dictation in pieces of about 5 s while it is spoken (`targetSeconds`,
 green while a dictation goes to the local model (`localAsr.barColor`) and
 black otherwise (`headless.barColor`).
 
+`headless.hotkeys` makes wispr-headless watch dictation shortcuts itself,
+from /dev/input on any desktop, for example
+`[ "wispr:RightAlt" "local:RightCtrl" ]`: hold Right Alt to dictate with
+Wispr, Right Ctrl with the local model, whose text is then typed into the
+focused window. A held key becomes a dictation after 200 ms alone; another
+key while it is held makes it an ordinary shortcut. On macOS,
+`lib.macWisprFlow` holds Right Option for Wispr and, with `localAsr`, Right
+Command for the local model (`hotkeys` changes that); set Wispr's own
+shortcut to other keys. To try it by hand,
+`wispr-headless --hotkey-test --hotkey RightAlt` prints the keys pressed and
+what the shortcut does, and `echo text | wispr-headless --type-test` types
+into the focused window three seconds later.
+
 On macOS, `lib.macWisprFlow` cross-builds the app on Linux. The caller
 provides an Apple SDK toolchain:
 
@@ -100,3 +113,7 @@ wispr-flow-debloated.lib.macLlamaCpp {
       WISPR_ASR_WAVS=a.wav:b.wav cargo test real_model -- --ignored --nocapture
     wispr-headless/tests/electron/run.sh <wispr-headless binary>
     tests/ime-vm/run-wispr-ime.sh
+    tests/kde-vm/run.sh
+
+The KDE test runs Plasma on Wayland in a VM with a stand-in keyboard: the
+shortcut from /dev/input and typing through /dev/uinput.
