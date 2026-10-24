@@ -15,7 +15,8 @@
 //!
 //! Use: `Asr::start` when a dictation starts, `Dictation::feed` with its
 //! audio as it arrives, `Dictation::finish` for the text when it ends.
-//! Dropping an unfinished Dictation cancels it.
+//! Dropping an unfinished Dictation cancels it. `Dictation::failure` tells
+//! early that it failed (the server died while the user still speaks).
 
 mod prompt;
 mod segment;
@@ -104,6 +105,9 @@ impl Settings {
 
 type Log = Arc<dyn Fn(String) + Send + Sync>;
 
+/// How often a dictation waiting for audio checks that the server is up.
+const CHECK_EVERY: Duration = Duration::from_millis(250);
+
 /// Transcribes the pieces of a dictation: llama-server, or a stand-in in
 /// tests.
 trait Engine: Send + 'static {
@@ -112,6 +116,9 @@ trait Engine: Send + 'static {
     /// a piece.
     fn prime(&mut self) -> Result<(), String>;
     fn transcribe(&mut self, pcm: &[i16]) -> Result<String, String>;
+    /// Err with the reason once it can no longer transcribe (the server
+    /// died). Asked while waiting for audio.
+    fn check(&mut self) -> Result<(), String>;
 }
 
 struct Llama {
@@ -143,9 +150,14 @@ impl Llama {
         keywords.truncate(prompt::fit_estimate(&keywords, longest).len());
         let context = prompt::context_for(&prompt::prompt(&keywords), longest);
         let mut lease = slot.take(settings, cancelled)?;
-        if !lease.server.as_ref().is_some_and(|s| s.context >= context) {
+        // A kept server may have died meanwhile.
+        if !lease
+            .server
+            .as_mut()
+            .is_some_and(|s| s.context >= context && s.ended().is_none())
+        {
             lease.server = None;
-            lease.server = Some(Server::spawn(settings, context)?);
+            lease.server = Some(Server::spawn(settings, context, &**log)?);
         }
         let server = lease.server.as_mut().expect("just started");
         server.ready(cancelled)?;
@@ -190,6 +202,17 @@ impl Engine for Llama {
 
     fn transcribe(&mut self, pcm: &[i16]) -> Result<String, String> {
         self.ask(pcm, prompt::max_tokens(pcm.len()))
+    }
+
+    fn check(&mut self) -> Result<(), String> {
+        let server = self.lease.server.as_mut().expect("loaded");
+        match server.ended() {
+            None => Ok(()),
+            Some(why) => {
+                self.lease.healthy = false;
+                Err(why)
+            }
+        }
     }
 }
 
@@ -341,6 +364,8 @@ impl Shared {
 pub struct Dictation {
     shared: Arc<Shared>,
     result: Receiver<Result<String, String>>,
+    /// What `failure` already took from `result`.
+    outcome: Option<Result<String, String>>,
     /// The odd byte of the last feed.
     carry: Option<u8>,
     finished: bool,
@@ -373,6 +398,7 @@ impl Dictation {
         Dictation {
             shared,
             result,
+            outcome: None,
             carry: None,
             finished: false,
         }
@@ -411,10 +437,29 @@ impl Dictation {
             state.segmenter.finish(total);
         }
         self.shared.wake.notify_all();
-        self.result
-            .recv()
-            .unwrap_or_else(|_| Err("the transcription stopped".into()))
+        match self.outcome.take() {
+            Some(outcome) => outcome,
+            None => self.result.recv().unwrap_or_else(|_| Err(stopped())),
+        }
     }
+
+    /// Without waiting: the error the transcription already ended with, if
+    /// it did (the server died, say), while audio is still being fed.
+    /// `finish` then returns the same.
+    pub fn failure(&mut self) -> Option<String> {
+        if self.outcome.is_none() {
+            self.outcome = match self.result.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(stopped())),
+            };
+        }
+        self.outcome.as_ref()?.as_ref().err().cloned()
+    }
+}
+
+fn stopped() -> String {
+    "the transcription stopped".into()
 }
 
 impl Drop for Dictation {
@@ -454,6 +499,7 @@ fn work<E: Engine>(
     let mut texts: Vec<String> = Vec::new();
     let mut requests = 0;
     let mut busy = Duration::ZERO;
+    let mut checked = Instant::now();
     loop {
         let (job, pcm) = {
             let mut state = shared.state();
@@ -481,7 +527,23 @@ fn work<E: Engine>(
                     ));
                     return (Ok(texts.join(" ")), Some(engine));
                 }
-                state = shared.wake.wait(state).expect("dictation lock poisoned");
+                // Every so often, while audio keeps coming or not: is the
+                // engine still there?
+                let wait = CHECK_EVERY.saturating_sub(checked.elapsed());
+                if wait.is_zero() {
+                    drop(state);
+                    if let Err(e) = engine.check() {
+                        return (Err(e), None);
+                    }
+                    checked = Instant::now();
+                    state = shared.state();
+                    continue;
+                }
+                state = shared
+                    .wake
+                    .wait_timeout(state, wait)
+                    .expect("dictation lock poisoned")
+                    .0;
             }
         };
         // Silence is not sent: the model would make words of it.
@@ -519,6 +581,9 @@ mod tests {
         /// The load gave up: the dictation was cancelled.
         load_cancelled: bool,
         dropped: bool,
+        /// Set by the test: the engine is gone.
+        dead: bool,
+        checks: usize,
     }
 
     struct Fake {
@@ -544,6 +609,15 @@ mod tests {
             }
             self.calls.lock().unwrap().pieces.push(pcm.len());
             Ok(format!("[{}ms]", pcm.len() / 16))
+        }
+
+        fn check(&mut self) -> Result<(), String> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.checks += 1;
+            match calls.dead {
+                true => Err("the model is gone".into()),
+                false => Ok(()),
+            }
         }
     }
 
@@ -700,14 +774,40 @@ mod tests {
         });
     }
 
-    /// Settings whose server is a shell script that only waits.
-    fn sleeper(dir: &std::path::Path, idle_seconds: f64) -> Settings {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("fake-llama-server");
-        std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[test]
+    fn a_dead_engine_fails_the_dictation_while_it_records() {
+        let (mut d, calls) = dictation(loaded_at_once(), false);
+        wait_for("the prompt", || calls.lock().unwrap().primes == 1);
+        d.feed(&bytes(&audio(&[Speech(1_000)])));
+        assert_eq!(d.failure(), None);
+        calls.lock().unwrap().dead = true;
+        let start = Instant::now();
+        // While audio keeps coming, as it does while the user speaks.
+        wait_for("the failure", || {
+            d.feed(&bytes(&audio(&[Quiet(20)])));
+            d.failure().is_some()
+        });
+        assert!(start.elapsed() < Duration::from_secs(1), "noticed in time");
+        assert_eq!(d.failure().unwrap(), "the model is gone");
+        assert_eq!(d.finish().unwrap_err(), "the model is gone");
+        assert!(calls.lock().unwrap().dropped);
+    }
+
+    #[test]
+    fn a_live_dictation_has_no_failure_and_keeps_its_text() {
+        let (mut d, calls) = dictation(loaded_at_once(), false);
+        d.feed(&bytes(&audio(&[Speech(1_000)])));
+        wait_for("a check", || calls.lock().unwrap().checks > 0);
+        assert_eq!(d.failure(), None);
+        assert_eq!(d.finish().unwrap(), "[1000ms]");
+    }
+
+    /// Settings whose server is the shell script `body`.
+    fn stand_in(dir: &std::path::Path, body: &str, idle_seconds: f64) -> Settings {
         Settings {
-            server: path.to_string_lossy().into_owned(),
+            server: server::tests::script(dir, body)
+                .to_string_lossy()
+                .into_owned(),
             model: String::new(),
             mmproj: String::new(),
             keywords: None,
@@ -718,10 +818,15 @@ mod tests {
         }
     }
 
+    /// Settings whose server is a shell script that only waits.
+    fn sleeper(dir: &std::path::Path, idle_seconds: f64) -> Settings {
+        stand_in(dir, "exec sleep 30", idle_seconds)
+    }
+
     /// A turn with a fresh server, as after a successful load.
     fn loaded_lease(slot: &Arc<Slot>, settings: &Settings) -> (Lease, PathBuf) {
         let mut lease = slot.take(settings, &|| false).unwrap();
-        let server = Server::spawn(settings, 1_024).unwrap();
+        let server = Server::spawn(settings, 1_024, &|_| {}).unwrap();
         let socket = server.socket().to_path_buf();
         lease.server = Some(server);
         lease.healthy = true;
@@ -734,6 +839,7 @@ mod tests {
 
     #[test]
     fn a_waiting_dictation_takes_over_the_server() {
+        let _one = server::one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let settings = sleeper(dir.path(), 0.0);
         let slot = Arc::new(Slot::default());
@@ -751,6 +857,7 @@ mod tests {
 
     #[test]
     fn without_a_waiting_dictation_the_server_stops_or_idles() {
+        let _one = server::one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let slot = Arc::new(Slot::default());
         let (lease, _) = loaded_lease(&slot, &sleeper(dir.path(), 0.0));
@@ -765,6 +872,7 @@ mod tests {
 
     #[test]
     fn a_failed_server_is_not_handed_on() {
+        let _one = server::one_at_a_time();
         let dir = tempfile::tempdir().unwrap();
         let settings = sleeper(dir.path(), 10.0);
         let slot = Arc::new(Slot::default());
@@ -773,6 +881,120 @@ mod tests {
         drop(lease);
         assert!(!kept(&slot));
         assert!(slot.take(&settings, &|| false).unwrap().server.is_none());
+    }
+
+    /// The pids the stand-in servers wrote to `dir` that still run.
+    fn running(dir: &std::path::Path) -> (usize, usize) {
+        let pids: Vec<i32> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        let alive = pids.iter().filter(|&&p| server::tests::alive(p)).count();
+        (alive, pids.len())
+    }
+
+    #[test]
+    fn there_is_never_more_than_one_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        std::fs::create_dir(&pids).unwrap();
+        // Never ready, so each dictation is still loading when it goes.
+        let body = format!("echo $$ > '{}'/$$\nexec sleep 30", pids.display());
+        let asr = Asr::new(stand_in(dir.path(), &body, 0.0), |_| {});
+        let stop = Arc::new(AtomicBool::new(false));
+        let monitor = {
+            let (pids, stop) = (pids.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut most = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    most = most.max(running(&pids).0);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                most
+            })
+        };
+        let mut random = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+            | 1;
+        let mut next = move |n: u64| {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random % n
+        };
+        let mut live = std::collections::VecDeque::new();
+        for _ in 0..40 {
+            // Starts while the last is still loading: it waits for its turn.
+            live.push_back(asr.start());
+            std::thread::sleep(Duration::from_millis(next(60)));
+            match next(4) {
+                0 => drop(live.pop_front()),
+                1 => drop(live.pop_back()),
+                2 => live.clear(),
+                _ => {}
+            }
+            if live.len() > 3 {
+                drop(live.pop_front());
+            }
+        }
+        drop(live);
+        wait_for("the last server to go", || running(&pids).0 == 0);
+        stop.store(true, Ordering::Relaxed);
+        let most = monitor.join().unwrap();
+        let (_, started) = running(&pids);
+        assert!(started > 1, "only {started} servers started");
+        assert!(most <= 1, "{most} servers at once");
+    }
+
+    #[test]
+    fn a_server_that_dies_while_recording_fails_the_dictation() {
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let (host, die) = (dir.path().join("host"), dir.path().join("die"));
+        // Tells the test its socket ("--host"), which the test then serves,
+        // and dies when told to.
+        let body = format!(
+            "echo \"$6\" > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\n\
+             echo 'error: out of memory'\nexit 1",
+            host.display(),
+            die.display()
+        );
+        let asr = Asr::new(stand_in(dir.path(), &body, 0.0), |_| {});
+        let mut d = asr.start();
+        let mut socket = String::new();
+        wait_for("the server to start", || {
+            socket = std::fs::read_to_string(&host).unwrap_or_default();
+            socket.ends_with('\n')
+        });
+        let asked = server::tests::answer_on(
+            std::path::Path::new(socket.trim_end()),
+            server::tests::answer("200 OK", r#"{"tokens":[1,2],"text":"hi"}"#),
+        );
+        // Loaded, and the prompt sent: recording, nothing left to do.
+        let prime = std::iter::from_fn(|| asked.recv_timeout(Duration::from_secs(10)).ok())
+            .find(|r| r.starts_with(b"POST /v1/audio/transcriptions"));
+        assert!(prime.is_some(), "the prompt was sent");
+        d.feed(&bytes(&audio(&[Quiet(500)])));
+        assert_eq!(d.failure(), None);
+        std::fs::write(&die, "").unwrap();
+        let start = Instant::now();
+        // While audio keeps coming, as it does while the user speaks.
+        wait_for("the failure", || {
+            d.feed(&bytes(&audio(&[Quiet(20)])));
+            d.failure().is_some()
+        });
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "noticed after {:?}",
+            start.elapsed()
+        );
+        let e = d.failure().unwrap();
+        assert!(e.contains("llama-server ended") && e.contains("out of memory"), "{e}");
+        assert_eq!(d.finish().unwrap_err(), e);
     }
 
     #[test]
@@ -917,7 +1139,8 @@ mod tests {
             .unwrap_or_default();
         let ask = prompt::prompt(&keywords);
         let longest = 30 * RATE;
-        let mut server = Server::spawn(&settings, prompt::context_for(&ask, longest)).unwrap();
+        let mut server =
+            Server::spawn(&settings, prompt::context_for(&ask, longest), &|_| {}).unwrap();
         server.ready(&|| false).unwrap();
         let primed = Instant::now();
         server.transcribe(&[0; RATE / 10], &ask, 1).unwrap();
