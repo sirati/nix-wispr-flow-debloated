@@ -99,6 +99,20 @@ let
       // lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
     )
   );
+  # Its own dictation shortcuts, and how it types a transcript it finishes
+  # itself; wl-copy is for pasting on Wayland.
+  daemonArgs = lib.concatStringsSep " " (
+    lib.concatMap (h: [
+      "--hotkey"
+      h
+    ]) cfg.headless.hotkeys
+    ++ [
+      "--type-with"
+      cfg.headless.typing
+      "--wl-copy"
+      "${pkgs.wl-clipboard}/bin/wl-copy"
+    ]
+  );
   headlessShim = pkgs.replaceVars ./wispr-headless/shim.js {
     daemon = "${headlessDaemon}/bin/wispr-headless";
     pwcat = "${pkgs.pipewire}/bin/pw-cat";
@@ -109,6 +123,7 @@ let
     asrConfig = lib.optionalString local.enable "${asrConfig}";
     barColor = cfg.headless.barColor;
     localBarColor = local.barColor;
+    inherit daemonArgs;
     # macOS only (darwin/wispr-flow.nix).
     captureCmd = "";
     deviceName = "";
@@ -339,6 +354,41 @@ in
           ];
           description = "More arguments for llama-server.";
         };
+      };
+      hotkeys = lib.mkOption {
+        type = lib.types.listOf (lib.types.strMatching "[^[:space:]]+");
+        default = [ ];
+        example = [
+          "RightAlt"
+          "toggle:RightAlt+Space"
+          "toggle:BTN_TASK"
+        ];
+        description = ''
+          Dictation shortcuts that wispr-headless reads from /dev/input
+          itself, on any desktop (the users need to be in `users`). Wispr
+          dictates on them as if its bar were clicked. `Key+Key` holds to
+          talk; `toggle:` starts and stops hands-free; a hold that grows into
+          a toggle binding turns hands-free, like Wispr's Fn+Space. Keys
+          Wispr also binds would start it twice. Names are listed in
+          wispr-headless/daemon/src/hotkey/keys.rs; any evdev name (KEY_*,
+          BTN_* for mouse buttons) works too, and `wispr-headless
+          --hotkey-test` prints the names of the keys pressed.
+        '';
+      };
+      typing = lib.mkOption {
+        type = lib.types.enum [
+          "auto"
+          "ime"
+          "keys"
+          "paste"
+        ];
+        default = "auto";
+        description = ''
+          How wispr-headless types a transcript it finishes itself, not
+          through Wispr (see wispr-headless/daemon/src/typing/mod.rs).
+          `auto`: wispr-ime on GNOME, else key presses through /dev/uinput
+          (Wayland) or XTEST (X11), pasting what the layout cannot type.
+        '';
       };
     };
 

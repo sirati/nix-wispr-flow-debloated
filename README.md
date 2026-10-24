@@ -56,6 +56,15 @@ dictation in pieces of about 5 s while it is spoken (`targetSeconds`,
 green while a dictation goes to the local model (`localAsr.barColor`) and
 black otherwise (`headless.barColor`).
 
+`headless.hotkeys` makes wispr-headless watch dictation shortcuts itself,
+from /dev/input on any desktop, for example
+`[ "RightAlt" "toggle:RightAlt+Space" ]`: hold Right Alt to talk, add Space to
+go hands-free. Wispr dictates on them as if its bar were clicked. On macOS,
+pass `hotkeys` to `lib.macWisprFlow`. To try it by hand,
+`wispr-headless --hotkey-test --hotkey RightAlt` prints the keys pressed and
+what the shortcut does, and `echo text | wispr-headless --type-test` types
+into the focused window three seconds later.
+
 On macOS, `lib.macWisprFlow` cross-builds the app on Linux. The caller
 provides an Apple SDK toolchain:
 
