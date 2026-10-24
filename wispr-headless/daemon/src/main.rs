@@ -1,13 +1,19 @@
-// Safe Rust, except mic_mac.rs: objc2 marks AVFoundation calls unsafe until
-// they are reviewed upstream, so that module allows it (see its header).
+// Safe Rust, except the macOS modules that call C APIs: mic_mac.rs (objc2
+// marks AVFoundation calls unsafe until they are reviewed upstream),
+// hotkey/mac.rs and typing/mac.rs; each allows it (see their headers).
 #![deny(unsafe_code)]
 //! Stands in for Wispr Flow's hidden windows while they are not rendered:
 //! records the microphone for its dictation and draws the speech indicator.
 //! Spawned by the Electron shim (wispr-headless/shim.js), which speaks to it
 //! in JSON lines on stdin/stdout. Exits when stdin closes.
+//!
+//! It can also watch the dictation shortcut itself (`--hotkey`, hotkey/)
+//! and type text into the focused app (typing/), for dictation that does
+//! not go through Wispr. `--hotkey-test` and `--type-test` try them out.
 
 mod asr;
 mod bar;
+mod hotkey;
 #[cfg(target_os = "macos")]
 mod mic_mac;
 mod mics;
@@ -20,6 +26,7 @@ mod recorder;
 mod resample;
 #[cfg(target_os = "linux")]
 mod text;
+mod typing;
 mod wave;
 
 #[cfg(target_os = "macos")]
@@ -27,17 +34,33 @@ use pill_mac as pill;
 #[cfg(target_os = "linux")]
 use pill_x11 as pill;
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::process::{Command as Process, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bar::{BarEvent, PillCommand};
+use hotkey::Hotkey;
 use protocol::{Backend, Command, Event};
 use recorder::{Progress, Recording};
 
+/// What the process is run for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// Wispr's recorder and bar, for the shim.
+    Shim,
+    /// Prints the keys and what the `--hotkey` bindings make of them.
+    HotkeyTest,
+    /// Types stdin into the focused app.
+    TypeTest,
+}
+
 struct Config {
+    run: Run,
+    /// `--hotkey` bindings (hotkey/keys.rs).
+    hotkeys: Vec<String>,
+    typing: typing::Options,
     /// The capture command without its device (see `capture_for`).
     capture: Vec<String>,
     /// The input given on the command line (Nix's micTarget), which wins over
@@ -85,9 +108,27 @@ fn config() -> Config {
     let mut asr_config = None;
     let mut fill = bar::WISPR_FILL;
     let mut local_fill = bar::LOCAL_FILL;
+    let mut run = Run::Shim;
+    let mut hotkeys = Vec::new();
+    let mut typing = typing::Options::default();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            // A dictation shortcut, e.g. RightAlt or toggle:RightAlt+Space;
+            // may be given more than once.
+            "--hotkey" => hotkeys.extend(args.next()),
+            // auto, ime, keys or paste (typing/mod.rs).
+            "--type-with" => {
+                if let Some(m) = args.next() {
+                    match typing::Method::parse(&m) {
+                        Ok(m) => typing.method = m,
+                        Err(e) => eprintln!("wispr-headless: --type-with {e}"),
+                    }
+                }
+            }
+            "--wl-copy" => typing.wl_copy = args.next(),
+            "--hotkey-test" => run = Run::HotkeyTest,
+            "--type-test" => run = Run::TypeTest,
             "--pw-cat" => {
                 if let Some(p) = args.next() {
                     capture[0] = p.clone();
@@ -133,6 +174,9 @@ fn config() -> Config {
         }
     }
     Config {
+        run,
+        hotkeys,
+        typing,
         capture,
         target: target.filter(|t| !t.is_empty()),
         device,
@@ -216,6 +260,19 @@ fn start_recording(
     #[cfg(not(target_os = "macos"))]
     let _ = (out, ready);
     Recording::start(uuid.to_string(), &capture, device, clock_ms)
+}
+
+/// A recording started ahead of Wispr's request (`early` in serve()).
+fn start_early(
+    cfg: &Config,
+    chosen: Option<&mics::Native>,
+    clock_ms: f64,
+    out: &Out,
+    ready: &mut Ready,
+) -> Option<(Recording, Instant)> {
+    start_recording(cfg, "", chosen, clock_ms, out, ready)
+        .ok()
+        .map(|r| (r, Instant::now()))
 }
 
 /// macOS: the input unit kept prepared (microphone off) for the input the
@@ -329,8 +386,78 @@ fn local_failed(out: &Out, pill_tx: &mpsc::Sender<PillCommand>, error: String) {
     out.send(&Event::TranscriptFailed { error });
 }
 
+/// `--hotkey-test`: prints each key going down and up, by the name a
+/// binding would use, and what the `--hotkey` bindings make of it. Without
+/// bindings every device with keys is read, to find a key's name.
+fn hotkey_test(cfg: &Config) -> ! {
+    let bindings = hotkey::parse_bindings(&cfg.hotkeys).unwrap_or_else(|e| {
+        eprintln!("wispr-headless: --hotkey {e}");
+        std::process::exit(2)
+    });
+    let wanted: Vec<hotkey::Key> = if bindings.is_empty() {
+        (1..0x300).collect()
+    } else {
+        bindings.iter().flat_map(|b| b.keys.clone()).collect()
+    };
+    let (tx, rx) = mpsc::channel();
+    let log: hotkey::Log = Arc::new(|msg| eprintln!("{msg}"));
+    if let Err(e) = hotkey::watch(&wanted, tx, log) {
+        eprintln!("wispr-headless: {e}");
+        std::process::exit(1);
+    }
+    let mut chord = hotkey::Chord::new(bindings, hotkey::CANCEL_WINDOW);
+    let mut out = std::io::stdout().lock();
+    for (key, down) in rx {
+        let _ = writeln!(
+            out,
+            "{} {}",
+            hotkey::key_name(key),
+            if down { "down" } else { "up" }
+        );
+        for e in chord.key(key, down, Instant::now()) {
+            let _ = writeln!(out, "  {}", e.name());
+        }
+        let _ = out.flush();
+    }
+    std::process::exit(1)
+}
+
+/// `--type-test`: types stdin (one final new line dropped) into whatever
+/// has focus three seconds later (tests: WISPR_HEADLESS_TEST_TYPE_DELAY_MS).
+fn type_test(cfg: &Config) -> ! {
+    let mut text = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut text) {
+        eprintln!("wispr-headless: stdin: {e}");
+        std::process::exit(2);
+    }
+    let text = text.strip_suffix('\n').unwrap_or(&text);
+    let log: typing::Log = Arc::new(|msg| eprintln!("{msg}"));
+    let mut typist = typing::Typist::new(cfg.typing.clone(), log).unwrap_or_else(|e| {
+        eprintln!("wispr-headless: {e}");
+        std::process::exit(1)
+    });
+    let delay = std::env::var("WISPR_HEADLESS_TEST_TYPE_DELAY_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or(3000);
+    eprintln!("typing in {} seconds; focus a text field", delay / 1000);
+    std::thread::sleep(Duration::from_millis(delay));
+    match typist.type_text(text) {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("wispr-headless: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn main() {
     let cfg = config();
+    match cfg.run {
+        Run::HotkeyTest => hotkey_test(&cfg),
+        Run::TypeTest => type_test(&cfg),
+        Run::Shim => {}
+    }
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
 
     // The flow bar keeps the main thread (AppKit needs it on macOS); commands
@@ -436,6 +563,25 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
     });
     let internal = cmd_tx.clone();
 
+    // Our own dictation shortcut, if bindings are given.
+    if !cfg.hotkeys.is_empty() {
+        let log_out = Out(out.0.clone());
+        let log: hotkey::Log = Arc::new(move |msg| log_out.send(&Event::Log { msg }));
+        let to_serve = cmd_tx.clone();
+        let started = hotkey::parse_bindings(&cfg.hotkeys).and_then(|bindings| {
+            hotkey::spawn(
+                bindings,
+                move |h| {
+                    let _ = to_serve.send(Some(Command::Hotkey(h)));
+                },
+                log.clone(),
+            )
+        });
+        if let Err(e) = started {
+            log(format!("no dictation shortcut: {e}"));
+        }
+    }
+
     {
         let log_out = Out(out.0.clone());
         std::thread::spawn(move || {
@@ -535,23 +681,32 @@ fn serve(cfg: &Config, out: &Out, pill_tx: &mpsc::Sender<PillCommand>) {
             Ok(Some(Command::Early)) => {
                 if recording.is_none() && early.is_none() && local.is_none() {
                     let mic = chosen(&ranked);
-                    if let Ok(r) =
-                        start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
-                    {
-                        early = Some((r, Instant::now()));
-                    }
+                    early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready);
                 }
             }
             Ok(Some(Command::EarlyCancel)) => early = None,
+            // Our own shortcut (--hotkey). The shim dictates on it with
+            // Wispr's bar buttons; recording starts at once, as for Early.
+            // (A dictation that does not go through Wispr starts and stops
+            // its own recording on these instead.)
+            Ok(Some(Command::Hotkey(h))) => {
+                out.send(&Event::Hotkey {
+                    state: h.name().into(),
+                });
+                match h {
+                    Hotkey::Pressed if recording.is_none() && early.is_none() => {
+                        let mic = chosen(&ranked);
+                        early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready);
+                    }
+                    Hotkey::Cancelled => early = None,
+                    _ => {}
+                }
+            }
             Ok(Some(Command::Status { value })) => {
                 match value.as_str() {
                     "initializing" if recording.is_none() && early.is_none() && local.is_none() => {
                         let mic = chosen(&ranked);
-                        if let Ok(r) =
-                            start_recording(cfg, "", mic.as_ref(), clock_ms(), out, &mut ready)
-                        {
-                            early = Some((r, Instant::now()));
-                        }
+                        early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready);
                     }
                     "idle" | "dismissed" | "error" => early = None,
                     _ => {}
@@ -701,6 +856,9 @@ mod tests {
 
     fn cfg(capture: &str, target: Option<&str>) -> Config {
         Config {
+            run: Run::Shim,
+            hotkeys: Vec::new(),
+            typing: typing::Options::default(),
             capture: capture.split(' ').map(String::from).collect(),
             target: target.map(String::from),
             device: "Default".into(),
