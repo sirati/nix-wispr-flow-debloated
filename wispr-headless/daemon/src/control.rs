@@ -73,6 +73,9 @@ pub enum Input {
     Transcribed { ok: bool },
     /// The flow bar's button: start, stop or cancel.
     BarClick(String),
+    /// The Undo of a cancelled local dictation's notice: transcribe it after
+    /// all.
+    Undo,
     /// Time passed.
     Tick,
 }
@@ -88,8 +91,14 @@ pub enum Action {
     StartLocal { hands_free: bool },
     /// Stop recording; transcribe the rest (then Input::Transcribed).
     EndLocal,
-    /// Drop the local dictation untranscribed.
+    /// Stop the local dictation untranscribed, keeping it for a while for
+    /// the bar's Undo.
     CancelLocal,
+    /// Transcribe the cancelled local dictation after all (then
+    /// Input::Transcribed).
+    UndoLocal,
+    /// Another dictation starts: forget the cancelled one and its Undo.
+    DropCancelled,
     /// Drop it and report the error.
     FailLocal(String),
     /// Ask the shim to press (true) or release Wispr's shortcut key.
@@ -289,6 +298,7 @@ impl Control {
                         out.push(Action::WisprClick("cancel"));
                     } else {
                         self.local_bar = false;
+                        out.push(Action::DropCancelled);
                     }
                     self.wispr_recording = true;
                     self.wispr_hands_free = false;
@@ -365,6 +375,14 @@ impl Control {
                     }
                 }
             }
+            Input::Undo => {
+                self.finishing += 1;
+                out.push(Action::UndoLocal);
+                if self.phase == Phase::Idle && !self.wispr_recording {
+                    self.local_bar = true;
+                    out.push(Action::BarStatus("processing"));
+                }
+            }
             Input::Tick => {
                 if let Phase::Local { since, .. } = self.phase {
                     if now.duration_since(since) >= self.max {
@@ -390,6 +408,7 @@ impl Control {
         now: Instant,
         out: &mut Vec<Action>,
     ) {
+        out.push(Action::DropCancelled);
         match backend {
             Backend::Local => {
                 self.phase = Phase::Local {
@@ -495,6 +514,8 @@ mod tests {
         log: Vec<String>,
         early: bool,
         local: bool,
+        /// A cancelled local dictation waits for its Undo.
+        cancelled: bool,
         /// Local dictations being transcribed (the model's threads).
         finishing: usize,
         ptt: bool,
@@ -537,6 +558,7 @@ mod tests {
                 log: Vec::new(),
                 early: false,
                 local: false,
+                cancelled: false,
                 finishing: 0,
                 ptt: false,
                 wispr: WisprSim::Idle,
@@ -646,10 +668,20 @@ mod tests {
                     self.local = false;
                     self.finishing += 1;
                 }
-                CancelLocal | FailLocal(_) => {
+                CancelLocal => {
+                    assert!(self.local);
+                    self.local = false;
+                    self.cancelled = true;
+                }
+                FailLocal(_) => {
                     assert!(self.local);
                     self.local = false;
                 }
+                UndoLocal => {
+                    assert!(std::mem::take(&mut self.cancelled));
+                    self.finishing += 1;
+                }
+                DropCancelled => self.cancelled = false,
                 WisprKey(key, down) => self.wispr_key(key, down),
                 WisprClick(c) => {
                     self.clicks.push(c);
@@ -918,6 +950,39 @@ mod tests {
         assert_eq!(s.bar.last(), Some(&"idle"));
         s.up(1_050, ESC);
         s.settle(2_000);
+    }
+
+    #[test]
+    fn undo_transcribes_a_cancelled_local_dictation() {
+        let mut s = Sim::new();
+        s.tap(0, COMMAND);
+        s.down(200, COMMAND);
+        s.up(250, COMMAND);
+        s.down(1_000, ESC);
+        s.up(1_050, ESC);
+        assert!(s.cancelled && s.finishing == 0);
+        s.feed(Input::Undo);
+        assert!(!s.cancelled && s.finishing == 1);
+        assert_eq!(s.bar.last(), Some(&"processing"));
+        s.transcribed(true);
+        assert_eq!(s.bar.last(), Some(&"idle"));
+        s.settle(2_000);
+    }
+
+    #[test]
+    fn a_new_dictation_forgets_the_cancelled_one() {
+        let mut s = Sim::new();
+        s.tap(0, COMMAND);
+        s.down(200, COMMAND);
+        s.up(250, COMMAND);
+        s.down(1_000, ESC);
+        s.up(1_050, ESC);
+        assert!(s.cancelled);
+        s.down(2_000, OPTION);
+        s.advance(2_500);
+        assert!(!s.cancelled);
+        s.up(3_000, OPTION);
+        s.settle(4_000);
     }
 
     #[test]

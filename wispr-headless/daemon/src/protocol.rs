@@ -76,6 +76,12 @@ pub enum Command {
     /// Internal: a click on the flow bar: start, stop or cancel.
     #[serde(skip)]
     BarClick(String),
+    /// Internal: a click on a button of the bar's notice, by index.
+    #[serde(skip)]
+    NoticeAction { index: usize },
+    /// Internal: the bar's notice closed: "timeout" or "action".
+    #[serde(skip)]
+    NoticeClosed { reason: String },
 }
 
 /// Timing figures Wispr's Hub reports with `dictation:recordingDone`, in

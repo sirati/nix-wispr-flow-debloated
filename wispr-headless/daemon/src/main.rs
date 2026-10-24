@@ -433,15 +433,31 @@ struct Local {
     level: bar::LevelScale,
 }
 
-/// Ends a local dictation: the rest of its audio goes to the model, and the
-/// text comes back as Command::Transcribed.
-fn end_local(local: Local, commands: &mpsc::Sender<Option<Command>>) {
+/// The bar's notice for a cancelled local dictation, while it shows: the
+/// dictation, until its Undo is clicked.
+struct LocalNotice {
+    dictation: Option<asr::Dictation>,
+}
+
+/// How long the notice of a cancelled local dictation offers its Undo (the
+/// bar holds it while the pointer is over it).
+const UNDO_FOR: Duration = Duration::from_secs(5);
+
+/// Stops a local dictation's recording; the rest of its audio goes to the
+/// model.
+fn stop_local(local: Local) -> asr::Dictation {
     let Local {
         recording,
         mut dictation,
         ..
     } = local;
     dictation.feed(&recording.finish_pcm());
+    dictation
+}
+
+/// The text of a stopped local dictation comes back as
+/// Command::Transcribed.
+fn transcribe(dictation: asr::Dictation, commands: &mpsc::Sender<Option<Command>>) {
     let commands = commands.clone();
     std::thread::spawn(move || {
         let result = dictation.finish();
@@ -580,7 +596,6 @@ fn main() {
         });
     }
     let log_out = Out(out.0.clone());
-    let event_out = Out(out.0.clone());
     pill::run(
         pill_rx,
         fonts.as_deref(),
@@ -591,10 +606,16 @@ fn main() {
                 let _ = clicks.send(Some(Command::BarClick(action.to_string())));
             }
             // Notification results go straight to the shim.
-            BarEvent::NoticeAction(index) => event_out.send(&Event::NoticeAction { index }),
-            BarEvent::NoticeClosed(reason) => event_out.send(&Event::NoticeClosed {
-                reason: reason.to_string(),
-            }),
+            // The notice may be a cancelled local dictation's: serve()
+            // decides.
+            BarEvent::NoticeAction(index) => {
+                let _ = clicks.send(Some(Command::NoticeAction { index }));
+            }
+            BarEvent::NoticeClosed(reason) => {
+                let _ = clicks.send(Some(Command::NoticeClosed {
+                    reason: reason.to_string(),
+                }));
+            }
         },
     );
     // The bar only stops once serve() is done and about to exit.
@@ -791,6 +812,8 @@ fn serve(
     let mut early: Option<(Recording, Instant)> = None;
     // A dictation of our own that the local model transcribes.
     let mut local: Option<Local> = None;
+    // The bar's notice is a cancelled local dictation's, not Wispr's.
+    let mut local_notice: Option<LocalNotice> = None;
     let chosen = |ranked: &[mics::Ranked]| {
         let inputs = inputs.lock().expect("inputs lock poisoned");
         mics::choose(ranked, &inputs).cloned()
@@ -940,6 +963,8 @@ fn serve(
                 actions,
                 timeout,
             })) => {
+                // Wispr's notice takes the bar's place.
+                local_notice = None;
                 let _ = pill_tx.send(PillCommand::Notify {
                     title,
                     actions,
@@ -947,7 +972,22 @@ fn serve(
                 });
             }
             Ok(Some(Command::NotifyClear)) => {
-                let _ = pill_tx.send(PillCommand::NotifyClear);
+                if local_notice.is_none() {
+                    let _ = pill_tx.send(PillCommand::NotifyClear);
+                }
+            }
+            Ok(Some(Command::NoticeAction { index })) => match &local_notice {
+                Some(n) => {
+                    if n.dictation.is_some() {
+                        pending.push_back(control::Input::Undo);
+                    }
+                }
+                None => out.send(&Event::NoticeAction { index }),
+            },
+            Ok(Some(Command::NoticeClosed { reason })) => {
+                if local_notice.take().is_none() {
+                    out.send(&Event::NoticeClosed { reason });
+                }
             }
             Ok(Some(Command::Key { key, down })) => {
                 if let (Some(s), HotkeySource::Stdin) = (&shortcut, cfg.hotkey_source) {
@@ -1020,6 +1060,7 @@ fn serve(
                 ready: &mut ready,
                 early: &mut early,
                 local: &mut local,
+                local_notice: &mut local_notice,
             };
             run_control(&mut ctl, &mut pending, &mut |a| act(a, &mut effects));
         }
@@ -1094,6 +1135,7 @@ struct Effects<'a> {
     ready: &'a mut Ready,
     early: &'a mut Option<(Recording, Instant)>,
     local: &'a mut Option<Local>,
+    local_notice: &'a mut Option<LocalNotice>,
 }
 
 /// Carries out one of control.rs's answers; may have news for it.
@@ -1151,13 +1193,35 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                 if let Some(sound) = &e.cfg.local_stop_sound {
                     play_file(e.cfg, sound, e.out);
                 }
-                end_local(l, e.internal);
+                transcribe(stop_local(l), e.internal);
                 let _ = e.relist.send(());
             }
         }
         Action::CancelLocal => {
-            if e.local.take().is_some() {
+            if let Some(l) = e.local.take() {
+                *e.local_notice = Some(LocalNotice {
+                    dictation: Some(stop_local(l)),
+                });
+                let _ = e.pill_tx.send(PillCommand::Notify {
+                    title: "Transcript cancelled".into(),
+                    actions: vec!["Undo".into()],
+                    timeout: UNDO_FOR,
+                });
                 let _ = e.relist.send(());
+            }
+        }
+        Action::UndoLocal => {
+            match e.local_notice.as_mut().and_then(|n| n.dictation.take()) {
+                Some(dictation) => {
+                    let _ = e.pill_tx.send(PillCommand::Local);
+                    transcribe(dictation, e.internal);
+                }
+                None => return Some(control::Input::Transcribed { ok: false }),
+            }
+        }
+        Action::DropCancelled => {
+            if e.local_notice.take().is_some() {
+                let _ = e.pill_tx.send(PillCommand::NotifyClear);
             }
         }
         Action::FailLocal(error) => {
