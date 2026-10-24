@@ -541,6 +541,8 @@ mod tests {
             keywords: None,
             idle_seconds: 0.0,
             server_args: Vec::new(),
+            target_seconds: 5.0,
+            max_seconds: 10.0,
         }
     }
 

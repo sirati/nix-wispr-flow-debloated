@@ -7,11 +7,11 @@
 //! The server stops as soon as the text is out, unless the next dictation
 //! already waits for it (Slot) or `idleSeconds` says to keep it.
 //!
-//! Granite does not stream, so a dictation is cut into pieces at its pauses
-//! (segment.rs) and each piece is transcribed once it is complete. At about
-//! 4x realtime that catches up with the speaker after the load, and when the
-//! dictation ends only its last piece is left. Pieces that piled up in the
-//! meantime go to the model together. The texts are joined with spaces.
+//! Granite does not stream, so a dictation is cut into pieces of about 5 s
+//! at its pauses (segment.rs) and each piece is transcribed once it is
+//! complete. At about 4x realtime that catches up with the speaker after the
+//! load, and when the dictation ends only its last few seconds are left. The
+//! texts are joined with spaces.
 //!
 //! Use: `Asr::start` when a dictation starts, `Dictation::feed` with its
 //! audio as it arrives, `Dictation::finish` for the text when it ends.
@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use segment::{next_job, Segmenter, FRAME, MAX_PIECE, RATE};
+use segment::{next_job, Limits, Segmenter, RATE};
 use server::Server;
 
 /// Where the model files are unless the settings say otherwise.
@@ -61,6 +61,13 @@ pub struct Settings {
     /// More arguments for llama-server.
     #[serde(default)]
     pub server_args: Vec<String>,
+    /// How long pieces are (segment.rs): cut at the first pause after
+    /// this, so little is left when the dictation ends.
+    #[serde(default = "default_target")]
+    pub target_seconds: f64,
+    /// And cut here, pause or not.
+    #[serde(default = "default_max")]
+    pub max_seconds: f64,
 }
 
 fn default_server() -> String {
@@ -75,11 +82,23 @@ fn default_mmproj() -> String {
     format!("{MODEL_DIR}/mmproj-model-q4_k-convdw-f32.gguf")
 }
 
+fn default_target() -> f64 {
+    5.0
+}
+
+fn default_max() -> f64 {
+    10.0
+}
+
 impl Settings {
     pub fn load(path: &str) -> Result<Settings, String> {
         let text = std::fs::read_to_string(server::expand(path))
             .map_err(|e| format!("cannot read {path}: {e}"))?;
         serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
+    }
+
+    fn limits(&self) -> Limits {
+        Limits::new(self.target_seconds, self.max_seconds)
     }
 }
 
@@ -120,8 +139,9 @@ impl Llama {
             },
         };
         let all = keywords.len();
-        keywords.truncate(prompt::fit_estimate(&keywords).len());
-        let context = prompt::context_for(&prompt::prompt(&keywords));
+        let longest = settings.limits().max_samples();
+        keywords.truncate(prompt::fit_estimate(&keywords, longest).len());
+        let context = prompt::context_for(&prompt::prompt(&keywords), longest);
         let mut lease = slot.take(settings, cancelled)?;
         if !lease.server.as_ref().is_some_and(|s| s.context >= context) {
             lease.server = None;
@@ -131,7 +151,7 @@ impl Llama {
         server.ready(cancelled)?;
         // The estimate errs high, but names and numbers can take more: count,
         // and drop keywords from the end until they fit.
-        let budget = server.context - prompt::PIECE_TOKENS;
+        let budget = server.context - prompt::piece_tokens(longest);
         loop {
             let tokens = server.tokens(&prompt::prompt(&keywords))?;
             if tokens <= budget || keywords.is_empty() {
@@ -288,6 +308,7 @@ impl Asr {
         let (settings, slot, log) = (self.settings.clone(), self.slot.clone(), self.log.clone());
         Dictation::spawn(
             move |cancelled: &dyn Fn() -> bool| Llama::load(&settings, &slot, &log, cancelled),
+            self.settings.limits(),
             self.log.clone(),
         )
     }
@@ -304,6 +325,7 @@ struct State {
 }
 
 struct Shared {
+    limits: Limits,
     state: Mutex<State>,
     /// New audio, the end, or a cancel.
     wake: Condvar,
@@ -329,11 +351,13 @@ impl Dictation {
     /// out, which frees the model (or hands it on, see Slot).
     fn spawn<E: Engine>(
         load: impl FnOnce(&dyn Fn() -> bool) -> Result<E, String> + Send + 'static,
+        limits: Limits,
         log: Log,
     ) -> Dictation {
         let shared = Arc::new(Shared {
+            limits,
             state: Mutex::new(State {
-                segmenter: Segmenter::new(),
+                segmenter: Segmenter::new(limits),
                 ..State::default()
             }),
             wake: Condvar::new(),
@@ -419,7 +443,7 @@ fn work<E: Engine>(
         let state = shared.state();
         !state.cancelled
             && state.ended.is_none()
-            && next_job(state.segmenter.cuts(), 0, MAX_PIECE * FRAME).is_none()
+            && next_job(state.segmenter.cuts(), 0, shared.limits.merge_samples()).is_none()
     };
     if idle {
         if let Err(e) = engine.prime() {
@@ -437,7 +461,9 @@ fn work<E: Engine>(
                 if state.cancelled {
                     return (Err("cancelled".into()), Some(engine));
                 }
-                if let Some(job) = next_job(state.segmenter.cuts(), done, MAX_PIECE * FRAME) {
+                if let Some(job) =
+                    next_job(state.segmenter.cuts(), done, shared.limits.merge_samples())
+                {
                     let pcm = state
                         .segmenter
                         .has_speech(job.clone())
@@ -538,6 +564,7 @@ mod tests {
                     return Ok(engine);
                 }
             },
+            Limits::default(),
             Arc::new(|_| {}),
         );
         (d, calls)
@@ -583,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn pieces_that_piled_up_while_loading_go_together() {
+    fn pieces_that_piled_up_while_loading_stay_short() {
         let (load, loaded) = mpsc::channel();
         let (mut d, calls) = dictation(loaded, false);
         let a = audio(&[
@@ -596,16 +623,12 @@ mod tests {
         d.feed(&bytes(&a));
         std::thread::sleep(Duration::from_millis(50));
         load.send(()).unwrap();
-        // The two pieces heard during the load, as one.
-        wait_for("the first request", || {
-            !calls.lock().unwrap().pieces.is_empty()
-        });
-        let first = calls.lock().unwrap().pieces[0];
-        assert!(first > 10 * 16_000 && first < 11_500 * 16, "{first}");
         d.finish().unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.primes, 0, "pieces were waiting, no need to prime");
-        assert_eq!(calls.pieces.len(), 2);
+        // Not one request of 10 s: no more than the target each.
+        assert_eq!(calls.pieces.len(), 3, "{:?}", calls.pieces);
+        assert!(calls.pieces[..2].iter().all(|&p| p < 6 * 16_000));
         assert_eq!(calls.pieces.iter().sum::<usize>(), a.len());
     }
 
@@ -652,6 +675,7 @@ mod tests {
     fn a_failed_load_fails_the_dictation() {
         let d = Dictation::spawn(
             |_: &dyn Fn() -> bool| Err::<Fake, _>("no such model".to_string()),
+            Limits::default(),
             Arc::new(|_| {}),
         );
         assert_eq!(d.finish().unwrap_err(), "no such model");
@@ -689,6 +713,8 @@ mod tests {
             keywords: None,
             idle_seconds,
             server_args: Vec::new(),
+            target_seconds: 5.0,
+            max_seconds: 10.0,
         }
     }
 
@@ -820,6 +846,8 @@ mod tests {
                 .filter(|k| !k.is_empty()),
             idle_seconds: 0.0,
             server_args: Vec::new(),
+            target_seconds: 5.0,
+            max_seconds: 10.0,
         };
         let speed: f64 = std::env::var("WISPR_ASR_SPEED")
             .ok()
@@ -850,5 +878,108 @@ mod tests {
             end.elapsed().as_secs_f64()
         );
         assert!(!text.is_empty());
+    }
+
+    /// Accuracy and time against piece length, with the real server and
+    /// model, on demand:
+    ///
+    /// ```sh
+    /// WISPR_ASR_SERVER=... WISPR_ASR_MODEL=... WISPR_ASR_MMPROJ=... \
+    /// WISPR_ASR_RECORDINGS=list.tsv WISPR_ASR_LIMITS=5:10,10:20,30:30 \
+    /// WISPR_ASR_OUT=pieces.jsonl [WISPR_ASR_KEYWORDS=terms.txt] \
+    ///   cargo test --release real_model_piece -- --ignored --nocapture
+    /// ```
+    ///
+    /// Each line of the list is a name, a tab and WAV files separated by
+    /// colons, played one after the other with 0.3 s of room noise between.
+    /// Each recording is cut with each target:longest pair and transcribed
+    /// piece by piece; one JSON line per recording and pair has the text and
+    /// each piece's length and time.
+    #[test]
+    #[ignore]
+    fn real_model_piece_lengths() {
+        use std::io::Write;
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+        let settings = Settings {
+            server: env("WISPR_ASR_SERVER"),
+            model: env("WISPR_ASR_MODEL"),
+            mmproj: env("WISPR_ASR_MMPROJ"),
+            keywords: None,
+            idle_seconds: 0.0,
+            server_args: Vec::new(),
+            target_seconds: 30.0,
+            max_seconds: 30.0,
+        };
+        let keywords = std::env::var("WISPR_ASR_KEYWORDS")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|k| prompt::parse_keywords(&std::fs::read_to_string(k).unwrap()))
+            .unwrap_or_default();
+        let ask = prompt::prompt(&keywords);
+        let longest = 30 * RATE;
+        let mut server = Server::spawn(&settings, prompt::context_for(&ask, longest)).unwrap();
+        server.ready(&|| false).unwrap();
+        let primed = Instant::now();
+        server.transcribe(&[0; RATE / 10], &ask, 1).unwrap();
+        eprintln!(
+            "{} keywords, {} tokens, primed in {:.2} s",
+            keywords.len(),
+            server.tokens(&ask).unwrap(),
+            primed.elapsed().as_secs_f64()
+        );
+        let noise: Vec<i16> = (0..RATE * 3 / 10)
+            .map(|i| ((i * 7_919 % 61) as i16 - 30) / 2)
+            .collect();
+        let mut out = std::fs::File::create(env("WISPR_ASR_OUT")).unwrap();
+        let list = std::fs::read_to_string(env("WISPR_ASR_RECORDINGS")).unwrap();
+        for line in list.lines().filter(|l| !l.is_empty()) {
+            let (name, wavs) = line.split_once('\t').unwrap();
+            let mut pcm = Vec::new();
+            for (i, path) in wavs.split(':').enumerate() {
+                if i > 0 {
+                    pcm.extend_from_slice(&noise);
+                }
+                pcm.extend(
+                    read_wav(path)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| i16::from_le_bytes(*b)),
+                );
+            }
+            for pair in env("WISPR_ASR_LIMITS").split(',') {
+                let (target, max) = pair.split_once(':').unwrap();
+                let limits = Limits::new(target.parse().unwrap(), max.parse().unwrap());
+                let mut segmenter = Segmenter::new(limits);
+                segmenter.push(&pcm);
+                segmenter.finish(pcm.len());
+                let (mut done, mut texts, mut pieces) = (0, Vec::new(), Vec::new());
+                while let Some(job) = next_job(segmenter.cuts(), done, limits.merge_samples()) {
+                    if segmenter.has_speech(job.clone()) {
+                        let piece = &pcm[job.clone()];
+                        let asked = Instant::now();
+                        let text = server
+                            .transcribe(piece, &ask, prompt::max_tokens(piece.len()))
+                            .unwrap();
+                        pieces.push((
+                            piece.len() as f64 / RATE as f64,
+                            asked.elapsed().as_secs_f64(),
+                        ));
+                        texts.push(text);
+                    }
+                    done = job.end;
+                }
+                let record = serde_json::json!({
+                    "recording": name,
+                    "limits": pair,
+                    "keywords": keywords.len(),
+                    "audio": pcm.len() as f64 / RATE as f64,
+                    "pieces": pieces,
+                    "text": texts.join(" "),
+                });
+                writeln!(out, "{record}").unwrap();
+                eprintln!("{name} {pair}: {} pieces", pieces.len());
+            }
+        }
     }
 }

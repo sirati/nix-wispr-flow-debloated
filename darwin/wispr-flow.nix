@@ -44,6 +44,7 @@
 #            backend ? "local"; model, mmproj, keywords ? null (paths on the
 #            Mac; null for the daemon's defaults in ~/Library/Application
 #            Support/wispr-headless); idleSeconds ? 0; serverArgs ? [ ];
+#            targetSeconds ? 5; maxSeconds ? 10;
 #            barColor ? "#15803d", the bar for dictations to the local model }
 {
   native,
@@ -62,6 +63,8 @@ let
     mmproj = null;
     keywords = null;
     idleSeconds = 0;
+    targetSeconds = 5;
+    maxSeconds = 10;
     serverArgs = [ ];
     barColor = "#15803d";
   }
@@ -71,7 +74,12 @@ let
     builtins.toJSON (
       {
         server = local.llamaServer;
-        inherit (local) idleSeconds serverArgs;
+        inherit (local)
+          idleSeconds
+          serverArgs
+          targetSeconds
+          maxSeconds
+          ;
       }
       // native.lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
     )

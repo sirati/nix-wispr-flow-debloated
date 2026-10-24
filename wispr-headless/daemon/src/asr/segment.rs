@@ -1,13 +1,15 @@
 //! Cuts a dictation into pieces Granite Speech can take while it is still
-//! being spoken. Granite is not a streaming model and does worse on long
-//! audio, so each piece ends in a pause, and none is longer than 30 s.
+//! being spoken. Granite is not a streaming model, so each piece is sent once
+//! it is complete; short pieces leave little to do when the dictation ends.
 //!
 //! The audio is measured in 30 ms frames. A frame is silent when it is
 //! quieter than a threshold between the dictation's noise floor (its 10th
 //! percentile) and its speech (90th percentile), and always below -60 dBFS.
-//! A pause long enough ends the piece in its middle; the longer the piece,
-//! the shorter the pause that may end it (`PAUSES`). A piece that reaches
-//! 30 s without one ends at its quietest frame of the last 4 s.
+//! A piece ends at the first pause after its target length (5 s unless
+//! `targetSeconds` says otherwise), in the middle of the pause; the closer it
+//! gets to its longest (`maxSeconds`, 10 s), the shorter the pause that ends
+//! it, 300 ms down to 90 ms. A piece that reaches its longest without one
+//! ends at its quietest frame of the last 4 s.
 
 use std::ops::Range;
 
@@ -17,19 +19,14 @@ pub const RATE: usize = 16_000;
 const fn frames(ms: usize) -> usize {
     ms * RATE / 1_000 / FRAME
 }
-/// No piece is shorter, unless the dictation is.
-const MIN_PIECE: usize = frames(3_000);
-pub const MAX_PIECE: usize = frames(30_000);
+/// Granite does worse on longer audio.
+const LONGEST: f64 = 30.0;
 /// Where a piece that found no pause is cut: its quietest frame this close
 /// to the end.
 const FORCED_WINDOW: usize = frames(4_000);
-/// The pause that ends a piece at least this long (frames, frames).
-const PAUSES: [(usize, usize); 4] = [
-    (frames(24_000), frames(90)),
-    (frames(16_000), frames(210)),
-    (frames(8_000), frames(300)),
-    (MIN_PIECE, frames(510)),
-];
+/// The pause that ends a piece of its target length, and of its longest.
+const LONG_PAUSE: usize = frames(300);
+const SHORT_PAUSE: usize = frames(90);
 /// Frames at least this quiet are digital silence (a starting microphone)
 /// and say nothing about the room.
 const DIGITAL_SILENCE: f32 = -100.0;
@@ -39,6 +36,55 @@ const QUIET: f32 = -60.0;
 const BINS: usize = 100;
 /// A piece with fewer loud frames than this is not sent to the model.
 const SPEECH_FRAMES: usize = 3;
+
+/// How long pieces are, in frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    target: usize,
+    max: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits::new(5.0, 10.0)
+    }
+}
+
+impl Limits {
+    /// In seconds; the target from 1 s, the longest from the target, both
+    /// at most 30 s.
+    pub fn new(target: f64, max: f64) -> Limits {
+        let target = target.clamp(1.0, LONGEST);
+        let max = max.clamp(target, LONGEST);
+        let frames = |s: f64| (s * RATE as f64 / FRAME as f64).round() as usize;
+        Limits {
+            target: frames(target),
+            max: frames(max),
+        }
+    }
+
+    /// The longest piece, in samples.
+    pub fn max_samples(&self) -> usize {
+        self.max * FRAME
+    }
+
+    /// The longest request when pieces piled up, in samples: no longer than
+    /// one piece of the target length, so they do not go together again.
+    pub fn merge_samples(&self) -> usize {
+        self.target * FRAME
+    }
+
+    /// The pause (in frames) that ends a piece `len` frames long, or None
+    /// if it is too short to end.
+    fn pause_needed(&self, len: usize) -> Option<usize> {
+        if len < self.target {
+            return None;
+        }
+        let span = (self.max - self.target).max(1);
+        let past = (len - self.target).min(span);
+        Some(LONG_PAUSE - (LONG_PAUSE - SHORT_PAUSE) * past / span)
+    }
+}
 
 /// Loudness of one frame in dBFS.
 fn level(samples: &[i16]) -> f32 {
@@ -51,14 +97,9 @@ fn level(samples: &[i16]) -> f32 {
     }
 }
 
-/// The pause (in frames) that ends a piece `len` frames long, or None if it
-/// is too short to end.
-fn pause_needed(len: usize) -> Option<usize> {
-    PAUSES.iter().find(|(at, _)| len >= *at).map(|(_, p)| *p)
-}
-
 #[derive(Default)]
 pub struct Segmenter {
+    limits: Limits,
     /// Loudness of every whole frame so far.
     levels: Vec<f32>,
     /// Samples that do not make a whole frame yet.
@@ -74,8 +115,9 @@ pub struct Segmenter {
 }
 
 impl Segmenter {
-    pub fn new() -> Segmenter {
+    pub fn new(limits: Limits) -> Segmenter {
         Segmenter {
+            limits,
             histogram: vec![0; BINS],
             ..Segmenter::default()
         }
@@ -135,15 +177,19 @@ impl Segmenter {
         if let Some(p) = self.pause {
             let run = i + 1 - p;
             let middle = p + run / 2;
-            if pause_needed(middle - self.start).is_some_and(|needed| run >= needed) {
+            if self
+                .limits
+                .pause_needed(middle - self.start)
+                .is_some_and(|needed| run >= needed)
+            {
                 self.cut(middle);
                 // The rest of the pause starts the next piece.
                 self.pause = Some(middle);
                 return;
             }
         }
-        if i + 1 - self.start >= MAX_PIECE {
-            let from = i + 1 - FORCED_WINDOW;
+        if i + 1 - self.start >= self.limits.max {
+            let from = i + 1 - FORCED_WINDOW.min(self.limits.max - 1);
             let quietest = (from..=i)
                 .min_by(|&a, &b| self.levels[a].total_cmp(&self.levels[b]))
                 .unwrap_or(i);
@@ -217,11 +263,16 @@ pub mod tests {
         out
     }
 
-    fn cuts_of(samples: &[i16]) -> Vec<usize> {
-        let mut s = Segmenter::new();
+    fn cuts_with(limits: Limits, samples: &[i16]) -> Vec<usize> {
+        let mut s = Segmenter::new(limits);
         s.push(samples);
         s.finish(samples.len());
         s.cuts().to_vec()
+    }
+
+    /// With the default 5 s target and 10 s longest.
+    fn cuts_of(samples: &[i16]) -> Vec<usize> {
+        cuts_with(Limits::default(), samples)
     }
 
     fn ms(samples: usize) -> usize {
@@ -229,51 +280,79 @@ pub mod tests {
     }
 
     #[test]
-    fn a_pause_after_a_few_seconds_ends_a_piece_in_its_middle() {
-        let a = audio(&[Speech(4_000), Quiet(700), Speech(4_000)]);
+    fn a_pause_after_the_target_ends_a_piece_in_its_middle() {
+        let a = audio(&[Speech(6_000), Quiet(700), Speech(3_000)]);
         let cuts = cuts_of(&a);
         assert_eq!(cuts.len(), 2, "{cuts:?}");
-        // Cut once 510 ms of the pause were heard, in the middle of those.
-        assert!((4_200..=4_300).contains(&ms(cuts[0])), "{}", ms(cuts[0]));
+        // Cut once 270 ms of the pause were heard, in the middle of those.
+        assert!((6_000..=6_300).contains(&ms(cuts[0])), "{}", ms(cuts[0]));
         assert_eq!(cuts[1], a.len());
     }
 
     #[test]
-    fn a_short_pause_does_not_end_a_short_piece() {
-        let a = audio(&[Speech(4_000), Quiet(250), Speech(4_000)]);
+    fn nothing_is_cut_before_the_target() {
+        let a = audio(&[Speech(3_000), Quiet(700), Speech(3_000)]);
         assert_eq!(cuts_of(&a), vec![a.len()]);
     }
 
     #[test]
-    fn nothing_is_cut_before_three_seconds() {
-        let a = audio(&[Speech(1_000), Quiet(1_000), Speech(1_000)]);
-        assert_eq!(cuts_of(&a), vec![a.len()]);
-    }
-
-    #[test]
-    fn a_long_piece_ends_at_a_shorter_pause() {
-        let a = audio(&[Speech(18_000), Quiet(250), Speech(3_000)]);
+    fn a_short_pause_ends_only_a_piece_near_its_longest() {
+        // 200 ms is not enough at 5.5 s (300 ms), but is at 9 s (150 ms).
+        let a = audio(&[
+            Speech(5_500),
+            Quiet(200),
+            Speech(3_300),
+            Quiet(200),
+            Speech(2_000),
+        ]);
         let cuts = cuts_of(&a);
         assert_eq!(cuts.len(), 2, "{cuts:?}");
-        assert!((18_000..=18_250).contains(&ms(cuts[0])), "{}", ms(cuts[0]));
+        assert!((9_000..=9_200).contains(&ms(cuts[0])), "{}", ms(cuts[0]));
     }
 
     #[test]
-    fn speech_without_pauses_is_cut_at_30_s_at_its_quietest() {
-        // A slight dip at 28 s, no real pause anywhere.
-        let mut a = audio(&[Speech(28_000)]);
+    fn speech_without_pauses_is_cut_at_its_longest_at_its_quietest() {
+        // A slight dip at 8 s, no real pause anywhere.
+        let mut a = audio(&[Speech(8_000)]);
         let dip = a.len();
         a.extend(audio(&[Speech(60)]).iter().map(|s| s / 4));
-        a.extend(audio(&[Speech(42_000)]));
+        a.extend(audio(&[Speech(22_000)]));
         let cuts = cuts_of(&a);
         assert!((ms(dip)..=ms(dip) + 60).contains(&ms(cuts[0])), "{cuts:?}");
         let mut start = 0;
         for &c in &cuts {
-            assert!(c - start <= MAX_PIECE * FRAME, "{} ms", ms(c - start));
+            assert!(c - start <= 10 * RATE, "{} ms", ms(c - start));
             start = c;
         }
         assert_eq!(*cuts.last().unwrap(), a.len());
-        assert!(cuts.len() >= 3);
+        assert!(cuts.len() >= 4, "{cuts:?}");
+    }
+
+    #[test]
+    fn longer_targets_make_longer_pieces() {
+        let a = audio(&[
+            Speech(6_000),
+            Quiet(400),
+            Speech(6_000),
+            Quiet(400),
+            Speech(6_000),
+            Quiet(400),
+            Speech(6_000),
+        ]);
+        assert_eq!(cuts_of(&a).len(), 4);
+        assert_eq!(cuts_with(Limits::new(10.0, 20.0), &a).len(), 2);
+        assert_eq!(cuts_with(Limits::new(30.0, 30.0), &a), vec![a.len()]);
+    }
+
+    #[test]
+    fn limits_stay_within_what_granite_takes() {
+        // Whole 30 ms frames.
+        assert_eq!(Limits::new(5.0, 10.0).max_samples(), 333 * FRAME);
+        assert_eq!(Limits::new(5.0, 10.0).merge_samples(), 167 * FRAME);
+        let tiny = Limits::new(0.2, 100.0);
+        assert_eq!((tiny.target, tiny.max), (33, 1_000));
+        let crossed = Limits::new(8.0, 4.0);
+        assert_eq!(crossed.max, crossed.target);
     }
 
     #[test]
@@ -282,12 +361,12 @@ pub mod tests {
             Quiet(500),
             Speech(5_000),
             Quiet(600),
-            Speech(9_000),
+            Speech(5_000),
             Quiet(350),
-            Speech(20_000),
+            Speech(6_000),
         ]);
         let whole = cuts_of(&a);
-        let mut s = Segmenter::new();
+        let mut s = Segmenter::new(Limits::default());
         for piece in a.chunks(337) {
             s.push(piece);
         }
@@ -299,20 +378,20 @@ pub mod tests {
     #[test]
     fn silence_is_not_speech() {
         let a = audio(&[Quiet(5_000)]);
-        let mut s = Segmenter::new();
+        let mut s = Segmenter::new(Limits::default());
         s.push(&a);
         s.finish(a.len());
         assert!(!s.has_speech(0..a.len()));
         // Nor is a microphone that only delivers zeros.
-        let mut z = Segmenter::new();
+        let mut z = Segmenter::new(Limits::default());
         z.push(&vec![0i16; 48_000]);
         assert!(!z.has_speech(0..48_000));
     }
 
     #[test]
     fn a_long_silent_start_is_a_piece_of_its_own_without_speech() {
-        let a = audio(&[Quiet(7_000), Speech(2_000)]);
-        let mut s = Segmenter::new();
+        let a = audio(&[Quiet(11_000), Speech(2_000)]);
+        let mut s = Segmenter::new(Limits::default());
         s.push(&a);
         s.finish(a.len());
         let cuts = s.cuts().to_vec();

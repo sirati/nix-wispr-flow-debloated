@@ -89,7 +89,12 @@ let
     builtins.toJSON (
       {
         server = lib.getExe' local.llamaCpp "llama-server";
-        inherit (local) idleSeconds serverArgs;
+        inherit (local)
+          idleSeconds
+          serverArgs
+          targetSeconds
+          maxSeconds
+          ;
       }
       // lib.filterAttrs (_: v: v != null) { inherit (local) model mmproj keywords; }
     )
@@ -295,6 +300,25 @@ in
             jargon), one per line or separated by commas; up to about 2000.
             Read when each dictation starts, so edits need no rebuild. A long
             list makes the model's context, and its memory, bigger.
+          '';
+        };
+        targetSeconds = lib.mkOption {
+          type = lib.types.numbers.between 1 30;
+          default = 5;
+          description = ''
+            The model transcribes a dictation in pieces while it is spoken;
+            a piece ends at the first pause after this many seconds. When the
+            dictation ends, only the last piece is left to transcribe (about
+            a quarter of its length on the Mac). Longer pieces give the model
+            more context but leave more to wait for.
+          '';
+        };
+        maxSeconds = lib.mkOption {
+          type = lib.types.numbers.between 1 30;
+          default = 10;
+          description = ''
+            A piece without a pause ends here, at its quietest moment (at
+            least `targetSeconds`).
           '';
         };
         idleSeconds = lib.mkOption {

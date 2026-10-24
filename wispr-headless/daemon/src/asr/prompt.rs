@@ -9,9 +9,12 @@
 pub const INSTRUCTION: &str = "transcribe the speech to text.";
 /// Granite Speech 5.0's context, in tokens.
 pub const MODEL_CONTEXT: u32 = 16_384;
-/// Room each request needs besides the prompt: up to 30 s of audio (about
-/// 10 tokens a second), the chat template, and the text (`max_tokens`).
-pub const PIECE_TOKENS: u32 = 768;
+/// Room each request needs besides the prompt, for pieces up to
+/// `max_samples`: the audio (about 10 tokens a second), the chat template,
+/// and the text (`max_tokens`).
+pub fn piece_tokens(max_samples: usize) -> u32 {
+    (max_samples * 12 / 16_000) as u32 + max_tokens(max_samples) + 16
+}
 
 /// The longest text the model may answer with for `samples` of audio:
 /// generous for fast speech, short enough to stop a model that repeats itself.
@@ -47,9 +50,10 @@ pub fn estimate_tokens(text: &str) -> u32 {
     (text.len() / 3) as u32 + 16
 }
 
-/// The context to start the server with for `prompt`, in steps of 256.
-pub fn context_for(prompt: &str) -> u32 {
-    (estimate_tokens(prompt) + PIECE_TOKENS)
+/// The context to start the server with for `prompt` and pieces up to
+/// `max_samples`, in steps of 256.
+pub fn context_for(prompt: &str, max_samples: usize) -> u32 {
+    (estimate_tokens(prompt) + piece_tokens(max_samples))
         .div_ceil(256)
         .saturating_mul(256)
         .min(MODEL_CONTEXT)
@@ -67,8 +71,8 @@ pub fn keep_for(keywords: usize, tokens: u32, budget: u32) -> usize {
 
 /// The keywords that fit the model's context by the estimate (the rest is
 /// dropped from the end).
-pub fn fit_estimate(keywords: &[String]) -> &[String] {
-    let budget = MODEL_CONTEXT - PIECE_TOKENS;
+pub fn fit_estimate(keywords: &[String], max_samples: usize) -> &[String] {
+    let budget = MODEL_CONTEXT - piece_tokens(max_samples);
     let mut n = keywords.len();
     loop {
         let tokens = estimate_tokens(&prompt(&keywords[..n]));
@@ -82,6 +86,8 @@ pub fn fit_estimate(keywords: &[String]) -> &[String] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEN_S: usize = 10 * 16_000;
 
     fn words(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("term{i}")).collect()
@@ -113,21 +119,23 @@ mod tests {
     #[test]
     fn two_thousand_keywords_fit_with_room_for_a_piece() {
         let k = words(2_000);
-        assert_eq!(fit_estimate(&k).len(), 2_000);
+        assert_eq!(fit_estimate(&k, TEN_S).len(), 2_000);
         let p = prompt(&k);
-        let ctx = context_for(&p);
-        assert!(ctx >= estimate_tokens(&p) + PIECE_TOKENS);
+        let ctx = context_for(&p, TEN_S);
+        assert!(ctx >= estimate_tokens(&p) + piece_tokens(TEN_S));
         assert!(ctx <= MODEL_CONTEXT);
         assert_eq!(ctx % 256, 0);
-        assert_eq!(context_for(INSTRUCTION), 1_024);
+        // Small without keywords: 40 MB of cache.
+        assert_eq!(context_for(INSTRUCTION, TEN_S), 512);
+        assert_eq!(context_for(INSTRUCTION, 30 * 16_000), 768);
     }
 
     #[test]
     fn too_many_keywords_are_cut_to_the_context() {
         let k = words(20_000);
-        let kept = fit_estimate(&k);
+        let kept = fit_estimate(&k, TEN_S);
         assert!(kept.len() > 1_000 && kept.len() < 20_000, "{}", kept.len());
-        assert!(estimate_tokens(&prompt(kept)) <= MODEL_CONTEXT - PIECE_TOKENS);
+        assert!(estimate_tokens(&prompt(kept)) <= MODEL_CONTEXT - piece_tokens(TEN_S));
         assert_eq!(kept[0], "term0", "the first ones stay");
     }
 
