@@ -23,8 +23,13 @@ fn binary() -> String {
 
 impl Daemon {
     fn start(capture: &str) -> Daemon {
+        Daemon::start_with(capture, &[])
+    }
+
+    fn start_with(capture: &str, args: &[&str]) -> Daemon {
         let mut child = Command::new(binary())
             .args(["--capture-cmd", capture])
+            .args(args)
             .env_remove("DISPLAY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -261,5 +266,70 @@ fn an_early_start_without_a_request_is_dropped() {
     std::thread::sleep(Duration::from_millis(100));
     d.send(r#"{"op":"stop"}"#);
     let (got, _) = collect_session(&mut d, "late-1");
+    assert_eq!(got, pcm);
+}
+
+/// A local model whose server cannot start.
+fn broken_asr_config() -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("asr.json");
+    std::fs::write(&path, r#"{"server":"/nonexistent/llama-server"}"#).unwrap();
+    let p = path.to_string_lossy().into_owned();
+    (dir, p)
+}
+
+#[test]
+fn a_dictation_of_our_own_for_wispr_clicks_its_start_and_stop() {
+    let mut d = Daemon::start("true");
+    d.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    assert_eq!(d.next_op("click")["action"], "start");
+    d.send(r#"{"op":"dictateEnd"}"#);
+    assert_eq!(d.next_op("click")["action"], "stop");
+}
+
+#[test]
+fn without_a_local_model_our_dictations_go_to_wispr() {
+    let mut d = Daemon::start("true");
+    d.send(r#"{"op":"dictate"}"#);
+    assert_eq!(d.next_op("click")["action"], "start");
+}
+
+#[test]
+fn a_local_dictation_without_a_model_fails() {
+    let mut d = Daemon::start("true");
+    d.send(r#"{"op":"dictate","backend":"local"}"#);
+    let f = d.next_op("transcriptFailed");
+    assert!(
+        f["error"].as_str().unwrap().contains("no local model"),
+        "{f}"
+    );
+}
+
+#[test]
+fn a_local_dictation_records_and_reports_the_model_s_failure() {
+    let (_tone_dir, tone, _) = tone_file(16_000);
+    let (_dir, config) = broken_asr_config();
+    let mut d = Daemon::start_with(&format!("cat {tone}"), &["--asr-config", &config]);
+    // The local model is the default now.
+    d.send(r#"{"op":"dictate"}"#);
+    std::thread::sleep(Duration::from_millis(100));
+    d.send(r#"{"op":"dictateEnd"}"#);
+    let f = d.next_op("transcriptFailed");
+    assert!(
+        f["error"].as_str().unwrap().contains("llama-server ended"),
+        "{f}"
+    );
+}
+
+#[test]
+fn wispr_s_own_dictations_are_unchanged_with_a_local_model() {
+    let (_tone_dir, tone, pcm) = tone_file(2_000);
+    let (_dir, config) = broken_asr_config();
+    let mut d = Daemon::start_with(&format!("cat {tone}"), &["--asr-config", &config]);
+    d.send(r#"{"op":"start","uuid":"w-1"}"#);
+    assert_eq!(d.next_op("started")["uuid"], "w-1");
+    std::thread::sleep(Duration::from_millis(100));
+    d.send(r#"{"op":"stop"}"#);
+    let (got, _) = collect_session(&mut d, "w-1");
     assert_eq!(got, pcm);
 }

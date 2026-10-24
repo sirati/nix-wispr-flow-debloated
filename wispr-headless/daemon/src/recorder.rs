@@ -225,32 +225,72 @@ impl Recording {
         event
     }
 
-    /// Waits up to `wait` for audio and returns the chunks that are complete.
-    pub fn poll(&mut self, wait: Duration) -> Progress {
-        let mut events = Vec::new();
+    /// Waits up to `wait` for audio and returns what arrived, or why there
+    /// will be none: the source ended without any.
+    fn receive(&mut self, wait: Duration) -> Result<Vec<u8>, &'static str> {
         match self.bytes.recv_timeout(wait) {
             Ok(first) => {
                 let mut data = first;
                 while let Ok(more) = self.bytes.try_recv() {
                     data.extend_from_slice(&more);
                 }
-                for chunk in self.chunker.push(&data) {
-                    events.push(self.chunk_event(&chunk));
-                }
+                Ok(data)
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => Ok(Vec::new()),
             Err(RecvTimeoutError::Disconnected) => {
                 if self.first_chunk.is_none() && self.chunker.pending.is_empty() {
-                    return Progress::Failed(
-                        self.failure("the capture command ended without audio"),
-                    );
+                    Err("the capture command ended without audio")
+                } else {
+                    Ok(Vec::new())
                 }
             }
+        }
+    }
+
+    /// Waits up to `wait` for audio and returns the chunks that are complete.
+    pub fn poll(&mut self, wait: Duration) -> Progress {
+        let data = match self.receive(wait) {
+            Ok(data) => data,
+            Err(why) => return Progress::Failed(self.failure(why)),
+        };
+        let mut events = Vec::new();
+        for chunk in self.chunker.push(&data) {
+            events.push(self.chunk_event(&chunk));
         }
         if self.first_chunk.is_none() && self.started.elapsed() > FIRST_AUDIO_PATIENCE {
             return Progress::Failed(self.failure("no audio from the microphone"));
         }
         Progress::Chunks(events)
+    }
+
+    /// For a dictation transcribed here: the audio itself, as it arrives,
+    /// instead of Wispr's chunks. Err: why the microphone failed.
+    pub fn poll_pcm(&mut self, wait: Duration) -> Result<Vec<u8>, String> {
+        let why = match self.receive(wait) {
+            Ok(data) => {
+                if !data.is_empty() && self.first_chunk.is_none() {
+                    self.first_chunk = Some(Instant::now());
+                }
+                if self.first_chunk.is_some() || self.started.elapsed() <= FIRST_AUDIO_PATIENCE {
+                    return Ok(data);
+                }
+                "no audio from the microphone"
+            }
+            Err(why) => why,
+        };
+        self.source.stop();
+        Err(why.to_string())
+    }
+
+    /// Ends a recording read with `poll_pcm`: stops capture and returns the
+    /// audio still on its way.
+    pub fn finish_pcm(mut self) -> Vec<u8> {
+        self.source.stop();
+        let mut rest = Vec::new();
+        while let Ok(more) = self.bytes.try_recv() {
+            rest.extend_from_slice(&more);
+        }
+        rest
     }
 
     fn failure(&mut self, why: &str) -> Event {
