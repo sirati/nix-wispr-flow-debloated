@@ -48,10 +48,24 @@
       # with daemon = a cross build of ./wispr-headless/daemon.
       lib.macWisprFlow = import ./darwin/wispr-flow.nix;
 
+      # llama.cpp for Granite Speech (see llama-cpp/default.nix), cross-built
+      # for the Mac with the same toolchain:
+      #   lib.macLlamaCpp { native; stdenv; sdk; }
+      # with stdenv = an stdenv whose cc is an aarch64-apple-darwin clang
+      # and sdk = the macOS SDK it uses.
+      lib.macLlamaCpp =
+        {
+          native,
+          stdenv,
+          sdk,
+        }:
+        native.callPackage ./llama-cpp { inherit stdenv sdk; };
+
       packages.${system} = {
         wispr-headless = pkgs.callPackage ./wispr-headless/daemon { };
         wispr-ime = pkgs.callPackage ./wispr-ime { };
         wispr-ime-helper = pkgs.callPackage ./wispr-ime/helper.nix { inherit wispr-flow-linux; };
+        llama-cpp = pkgs.callPackage ./llama-cpp { };
       };
 
       checks.${system} = {

@@ -60,6 +60,19 @@ with a certificate that stays in the Mac's System keychain. Grant microphone
 and accessibility access once after switching from Wispr's own build; the
 certificate keeps them for later versions.
 
+`packages.x86_64-linux.llama-cpp` is llama.cpp pinned to a release that runs
+IBM Granite Speech 5.0, with patches in `llama-cpp/patches/` so that an audio
+encoder (mmproj) quantized with plain `llama-quantize` works. On macOS,
+`lib.macLlamaCpp` cross-builds it with Metal using the same toolchain:
+
+```nix
+wispr-flow-debloated.lib.macLlamaCpp {
+  native = pkgs;          # x86_64-linux nixpkgs
+  stdenv = crossStdenv;   # its cc an aarch64-apple-darwin clang
+  sdk = appleSdk;         # the macOS SDK that clang uses
+}
+```
+
 ## Tests
 
     nix flake check

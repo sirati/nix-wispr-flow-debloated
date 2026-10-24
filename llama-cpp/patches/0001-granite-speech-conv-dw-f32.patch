@@ -1,0 +1,37 @@
+From 2fc9bd31fa166fb3d646f34cf40133780a8516b6 Mon Sep 17 00:00:00 2001
+From: sirati <sirati@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:01:06 +0200
+Subject: [PATCH 1/2] mtmd: granite-speech: cast conv_dw weights to F32 for
+ ssm_conv
+
+ggml_ssm_conv takes F32 weights only (the CPU kernel asserts it, Metal's
+pipeline aborts on GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32)), but
+llama-quantize stores the depthwise conv weights of a quantized mmproj as
+F16, since their rows (15) do not fill a quantization block. Cast them in
+the graph; the tensor is small (kernel x 2048 per layer).
+---
+ tools/mtmd/models/granite-speech.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tools/mtmd/models/granite-speech.cpp b/tools/mtmd/models/granite-speech.cpp
+index 9725def..113082e 100644
+--- a/tools/mtmd/models/granite-speech.cpp
++++ b/tools/mtmd/models/granite-speech.cpp
+@@ -144,7 +144,13 @@ ggml_cgraph * clip_graph_granite_speech::build() {
+             cb(x, "conv_glu", il);
+ 
+             x = ggml_pad_ext(ctx0, x, conv_pad, conv_pad, 0, 0, 0, 0, 0, 0);
+-            x = ggml_ssm_conv(ctx0, x, layer.conv_dw_w);
++            // ggml_ssm_conv takes F32 weights only, and quantized mmprojs
++            // may store this small tensor as F16
++            ggml_tensor * conv_dw_w = layer.conv_dw_w;
++            if (conv_dw_w->type != GGML_TYPE_F32) {
++                conv_dw_w = ggml_cast(ctx0, conv_dw_w, GGML_TYPE_F32);
++            }
++            x = ggml_ssm_conv(ctx0, x, conv_dw_w);
+             cb(x, "conv_dw", il);
+ 
+             // folded batch norm
+-- 
+2.56.0
+

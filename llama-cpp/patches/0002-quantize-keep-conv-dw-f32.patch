@@ -1,0 +1,27 @@
+From c5ae402d3ace8b0393d0a3fcb285d18e44400ad3 Mon Sep 17 00:00:00 2001
+From: sirati <sirati@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:01:06 +0200
+Subject: [PATCH 2/2] quantize: keep conv_dw weights in F32
+
+They are tiny and only used by ggml_ssm_conv, which takes F32 weights.
+---
+ src/llama-quant.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index b8f96bc..90b61b7 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -331,6 +331,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+     // NOTE: can't use LLM_TN here because the layer number is not known
+     quantize &= name.find("ssm_conv1d") == std::string::npos;
+     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
++    // nor the depthwise conv of audio encoders (Conformer, Granite Speech):
++    // it goes to ggml_ssm_conv, which takes F32 only
++    quantize &= name.find("conv_dw.weight") == std::string::npos;
+ 
+     // do not quantize MiniMax's indexer projection weights, they are tiny
+     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
+-- 
+2.56.0
+
