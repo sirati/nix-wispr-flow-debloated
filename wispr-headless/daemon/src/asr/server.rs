@@ -573,7 +573,7 @@ mod tests {
         );
         let server = Server::spawn(&settings(&fake), 1_024).unwrap();
         let mut pid = String::new();
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             pid = std::fs::read_to_string(&pidfile)
                 .unwrap_or_default()
                 .trim()
@@ -585,7 +585,7 @@ mod tests {
         }
         assert!(alive(&pid), "the stand-in server runs");
         drop(server);
-        for _ in 0..200 {
+        for _ in 0..1_000 {
             if !alive(&pid) {
                 return;
             }

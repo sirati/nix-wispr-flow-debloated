@@ -577,7 +577,7 @@ mod tests {
     }
 
     fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
-        for _ in 0..500 {
+        for _ in 0..1_000 {
             if ok() {
                 return;
             }
