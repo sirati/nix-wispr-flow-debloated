@@ -100,7 +100,8 @@ pub struct CoreMl {
     pub encoder: String,
     /// Which of its functions to load, by length in frames of 20 ms: 250,
     /// 375 and 500 (5, 7.5 and 10 s). Each piece pads to the smallest that
-    /// holds it; fewer load faster and may take less memory. Empty for all.
+    /// holds it. Empty loads only 500, to avoid several loaded copies of
+    /// the encoder. List [250, 375, 500] to load all three.
     #[serde(default)]
     pub frames: Vec<u32>,
 }

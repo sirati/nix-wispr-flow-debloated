@@ -129,6 +129,32 @@ with a certificate that stays in the Mac's System keychain. Grant microphone
 and accessibility access once after switching from Wispr's own build; the
 certificate keeps them for later versions.
 
+The Mac build also has an optional Core ML path for Granite's audio encoder:
+
+```nix
+localAsr = {
+  coreml = {
+    encoder = "~/Library/Application Support/wispr-headless/granite_speech_audio_w8a8.mlpackage";
+    frames = [ 500 ];
+  };
+};
+```
+
+This needs the converted encoder package, currently kept separately from
+this repository, and this flake's patched llama-server. Core ML compiles
+the package on first use and caches it in
+`~/Library/Caches/llama-mtmd-coreml`. The language model still runs through
+Metal. The encoder requests CPU and Neural Engine execution; the actual
+device placement, speed and memory use need measurement on the Mac.
+
+The default loads only the 500-frame function, which handles up to 10 seconds
+of audio. Shorter clips are padded and masked. Loading `[ 250 375 500 ]`
+allows smaller inputs, but each function may hold another copy of the
+weights. The GGUF encoder also remains loaded for fallback when Core ML
+fails or the clip is too long. The difference in model-file sizes therefore
+does not describe the increase in RAM. Core ML is disabled unless `coreml`
+is set.
+
 `packages.x86_64-linux.llama-cpp` is llama.cpp pinned to a release that runs
 IBM Granite Speech 5.0, with patches in `llama-cpp/patches/` so that an audio
 encoder (mmproj) quantized with plain `llama-quantize` works. On macOS,

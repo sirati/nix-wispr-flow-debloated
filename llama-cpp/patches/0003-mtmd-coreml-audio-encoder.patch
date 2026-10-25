@@ -56,8 +56,8 @@ index 0000000..b9cff3e
 +
 +// path: a granite_speech_audio_*.mlpackage (compiled once and cached in
 +// ~/Library/Caches/llama-mtmd-coreml) or an .mlmodelc. Starts loading its
-+// functions (T250, T375, T500, or those $MTMD_COREML_AUDIO_FRAMES lists,
-+// e.g. "500") in the background. NULL on failure.
++// functions ($MTMD_COREML_AUDIO_FRAMES, e.g. "250,375,500"; T500 by
++// default) in the background. NULL on failure.
 +struct mtmd_coreml * mtmd_coreml_init(const char * path);
 +
 +// mel: mtmd's stacked log-mel, n_mel (160) rows of n_frames, row-major
@@ -174,7 +174,7 @@ index 0000000..5e527eb
 +                p = end;
 +            }
 +        } else {
-+            sizes = {250, 375, 500};
++            sizes = {500};
 +        }
 +        std::sort(sizes.begin(), sizes.end());
 +        sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());

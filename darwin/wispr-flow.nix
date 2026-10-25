@@ -57,7 +57,7 @@
 #            llama-server (headless.localAsr.cleanup);
 #            coreml ? null, or { encoder (a granite_speech_audio_*.mlpackage
 #            on the Mac); frames ? [ ] (which of its functions to load: 250,
-#            375, 500; all if empty) } to run the audio encoder on the
+#            375, 500; only 500 if empty) } to run the audio encoder on the
 #            Neural Engine through Core ML, with mmproj only for pieces it
 #            declines (needs the llama-server built here) }
 #   stdenv, sdk  the cross toolchain, as for lib.macLlamaCpp: an stdenv
