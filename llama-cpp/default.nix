@@ -8,6 +8,8 @@
 #         Engine) instead: MTMD_COREML_AUDIO names a
 #         granite_speech_audio_*.mlpackage; without it, nothing changes
 #   0004  reports compiled-cache reuse, loading and encoder timings
+#   0005  in Core ML-only mode, keeps only GGUF metadata and skips redundant
+#         audio encoder/projector weight buffers
 #
 # Not nixpkgs' llama-cpp: Granite Speech needs b11852 or later (older
 # releases lack its chat template).
@@ -61,6 +63,7 @@ stdenv.mkDerivation {
     ./patches/0002-quantize-keep-conv-dw-f32.patch
     ./patches/0003-mtmd-coreml-audio-encoder.patch
     ./patches/0004-coreml-cache-diagnostics.patch
+    ./patches/0005-coreml-only-no-fallback.patch
   ];
 
   outputs = [

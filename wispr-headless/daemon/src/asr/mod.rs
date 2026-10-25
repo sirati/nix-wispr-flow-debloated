@@ -61,14 +61,13 @@ pub struct Settings {
     /// Granite Speech's language model.
     #[serde(default = "default_model")]
     pub model: String,
-    /// Its audio encoder. The default is quantized to Q4_K except its
-    /// depthwise convolutions (`llama-quantize --tensor-type conv_dw=f32`):
-    /// 318 MB instead of 1.2 GB at F16.
+    /// Granite Speech's GGUF metadata container. In Core ML mode llama.cpp
+    /// reads its format metadata but does not load its redundant audio
+    /// encoder/projector weights.
     #[serde(default = "default_mmproj")]
     pub mmproj: String,
-    /// Run the audio encoder on Core ML (the Neural Engine) instead, with
-    /// mmproj only for what Core ML declines (macOS, with llama.cpp's
-    /// patch 0003).
+    /// Run the complete Granite audio encoder and projector on Core ML (the
+    /// Neural Engine) instead of loading the GGUF encoder weights.
     #[serde(default)]
     pub coreml: Option<CoreMl>,
     /// Terms the text should spell as listed, one per line (prompt.rs).

@@ -163,10 +163,11 @@ device placement is decided by Core ML.
 The default loads only the 500-frame function, which handles up to 10 seconds
 of audio. Shorter clips are padded and masked. Loading `[ 250 375 500 ]`
 allows smaller inputs, but each function may hold another copy of the
-weights. The GGUF encoder also remains loaded for fallback when Core ML
-fails or the clip is too long. The difference in model-file sizes therefore
-does not describe the increase in RAM. Core ML is disabled unless `coreml`
-is set.
+weights. In Core ML-only mode, the GGUF file remains as a metadata container
+because llama.cpp needs Granite's format and dimensions, but its encoder and
+projector weight tensors are not allocated or loaded. Core ML errors or clips
+longer than the configured frame buckets fail instead of silently loading the
+redundant GGUF encoder. Core ML is disabled unless `coreml` is set.
 
 A standalone test on an A18 Pro MacBook Neo with macOS 26.6 on October 25,
 2026 encoded one 9.02-second LibriSpeech clip in 137 ms with the W8A8

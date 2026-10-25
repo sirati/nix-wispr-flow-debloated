@@ -1,0 +1,77 @@
+From: sirati <sirati@users.noreply.github.com>
+Subject: [PATCH] mtmd: omit the GGUF audio encoder in Core ML-only mode
+
+The Core ML package already contains Granite Speech's complete audio encoder
+and projector. Keep the GGUF file for metadata, but do not allocate or load
+its redundant weights. Fail explicitly if Core ML cannot encode.
+
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -4315,8 +4315,12 @@
+     clip_ctx * ctx_gen_audio = nullptr;
+ 
+     try {
++        // Granite Speech's Core ML bridge supplies the complete audio
++        // encoder and projector. Keep only GGUF metadata and hparams in the
++        // mtmd context, so the redundant GGUF weight buffers are not loaded.
++        const bool coreml_only = getenv("MTMD_COREML_AUDIO") && *getenv("MTMD_COREML_AUDIO");
+         clip_model_loader loader(fname,
+-            /* skip_tensors */ false,
++            /* skip_tensors */ coreml_only,
+             ctx_params.progress_callback,
+             ctx_params.progress_callback_user_data);
+         bool skip_audio = false;
+@@ -4338,10 +4342,12 @@
+         if (loader.has_audio && !skip_audio) {
+             ctx_audio = new clip_ctx(ctx_params);
+             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
+-            loader.load_tensors(*ctx_audio);
+-            loader.init_ctx(*ctx_audio);
+-            if (ctx_params.warmup) {
+-                loader.warmup(*ctx_audio);
++            if (!coreml_only) {
++                loader.load_tensors(*ctx_audio);
++                loader.init_ctx(*ctx_audio);
++                if (ctx_params.warmup) {
++                    loader.warmup(*ctx_audio);
++                }
+             }
+         }
+ 
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -526,6 +526,9 @@
+ #ifdef MTMD_COREML
+     // Granite Speech's audio encoder on Core ML, from $MTMD_COREML_AUDIO
+     struct mtmd_coreml * coreml = nullptr;
++    // Core ML includes the complete Granite audio encoder and projector;
++    // there is no GGUF fallback context to use when this is set.
++    bool coreml_only = false;
+ #endif
+     std::vector<float> out_embd; // image embedding vector
+ 
+@@ -1080,8 +1083,12 @@
+                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_granite_speech>(ctx_a);
+ #ifdef MTMD_COREML
+                     if (const char * path = getenv("MTMD_COREML_AUDIO"); path && *path) {
++                        coreml_only = true;
+                         coreml = mtmd_coreml_init(path);
+                         LOG_INF("%s: Core ML audio encoder %s: %s\n", __func__, path, coreml ? "loading" : "failed");
++                        if (!coreml) {
++                            throw std::runtime_error("Core ML audio encoder initialization failed; no GGUF fallback is loaded");
++                        }
+                     }
+ #endif
+                 } break;
+@@ -2052,7 +2059,10 @@
+                                    (int) chunk->tokens_audio->n_tokens, n_mmproj_embd)) {
+                 return 0;
+             }
+-            LOG_WRN("%s: Core ML audio encoder declined (%d frames), using ggml\n", __func__, mel.nx());
++            LOG_ERR("%s: Core ML audio encoder declined (%d frames)\n", __func__, mel.nx());
++            if (ctx->coreml_only) {
++                return 1;
++            }
+         }
+ #endif
+         bool ok = clip_image_batch_encode(
