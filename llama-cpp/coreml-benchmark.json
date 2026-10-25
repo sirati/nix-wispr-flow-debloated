@@ -1,0 +1,109 @@
+{
+  "date": "2026-10-25",
+  "device": "MacBook Neo, A18 Pro, 8 GiB, macOS 26.6",
+  "scope": "Standalone encoder only, one process at a time; no language model or cleanup model loaded.",
+  "fixture": {
+    "dataset": "LibriSpeech",
+    "clip": "1272-128104-0005",
+    "frames": 451,
+    "seconds": 9.02,
+    "output_tokens": 93,
+    "embedding_width": 2048,
+    "input": "Saved stacked log-mel rounded to float16, converted to float32 for both backends."
+  },
+  "protocol": {
+    "predictions_per_process": 6,
+    "timing": "Median of the last 5 predictions. The first includes asynchronous model loading.",
+    "coreml_function": "T500",
+    "coreml_compute_units": "CPUAndNeuralEngine",
+    "gpu": "Metal, Q4_K GGUF with F32 depthwise convolutions, flash attention auto, 4 CPU threads.",
+    "memory_note": "Process RSS excludes memory owned by system services such as aned. System free percentages are approximate, shared measurements, not isolated footprints."
+  },
+  "coreml_package": {
+    "name": "granite_speech_audio_w8a8.mlpackage",
+    "files": {
+      "Data/com.apple.CoreML/model.mlmodel": {
+        "bytes": 2100902,
+        "sha256": "f88b7793ed79e42accabd63a3f5781f30fc3ccdee72c06fea775a637cab98e72"
+      },
+      "Data/com.apple.CoreML/weights/weight.bin": {
+        "bytes": 472964288,
+        "sha256": "1ba602df07c9812e8a1527dac78b12e7aa9e7642bbdf76163a72659cf930b642"
+      },
+      "Manifest.json": {
+        "bytes": 617,
+        "sha256": "2cb043dec15323d6fa53e70432541b4d3af3b1d838c680dd0141bc426ea87349"
+      }
+    },
+    "file_bytes": 475065807
+  },
+  "coreml_first_process": {
+    "guard": {
+      "backend": "coreml",
+      "exit_code": 0,
+      "stopped_for": null,
+      "initial_free_percent": 40,
+      "min_free_percent": 30,
+      "max_observed_rss_mib": 563.96875,
+      "elapsed_s": 19.64
+    },
+    "measurement": {
+      "frames": 451,
+      "tokens": 93,
+      "cold_total_s": 16.1746,
+      "first_ms": 14966.7,
+      "median_ms": 125.867,
+      "peak_rss_mib": 563.969,
+      "cosine": 0.993869,
+      "relative_l2": 0.110674
+    }
+  },
+  "coreml_cached_process": {
+    "guard": {
+      "backend": "coreml",
+      "exit_code": 0,
+      "stopped_for": null,
+      "initial_free_percent": 41,
+      "min_free_percent": 32,
+      "max_observed_rss_mib": 70.5,
+      "elapsed_s": 2.14
+    },
+    "measurement": {
+      "frames": 451,
+      "tokens": 93,
+      "cold_total_s": 1.84688,
+      "first_ms": 1159.55,
+      "median_ms": 137.309,
+      "peak_rss_mib": 70.5,
+      "cosine": 0.993869,
+      "relative_l2": 0.110674
+    }
+  },
+  "gpu_process": {
+    "guard": {
+      "backend": "ggml",
+      "exit_code": 0,
+      "stopped_for": null,
+      "initial_free_percent": 44,
+      "min_free_percent": 33,
+      "max_observed_rss_mib": 391.09375,
+      "elapsed_s": 4.11
+    },
+    "measurement": {
+      "frames": 451,
+      "tokens": 93,
+      "cold_total_s": 3.32751,
+      "first_ms": 457.571,
+      "median_ms": 446.868,
+      "peak_rss_mib": 391.094,
+      "cosine": 0.989961,
+      "relative_l2": 0.141607
+    }
+  },
+  "compute_plan": {
+    "operations_preferring_neural_engine": 1375,
+    "unassigned_weight_constants": 229,
+    "note": "All unassigned operations are constexpr_blockwise_shift_scale weight constants. The plan reports preferred placement, not a hardware instruction trace."
+  },
+  "limitation": "One-clip speed smoke test. End-to-end dictation latency, full application memory and transcription accuracy on the device were not measured."
+}

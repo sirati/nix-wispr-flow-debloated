@@ -145,7 +145,7 @@ this repository, and this flake's patched llama-server. Core ML compiles
 the package on first use and caches it in
 `~/Library/Caches/llama-mtmd-coreml`. The language model still runs through
 Metal. The encoder requests CPU and Neural Engine execution; the actual
-device placement, speed and memory use need measurement on the Mac.
+device placement is decided by Core ML.
 
 The default loads only the 500-frame function, which handles up to 10 seconds
 of audio. Shorter clips are padded and masked. Loading `[ 250 375 500 ]`
@@ -154,6 +154,18 @@ weights. The GGUF encoder also remains loaded for fallback when Core ML
 fails or the clip is too long. The difference in model-file sizes therefore
 does not describe the increase in RAM. Core ML is disabled unless `coreml`
 is set.
+
+A standalone test on an A18 Pro MacBook Neo with macOS 26.6 on October 25,
+2026 encoded one 9.02-second LibriSpeech clip in 137 ms with the W8A8
+candidate, versus 447 ms with the Q4_K Metal encoder. These are medians of
+five predictions after the first. Core ML's first result took about 15
+seconds on the first process and 1.16 seconds in a later process using the
+cache. Its compute plan assigned 1,375 runtime operations to the Neural
+Engine. The [measurements and package hashes](llama-cpp/coreml-benchmark.json)
+also record process RSS and the memory guard's readings. Process RSS does
+not include Neural Engine memory in system services. Full dictation latency
+and memory, with the language model, fallback encoder and cleanup model,
+have not been measured with this backend.
 
 `packages.x86_64-linux.llama-cpp` is llama.cpp pinned to a release that runs
 IBM Granite Speech 5.0, with patches in `llama-cpp/patches/` so that an audio
