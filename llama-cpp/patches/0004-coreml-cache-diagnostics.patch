@@ -1,0 +1,81 @@
+From: sirati <sirati@users.noreply.github.com>
+Subject: [PATCH] mtmd: report Core ML cache reuse, load and prediction timings
+
+--- a/tools/mtmd/mtmd-coreml.mm
++++ b/tools/mtmd/mtmd-coreml.mm
+@@ -6,6 +6,7 @@
+
+ #include <algorithm>
+ #include <cstdio>
++#include <chrono>
+ #include <cstdlib>
+ #include <cstring>
+ #include <vector>
+@@ -19,11 +20,12 @@
+     dispatch_semaphore_t loaded;      // signalled once model is set (or failed)
+ };
+
+-// The compiled model next to nothing the user owns: in the caches directory,
+-// recompiled when the package is newer than the cache.
++// This disk cache survives app restarts and reboots. Core ML also keeps
++// its own hardware specialization cache; the first prediction prepares it.
+ NSURL * compiled_url(NSString * path, NSError ** err) {
+     NSURL * src = [NSURL fileURLWithPath:path];
+     if ([path hasSuffix:@".mlmodelc"]) {
++        fprintf(stderr, "mtmd_coreml: using compiled model %s\n", src.path.UTF8String);
+         return src;
+     }
+     NSFileManager * fm = NSFileManager.defaultManager;
+@@ -35,8 +37,11 @@
+     NSDate * src_t = [[fm attributesOfItemAtPath:path error:nil] fileModificationDate];
+     NSDate * dst_t = [[fm attributesOfItemAtPath:dst.path error:nil] fileModificationDate];
+     if (dst_t && src_t && [dst_t compare:src_t] != NSOrderedAscending) {
++        fprintf(stderr, "mtmd_coreml: using compiled cache %s\n", dst.path.UTF8String);
+         return dst;
+     }
++    fprintf(stderr, "mtmd_coreml: compiling model %s\n", path.UTF8String);
++    const auto begun = std::chrono::steady_clock::now();
+     NSURL * tmp = [MLModel compileModelAtURL:src error:err];
+     if (!tmp) {
+         return nil;
+@@ -45,6 +50,8 @@
+     if (![fm moveItemAtURL:tmp toURL:dst error:err]) {
+         return nil;
+     }
++    fprintf(stderr, "mtmd_coreml: compiled model cached in %.2f s\n",
++            std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count());
+     return dst;
+ }
+
+@@ -119,11 +126,14 @@
+             MLModelConfiguration * cfg = [MLModelConfiguration new];
+             cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+             cfg.functionName = b.function;  // macOS 15
++            const auto begun = std::chrono::steady_clock::now();
+             [MLModel loadContentsOfURL:url configuration:cfg completionHandler:^(MLModel * m, NSError * e) {
+                 if (!m) {
+                     fprintf(stderr, "mtmd_coreml: cannot load %s: %s\n", bp->function.UTF8String,
+                             e.localizedDescription.UTF8String);
+                 }
++                fprintf(stderr, "mtmd_coreml: loaded %s in %.2f s\n", bp->function.UTF8String,
++                        std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count());
+                 bp->model = m;
+                 dispatch_semaphore_signal(bp->loaded);
+             }];
+@@ -144,6 +154,7 @@
+     if (!b) {
+         return false;  // longer than 10 s: the ggml encoder takes it
+     }
++    const auto begun = std::chrono::steady_clock::now();
+     dispatch_semaphore_wait(b->loaded, DISPATCH_TIME_FOREVER);
+     dispatch_semaphore_signal(b->loaded);  // stays signalled for the next piece
+     if (!b->model || n_tokens > (b->frames + 14) / 15 * 3) {
+@@ -181,6 +192,8 @@
+                 }
+             }];
+         }
++        fprintf(stderr, "mtmd_coreml: encoded %d frames with %s in %.1f ms\n", n_frames, b->function.UTF8String,
++                1000 * std::chrono::duration<double>(std::chrono::steady_clock::now() - begun).count());
+         return ok;
+     }
+ }

@@ -86,6 +86,15 @@ pub struct Server {
     kind: Kind,
 }
 
+/// Stops a startup warm-up even while it is blocked in a model request.
+pub(super) struct StopHandle(Arc<Group>);
+
+impl StopHandle {
+    pub fn stop(&self) {
+        self.0.kill();
+    }
+}
+
 /// What `Server::complete` got back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Completion {
@@ -220,6 +229,10 @@ fn private_dir() -> Result<PathBuf, String> {
 }
 
 impl Server {
+    pub(super) fn stop_handle(&self) -> StopHandle {
+        StopHandle(self.group.clone())
+    }
+
     /// Starts loading Granite Speech; `ready` waits for it. Stops any other
     /// speech server first.
     pub fn spawn(
@@ -320,6 +333,10 @@ fn launch(
         std::thread::spawn(move || {
             for line in BufReader::new(out).lines() {
                 let Ok(line) = line else { break };
+                // Only encoder diagnostics, never server prompts or transcripts.
+                if line.starts_with("mtmd_coreml:") {
+                    crate::log::write(&line);
+                }
                 let mut log = log.lock().expect("log lock poisoned");
                 if log.len() == LOG_LINES {
                     log.pop_front();
@@ -953,6 +970,7 @@ pub mod tests {
         s.coreml = Some(super::super::CoreMl {
             encoder: "/m/encoder.mlpackage".into(),
             frames: vec![375, 500],
+            prewarm: true,
         });
         let _server = Server::spawn(&s, 1_024, &no_log).unwrap();
         for _ in 0..1_000 {

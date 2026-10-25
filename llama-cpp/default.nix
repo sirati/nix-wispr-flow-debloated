@@ -7,6 +7,7 @@
 #   0003  on the Mac, mtmd can run the audio encoder on Core ML (the Neural
 #         Engine) instead: MTMD_COREML_AUDIO names a
 #         granite_speech_audio_*.mlpackage; without it, nothing changes
+#   0004  reports compiled-cache reuse, loading and encoder timings
 #
 # Not nixpkgs' llama-cpp: Granite Speech needs b11852 or later (older
 # releases lack its chat template).
@@ -59,6 +60,7 @@ stdenv.mkDerivation {
     ./patches/0001-granite-speech-conv-dw-f32.patch
     ./patches/0002-quantize-keep-conv-dw-f32.patch
     ./patches/0003-mtmd-coreml-audio-encoder.patch
+    ./patches/0004-coreml-cache-diagnostics.patch
   ];
 
   outputs = [

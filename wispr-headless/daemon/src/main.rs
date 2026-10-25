@@ -700,7 +700,7 @@ fn serve(
     };
     prepare(&mut ready, &ranked);
 
-    // Local transcription, if configured; nothing is loaded until it is used.
+    // Local transcription; Core ML prepares its caches in the background.
     let asr = cfg
         .asr_config
         .as_deref()

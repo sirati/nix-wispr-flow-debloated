@@ -1,7 +1,9 @@
 //! Dictation transcribed on this machine by IBM's Granite Speech (through
 //! llama.cpp) instead of Wispr's service.
 //!
-//! Nothing stays in memory between dictations. When one starts, llama-server
+//! Nothing stays in memory between dictations by default. With Core ML,
+//! a background startup warm-up prepares the disk caches before dictation.
+//! When a dictation starts, llama-server
 //! starts with the model, encoder and language model together (server.rs);
 //! the audio is buffered meanwhile (the load takes about 3 s on the Mac).
 //! The server stops as soon as the text is out, unless the next dictation
@@ -32,6 +34,7 @@ mod prompt;
 mod segment;
 mod server;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -104,6 +107,15 @@ pub struct CoreMl {
     /// the encoder. List [250, 375, 500] to load all three.
     #[serde(default)]
     pub frames: Vec<u32>,
+    /// Prepare the speech model and its Neural Engine/Metal caches in the
+    /// background when the app starts. Releases memory under idleSeconds,
+    /// or hands the same server to a dictation that starts meanwhile.
+    #[serde(default = "default_prewarm")]
+    pub prewarm: bool,
+}
+
+fn default_prewarm() -> bool {
+    true
 }
 
 fn default_server() -> String {
@@ -170,6 +182,15 @@ impl Llama {
         log: &Log,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Llama, String> {
+        Self::load_lease(settings, slot.take(settings, cancelled)?, log, cancelled)
+    }
+
+    fn load_lease(
+        settings: &Settings,
+        mut lease: Lease,
+        log: &Log,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Llama, String> {
         let mut keywords = match &settings.keywords {
             None => Vec::new(),
             Some(path) => match std::fs::read_to_string(server::expand(path)) {
@@ -184,7 +205,6 @@ impl Llama {
         let longest = settings.limits().max_samples();
         keywords.truncate(prompt::fit_estimate(&keywords, longest).len());
         let context = prompt::context_for(&prompt::prompt(&keywords), longest);
-        let mut lease = slot.take(settings, cancelled)?;
         // A kept server may have died meanwhile.
         if !lease
             .server
@@ -195,6 +215,9 @@ impl Llama {
             lease.server = Some(Server::spawn(settings, context, &**log)?);
         }
         let server = lease.server.as_mut().expect("just started");
+        if let Some(preparation) = &lease.preparation {
+            preparation.watch(server.stop_handle());
+        }
         server.ready(cancelled)?;
         // The estimate errs high, but names and numbers can take more: count,
         // and drop keywords from the end until they fit.
@@ -278,6 +301,7 @@ struct Lease {
     /// Loaded and answering: worth keeping for the next dictation.
     healthy: bool,
     idle: Duration,
+    preparation: Option<Arc<Preparation>>,
 }
 
 impl Slot {
@@ -312,12 +336,23 @@ impl Slot {
             server: state.server.take(),
             healthy: false,
             idle: Duration::from_secs_f64(settings.idle_seconds.clamp(0.0, 86_400.0)),
+            preparation: None,
         })
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        if let Some(preparation) = self.preparation.take() {
+            // Do not leave the warm-up's stop handle attached to a server
+            // handed to a user dictation.
+            preparation
+                .server
+                .lock()
+                .expect("preparation lock poisoned")
+                .take();
+            self.healthy &= !preparation.cancelled.load(Ordering::Relaxed);
+        }
         let server = self.server.take().filter(|_| self.healthy);
         let mut state = self.slot.state.lock().expect("slot lock poisoned");
         state.busy = false;
@@ -344,14 +379,44 @@ impl Drop for Lease {
     }
 }
 
-/// Local transcription, set up once per process; costs nothing until a
-/// dictation starts.
+#[derive(Default)]
+struct Preparation {
+    cancelled: AtomicBool,
+    server: Mutex<Option<server::StopHandle>>,
+}
+
+impl Preparation {
+    fn watch(&self, handle: server::StopHandle) {
+        let mut server = self.server.lock().expect("preparation lock poisoned");
+        if self.cancelled.load(Ordering::Relaxed) {
+            handle.stop();
+        } else {
+            *server = Some(handle);
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(server) = self
+            .server
+            .lock()
+            .expect("preparation lock poisoned")
+            .take()
+        {
+            server.stop();
+        }
+    }
+}
+
+/// Local transcription, set up once per process. Core ML prepares its
+/// caches at startup unless coreml.prewarm is false.
 pub struct Asr {
     settings: Arc<Settings>,
     slot: Arc<Slot>,
     /// The cleanup model's server, handed on the same way.
     cleanup_slot: Arc<Slot>,
     log: Log,
+    preparation: Arc<Preparation>,
 }
 
 /// Starts the cleanup of a dictation of so many samples, when it ends.
@@ -359,12 +424,48 @@ type BeginCleanup = Box<dyn FnOnce(usize) -> Pending + Send>;
 
 impl Asr {
     pub fn new(settings: Settings, log: impl Fn(String) + Send + Sync + 'static) -> Asr {
-        Asr {
+        let asr = Asr {
             settings: Arc::new(settings),
             slot: Arc::default(),
             cleanup_slot: Arc::default(),
             log: Arc::new(log),
+            preparation: Arc::default(),
+        };
+        if asr.settings.coreml.as_ref().is_some_and(|c| c.prewarm) {
+            // Reserve before returning, so a first dictation always follows
+            // preparation and takes its server rather than racing a second load.
+            let mut lease = asr.slot.take(&asr.settings, &|| false).expect("new slot");
+            lease.preparation = Some(asr.preparation.clone());
+            let (settings, log, preparation) = (
+                asr.settings.clone(),
+                asr.log.clone(),
+                asr.preparation.clone(),
+            );
+            std::thread::spawn(move || {
+                let begun = Instant::now();
+                log("local model: preparing caches in the background".into());
+                let result = Llama::load_lease(&settings, lease, &log, &|| {
+                    preparation.cancelled.load(Ordering::Relaxed)
+                })
+                .and_then(|mut engine| {
+                    if preparation.cancelled.load(Ordering::Relaxed) {
+                        engine.lease.healthy = false;
+                        return Err("cancelled".into());
+                    }
+                    // A real prediction triggers deferred Neural Engine and
+                    // Metal specialization, not just .mlpackage compilation.
+                    engine.prime()
+                });
+                match result {
+                    Ok(()) => log(format!(
+                        "local model: startup warm-up finished in {:.2} s",
+                        begun.elapsed().as_secs_f64()
+                    )),
+                    Err(e) => log(format!("local model: startup warm-up failed: {e}")),
+                }
+            });
         }
+        asr
     }
 
     /// A dictation starts: the model starts loading now.
@@ -384,6 +485,12 @@ impl Asr {
             self.log.clone(),
             cleanup,
         )
+    }
+}
+
+impl Drop for Asr {
+    fn drop(&mut self) {
+        self.preparation.cancel();
     }
 }
 
@@ -555,11 +662,13 @@ fn work<E: Engine>(
             && state.ended.is_none()
             && next_job(state.segmenter.cuts(), 0, shared.limits.merge_samples()).is_none()
     };
+    let priming = Instant::now();
     if idle {
         if let Err(e) = engine.prime() {
             return (Err(e), None);
         }
     }
+    let primed = priming.elapsed();
     let mut done = 0;
     let mut texts: Vec<String> = Vec::new();
     let mut requests = 0;
@@ -584,10 +693,11 @@ fn work<E: Engine>(
                 if let Some(ended) = state.ended {
                     log(format!(
                         "local transcription: {:.1} s of audio in {requests} requests \
-                         taking {:.1} s; model ready after {:.1} s, text {:.2} s after the end",
+                         taking {:.1} s; model ready after {:.1} s, warm-up {:.2} s, text {:.2} s after the end",
                         state.audio.len() as f64 / RATE as f64,
                         busy.as_secs_f64(),
                         loaded.as_secs_f64(),
+                        primed.as_secs_f64(),
                         ended.elapsed().as_secs_f64()
                     ));
                     return (Ok(texts.join(" ")), Some(engine));
@@ -907,6 +1017,151 @@ mod tests {
         slot.state.lock().unwrap().server.is_some()
     }
 
+    fn with_prewarm(mut settings: Settings) -> Settings {
+        settings.coreml = Some(CoreMl {
+            encoder: "/test/encoder.mlpackage".into(),
+            frames: vec![500],
+            prewarm: true,
+        });
+        settings
+    }
+
+    #[test]
+    fn startup_prepares_without_dictation_and_releases_the_model() {
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        let pids = dir.path().join("pids");
+        std::fs::create_dir(&pids).unwrap();
+        let body = format!(
+            "echo $$ > '{0}'/$$\necho \"$6\" > '{1}'\nexec sleep 30",
+            pids.display(),
+            host.display()
+        );
+        let done = Arc::new(AtomicBool::new(false));
+        let finished = done.clone();
+        let asr = Asr::new(with_prewarm(stand_in(dir.path(), &body, 0.0)), move |m| {
+            if m.contains("startup warm-up finished") {
+                finished.store(true, Ordering::Relaxed);
+            }
+        });
+        let mut socket = String::new();
+        wait_for("startup loading", || {
+            socket = std::fs::read_to_string(&host).unwrap_or_default();
+            socket.ends_with('\n')
+        });
+        let asked = server::tests::answer_on(
+            std::path::Path::new(socket.trim_end()),
+            server::tests::answer("200 OK", r#"{"tokens":[1,2],"text":"hi"}"#),
+        );
+        wait_for("startup prediction", || done.load(Ordering::Relaxed));
+        assert!(asked
+            .try_iter()
+            .any(|r| r.starts_with(b"POST /v1/audio/transcriptions")));
+        assert!(!kept(&asr.slot));
+        wait_for("the warm-up model to go", || running(&pids).0 == 0);
+        assert_eq!(running(&pids).1, 1);
+    }
+
+    #[test]
+    fn a_dictation_during_startup_takes_the_prepared_server() {
+        use std::sync::atomic::AtomicUsize;
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        let pids = dir.path().join("pids");
+        std::fs::create_dir(&pids).unwrap();
+        let body = format!(
+            "echo $$ > '{0}'/$$\necho \"$6\" > '{1}'\nexec sleep 30",
+            pids.display(),
+            host.display()
+        );
+        let asr = Asr::new(with_prewarm(stand_in(dir.path(), &body, 0.0)), |_| {});
+        let mut socket = String::new();
+        wait_for("startup loading", || {
+            socket = std::fs::read_to_string(&host).unwrap_or_default();
+            socket.ends_with('\n')
+        });
+        let predictions = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (count, gate) = (predictions.clone(), release.clone());
+        let _asked = server::tests::serve_on(std::path::Path::new(socket.trim_end()), move |r| {
+            if r.starts_with(b"POST /v1/audio/transcriptions") {
+                count.fetch_add(1, Ordering::Relaxed);
+                while !gate.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            server::tests::answer("200 OK", r#"{"tokens":[1,2],"text":"hi"}"#)
+        });
+        wait_for("warm-up in flight", || {
+            predictions.load(Ordering::Relaxed) == 1
+        });
+        let mut d = asr.start();
+        d.feed(&bytes(&audio(&[Speech(1_000)])));
+        let result = std::thread::spawn(move || d.finish());
+        wait_for("the dictation to wait", || {
+            asr.slot.state.lock().unwrap().waiting == 1
+        });
+        assert_eq!(running(&pids), (1, 1), "only the warm-up server exists");
+        release.store(true, Ordering::Relaxed);
+        assert_eq!(result.join().unwrap().unwrap(), "hi");
+        wait_for("the dictation model to go", || running(&pids).0 == 0);
+        assert_eq!(running(&pids).1, 1, "the dictation reused the server");
+    }
+
+    #[test]
+    fn dropping_asr_cancels_startup_loading() {
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        std::fs::create_dir(&pids).unwrap();
+        let body = format!("echo $$ > '{}'/$$\nexec sleep 30", pids.display());
+        let asr = Asr::new(with_prewarm(stand_in(dir.path(), &body, 0.0)), |_| {});
+        wait_for("startup server", || running(&pids).0 == 1);
+        let slot = asr.slot.clone();
+        drop(asr);
+        wait_for("cancelled startup server to go", || running(&pids).0 == 0);
+        wait_for("cancelled preparation to finish", || {
+            !slot.state.lock().unwrap().busy
+        });
+    }
+
+    #[test]
+    fn a_failed_startup_does_not_prevent_dictation() {
+        let _one = server::one_at_a_time();
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().join("host");
+        let marker = dir.path().join("started");
+        let body = format!(
+            "if [ ! -e '{0}' ]; then touch '{0}'; exit 1; fi\n\
+             echo \"$6\" > '{1}'\nexec sleep 30",
+            marker.display(),
+            host.display()
+        );
+        let failed = Arc::new(AtomicBool::new(false));
+        let reported = failed.clone();
+        let asr = Asr::new(with_prewarm(stand_in(dir.path(), &body, 0.0)), move |m| {
+            if m.contains("startup warm-up failed") {
+                reported.store(true, Ordering::Relaxed);
+            }
+        });
+        wait_for("failed preparation", || failed.load(Ordering::Relaxed));
+        let mut d = asr.start();
+        d.feed(&bytes(&audio(&[Speech(1_000)])));
+        let result = std::thread::spawn(move || d.finish());
+        let mut socket = String::new();
+        wait_for("dictation after failed preparation", || {
+            socket = std::fs::read_to_string(&host).unwrap_or_default();
+            socket.ends_with('\n')
+        });
+        let _asked = server::tests::answer_on(
+            std::path::Path::new(socket.trim_end()),
+            server::tests::answer("200 OK", r#"{"tokens":[1,2],"text":"hi"}"#),
+        );
+        assert_eq!(result.join().unwrap().unwrap(), "hi");
+    }
+
     #[test]
     fn a_waiting_dictation_takes_over_the_server() {
         let _one = server::one_at_a_time();
@@ -1115,6 +1370,22 @@ mod tests {
             .coreml
             .unwrap();
         assert_eq!((c.encoder.as_str(), c.frames.len()), ("~/e.mlpackage", 0));
+        assert!(
+            c.prewarm,
+            "Core ML prepares caches at app launch by default"
+        );
+        std::fs::write(
+            &path,
+            r#"{"coreml":{"encoder":"~/e.mlpackage","prewarm":false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !Settings::load(path.to_str().unwrap())
+                .unwrap()
+                .coreml
+                .unwrap()
+                .prewarm
+        );
     }
 
     /// A stand-in llama-server for both models: it writes its pid to

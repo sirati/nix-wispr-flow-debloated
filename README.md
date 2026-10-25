@@ -141,9 +141,22 @@ localAsr = {
 ```
 
 This needs the converted encoder package, currently kept separately from
-this repository, and this flake's patched llama-server. Core ML compiles
-the package on first use and caches it in
-`~/Library/Caches/llama-mtmd-coreml`. The language model still runs through
+this repository, and this flake's patched llama-server. At app launch a
+background warm-up loads the speech model and makes a short silent
+prediction, preparing Core ML's Neural Engine and Metal caches before the
+first dictation. Core ML compiles the package only when its disk cache is
+missing or older than the package. The compiled model lives in
+`~/Library/Caches/llama-mtmd-coreml` across app restarts and reboots.
+macOS may purge caches or rebuild hardware-specific plans after an OS
+update; startup warm-up handles that too. Set `coreml.prewarm = false` to
+disable startup preparation.
+
+Preparation shares the speech-server slot with dictation: speaking while
+it is running waits for that same server rather than loading a second
+copy. Once preparation finishes, `idleSeconds` applies as usual. At its
+default of zero the model is released, so later dictations still pay the
+ordinary load cost. Cache reuse, model loading and encoder timings are
+recorded in `~/Library/Logs/wispr-headless.log`. The language model still runs through
 Metal. The encoder requests CPU and Neural Engine execution; the actual
 device placement is decided by Core ML.
 
@@ -163,9 +176,9 @@ seconds on the first process and 1.16 seconds in a later process using the
 cache. Its compute plan assigned 1,375 runtime operations to the Neural
 Engine. The [measurements and package hashes](llama-cpp/coreml-benchmark.json)
 also record process RSS and the memory guard's readings. Process RSS does
-not include Neural Engine memory in system services. Full dictation latency
-and memory, with the language model, fallback encoder and cleanup model,
-have not been measured with this backend.
+not include Neural Engine memory in system services. These standalone
+measurements do not establish full dictation latency or total memory use,
+which also include the language model, fallback encoder and cleanup model.
 
 `packages.x86_64-linux.llama-cpp` is llama.cpp pinned to a release that runs
 IBM Granite Speech 5.0, with patches in `llama-cpp/patches/` so that an audio
