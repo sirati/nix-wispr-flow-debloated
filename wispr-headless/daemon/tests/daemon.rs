@@ -193,6 +193,13 @@ fn fake_model_server() {
         let body = if first.contains("/tokenize") {
             r#"{"tokens":[1]}"#
         } else if first.contains("/transcriptions") {
+            if let Some(gate) = std::env::var_os("WISPR_TEST_TRANSCRIPTION_GATE") {
+                let until = std::time::Instant::now() + Duration::from_secs(10);
+                while !std::path::Path::new(&gate).exists() {
+                    assert!(std::time::Instant::now() < until, "transcription gate");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             std::thread::sleep(Duration::from_millis(200));
             r#"{"text":"local words"}"#
         } else {
@@ -856,6 +863,87 @@ const KEYS: (u16, u16, u16) = (100, 126, 1);
 const RIGHT_ALT: u16 = KEYS.0;
 const RIGHT_META: u16 = KEYS.1;
 const ESCAPE: u16 = KEYS.2;
+
+fn check_local_stop_sound(hands_free: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let (_tone, path, _) = tone_file(16000);
+    let (model, config, _) = working_asr_config();
+    let gate = model.path().join("transcription-release");
+    let sound_log = model.path().join("sounds");
+    let player = model.path().join("player");
+    std::fs::write(
+        &player,
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$WISPR_TEST_SOUND_LOG\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&player, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = Daemon::start_with_env(
+        &format!("cat {path}"),
+        &[
+            "--asr-config",
+            &config,
+            "--hotkey-source",
+            "stdin",
+            "--hotkey",
+            "local:RightCommand",
+            "--player-cmd",
+            player.to_str().unwrap(),
+            "--local-start-sound",
+            "start.wav",
+            "--local-stop-sound",
+            "stop.wav",
+        ],
+        &[
+            ("WISPR_TEST_TRANSCRIPTION_GATE", gate.to_str().unwrap()),
+            ("WISPR_TEST_SOUND_LOG", sound_log.to_str().unwrap()),
+        ],
+    );
+    let sounds = || std::fs::read_to_string(&sound_log).unwrap_or_default();
+    let wait_for_sound = |expected: &str, timeout: Duration| {
+        let until = Instant::now() + timeout;
+        while sounds() != expected {
+            assert!(
+                Instant::now() < until,
+                "expected {expected:?}, got {:?}",
+                sounds()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    if hands_free {
+        daemon.tap(RIGHT_META);
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    daemon.key(RIGHT_META, true);
+    wait_for_sound("start.wav\n", Duration::from_secs(5));
+    if hands_free {
+        daemon.key(RIGHT_META, false);
+        daemon.quiet(100);
+        daemon.key(RIGHT_META, true);
+    }
+    daemon.key(RIGHT_META, false);
+    // Recognition cannot finish until released. The cue must still be played
+    // promptly by both hold-release and hands-free stop, exactly once.
+    wait_for_sound("start.wav\nstop.wav\n", Duration::from_millis(500));
+    daemon.quiet(100);
+    std::fs::write(gate, "release").unwrap();
+    assert_eq!(daemon.next_op("insertTranscript")["text"], "local words");
+    assert_eq!(daemon.next_op("transcript")["text"], "local words");
+    daemon.quiet(100);
+    assert_eq!(sounds(), "start.wav\nstop.wav\n");
+}
+
+#[test]
+fn local_hold_release_plays_stop_sound_before_transcription_finishes() {
+    check_local_stop_sound(false);
+}
+
+#[test]
+fn local_hands_free_stop_plays_stop_sound_before_transcription_finishes() {
+    check_local_stop_sound(true);
+}
 
 impl Daemon {
     /// With the shortcut wispr:RightAlt + local:RightCommand fed from stdin.

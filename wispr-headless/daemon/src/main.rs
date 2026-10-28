@@ -29,6 +29,8 @@ mod pill_x11;
 mod protocol;
 mod recorder;
 mod resample;
+#[cfg(target_os = "macos")]
+mod sound_mac;
 #[cfg(target_os = "linux")]
 mod text;
 mod typing;
@@ -403,6 +405,10 @@ fn play(cfg: &Config, name: &str, out: &Out) {
 }
 
 fn play_file(cfg: &Config, path: &str, out: &Out) {
+    #[cfg(target_os = "macos")]
+    if sound_mac::uses_native(&cfg.player) && sound_mac::play(path) {
+        return;
+    }
     let (program, args) = match cfg.player.split_first() {
         Some(p) => p,
         None => return,
@@ -772,6 +778,31 @@ fn serve(
     let clock = Instant::now();
     let clock_ms = || clock.elapsed().as_secs_f64() * 1_000.0;
     let log = |msg: String| out.send(&Event::Log { msg });
+
+    // Load cues before accepting a shortcut. Native playback avoids starting
+    // afplay (and its audio setup) while local inference is busy.
+    #[cfg(target_os = "macos")]
+    if sound_mac::uses_native(&cfg.player) {
+        let mut paths = Vec::new();
+        if let Some(dir) = &cfg.sounds {
+            for file in [
+                "dictation-start.wav",
+                "dictation-stop.wav",
+                "paste.wav",
+                "achievement.wav",
+                "popo-lock.wav",
+            ] {
+                paths.push(format!("{dir}/{file}"));
+            }
+        }
+        paths.extend(cfg.local_start_sound.iter().cloned());
+        paths.extend(cfg.local_stop_sound.iter().cloned());
+        for path in sound_mac::prepare(paths) {
+            log(format!(
+                "cannot preload sound {path}; using configured player"
+            ));
+        }
+    }
 
     // The system's inputs, listed in the background (ffmpeg takes a moment)
     // at start, when Wispr's ranking changes and after each recording, so a
