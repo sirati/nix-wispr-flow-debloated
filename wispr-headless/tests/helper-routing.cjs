@@ -71,6 +71,41 @@ test("an older idle status cannot release a queued invocation before its recorde
   retry.close();
 });
 
+test("an empty local result stops automatic retries without cancelling a cloud request still processing", async () => {
+  const sent = [], retried = [];
+  const retry = testing.createCloudRetry((event) => sent.push(event), () => retried.push(true), 5);
+  retry.start(1); retry.recording(); retry.status("error");
+  retry.noSpeech(1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(retried.length, 0);
+  assert.equal(sent.at(-1).value, "empty");
+  assert.equal(retry.active, null);
+  retry.start(2); retry.recording(); retry.status("processing");
+  retry.noSpeech(1);
+  assert.equal(retry.active, 2, "an older empty result cannot settle the next job");
+  retry.noSpeech(2);
+  assert.equal(retry.active, 2, "an in-flight cloud request may still return words");
+  retry.status("error");
+  assert.equal(retry.active, null);
+  assert.equal(sent.at(-1).id, 2);
+  assert.equal(sent.at(-1).value, "empty");
+  retry.close();
+});
+
+test("Wispr's empty-transcription notice is terminal and never schedules Retry", async () => {
+  const sent = [];
+  const retry = testing.createCloudRetry((event) => sent.push(event), () => assert.fail("retrying empty audio"), 5);
+  retry.start(1); retry.recording(); retry.status("error");
+  assert.equal(retry.notice({ type: "TranscriptionEmpty" }), true);
+  assert.equal(retry.active, null);
+  assert.equal(sent.at(-1).value, "empty");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  retry.start(2);
+  assert.equal(retry.notice({ type: "TranscriptionEmpty" }), false, "an older notification cannot release the next invocation before it records");
+  assert.equal(retry.active, 2);
+  retry.close();
+});
+
 for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Boolean)) {
   test(`the shipped bundle retains correlation and spoken Enter on both insertion paths: ${bundle}`, () => {
     const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
@@ -115,6 +150,20 @@ for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Bo
       router.delivered({ request: sent[0].request, applied: true });
     }
     assert.match(patched, /globalThis\.wisprHeadlessTextBoxInfo=\w+;/);
+    const empty = /(\w+)\|\|(\w+)\.status===(\w+)\.nf\.Empty\?\(globalThis\.wisprHeadlessEmpty\?\.\((\w+)\.ZZ\.uuid\),/.exec(patched);
+    assert.ok(empty, "Wispr's actual no-output branch reports its UUID without a paste request");
+    for (const [formatterEmpty, status, expected] of [[false, "empty", 1], [true, "formatted", 1], [false, "formatted", 0]]) {
+      const ended = [];
+      const env = { [empty[1]]: formatterEmpty, [empty[2]]: { status }, [empty[3]]: { nf: { Empty: "empty" } }, [empty[4]]: { ZZ: { uuid: "empty-session" } }, wisprHeadlessEmpty: (uuid) => ended.push(uuid) };
+      vm.runInNewContext(empty[0] + "true):false", env);
+      assert.equal(ended.length, expected);
+      if (expected) assert.equal(ended[0], "empty-session");
+    }
+    const noAudio = /return (globalThis\.wisprHeadlessEmpty\?\.\((\w+)\.ZZ\.uuid\),(\w+)\(\)\.warn\("No audio data received, skipping recording done"\))/.exec(patched);
+    assert.ok(noAudio, "zero audio reports completion before Wispr clears its dictation state");
+    const ended = [];
+    vm.runInNewContext(noAudio[1], { [noAudio[2]]: { ZZ: { uuid: "no-audio-session" } }, [noAudio[3]]: () => ({ warn() {} }), wisprHeadlessEmpty: (uuid) => ended.push(uuid) });
+    assert.deepEqual(ended, ["no-audio-session"]);
   });
 }
 

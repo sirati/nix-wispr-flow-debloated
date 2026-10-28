@@ -468,6 +468,18 @@ fn finish_cloud(
     }
 }
 
+fn empty_cloud(cloud: &mut cloud::Queue<destination::Session>, id: u64, out: &Out) {
+    if let Some(job) = cloud.jobs.get_mut(&id).filter(|job| !job.claimed) {
+        job.cloud_empty = true;
+        // A local attempt already in flight may still find words. Keep its
+        // captured route until that attempt also returns an empty result.
+        if !job.local_running {
+            cloud.cancel(id);
+        }
+        out.send(&Event::CloudEmpty { id });
+    }
+}
+
 /// A native notice owns either an unfinished recording for Undo or completed
 /// text for Copy, for either backend.
 fn retain_cloud_event(cloud: &mut cloud::Queue<destination::Session>, id: u64, event: &Event) {
@@ -1285,7 +1297,7 @@ fn serve(
                 if text.trim().is_empty() || cloud.handled(&uuid) {
                     if text.trim().is_empty() && !cloud.handled(&uuid) {
                         if let Some(id) = managed {
-                            cloud.cancel(id);
+                            empty_cloud(&mut cloud, id, out);
                         }
                     }
                     out.send(&Event::CloudDelivery {
@@ -1294,17 +1306,21 @@ fn serve(
                         applied: true,
                         error: None,
                     });
-                    continue;
+                } else {
+                    let destination = managed.and_then(|id| cloud.claim(id));
+                    let commands = internal.clone();
+                    std::thread::spawn(move || {
+                        let result = destination
+                            .ok_or_else(|| "no captured dictation session".to_string())
+                            .and_then(|destination| destination.complete(&text, submit));
+                        let _ = commands.send(Some(Command::CloudDelivered { request, result }));
+                    });
                 }
-                let captured = managed.and_then(|id| cloud.claim(id));
-                let destination = captured;
-                let commands = internal.clone();
-                std::thread::spawn(move || {
-                    let result = destination
-                        .ok_or_else(|| "no captured dictation session".to_string())
-                        .and_then(|destination| destination.complete(&text, submit));
-                    let _ = commands.send(Some(Command::CloudDelivered { request, result }));
-                });
+            }
+            Ok(Some(Command::CloudEmpty { uuid })) => {
+                if let Some(id) = cloud.id_for(&uuid) {
+                    empty_cloud(&mut cloud, id, out);
+                }
             }
             Ok(Some(Command::CloudDelivered { request, result })) => {
                 out.send(&Event::CloudDelivery {
@@ -1347,8 +1363,13 @@ fn serve(
                 if id.is_some() && cloud.active != id {
                     continue;
                 }
-                if matches!(value.as_str(), "idle" | "dismissed") {
+                if matches!(value.as_str(), "idle" | "dismissed" | "empty") {
                     upstream_busy = false;
+                    if value == "empty" {
+                        if let Some(id) = cloud.active {
+                            empty_cloud(&mut cloud, id, out);
+                        }
+                    }
                     if value == "dismissed" {
                         if let Some(id) = cloud.active {
                             if cloud_capture
@@ -1378,7 +1399,12 @@ fn serve(
             }
             Ok(Some(Command::LocalAlternative { id })) => {
                 if let (Some(asr), Some(job)) = (asr.as_ref(), cloud.jobs.get_mut(&id)) {
-                    if job.timing.is_some() && !job.local_running && !job.claimed {
+                    if job.timing.is_some()
+                        && !job.local_running
+                        && !job.local_empty
+                        && !job.cloud_empty
+                        && !job.claimed
+                    {
                         job.local_running = true;
                         let mut dictation = asr.start();
                         dictation.feed(&job.audio);
@@ -1409,8 +1435,24 @@ fn serve(
                             });
                         }
                     }
-                    Err(error) => log(format!("local alternative failed: {error}")),
-                    _ => {}
+                    Err(error) => {
+                        log(format!("local alternative failed: {error}"));
+                        if cloud.jobs.get(&id).is_some_and(|job| job.cloud_empty) {
+                            empty_cloud(&mut cloud, id, out);
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(job) = cloud.jobs.get_mut(&id).filter(|job| !job.claimed) {
+                            job.local_empty = true;
+                            if job.cloud_empty || job.cloud_done {
+                                empty_cloud(&mut cloud, id, out);
+                            } else {
+                                // Do not retry silence. A cloud request already
+                                // processing can still supply a nonempty result.
+                                out.send(&Event::CloudEmpty { id });
+                            }
+                        }
+                    }
                 }
                 cloud.prune();
             }
@@ -1526,14 +1568,19 @@ fn serve(
                 .jobs
                 .iter()
                 .filter(|(&id, job)| {
-                    job.timing.is_some()
+                    !job.cancelled
+                        && job.timing.is_some()
                         && (!job.cloud_done || !job.claimed || job.local_running)
                         && cloud_capture.as_ref().is_none_or(|c| c.id != id)
                 })
                 .map(|(&id, job)| bar::Processing {
                     id,
                     local: job.local_running,
-                    retry: asr.is_some() && !job.claimed && !job.local_running,
+                    retry: asr.is_some()
+                        && !job.claimed
+                        && !job.local_running
+                        && !job.local_empty
+                        && !job.cloud_empty,
                     queued: !job.cloud_done && cloud.active != Some(id) && !job.local_running,
                     icon: job.icon.clone(),
                 }),

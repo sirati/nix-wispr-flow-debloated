@@ -95,6 +95,11 @@ impl Session {
     /// Consumes the captured session. Dropping without completing cancels it,
     /// including after an expired Undo notice or an ASR failure.
     pub fn complete(self, text: &str, submit: bool) -> Delivery {
+        if text.trim().is_empty() {
+            // Dropping the sender cancels the captured broker session. There
+            // is no transcript to acknowledge, type, submit, or recover.
+            return Ok(true);
+        }
         let (tx, rx) = mpsc::channel();
         self.commands
             .send((text.into(), submit, tx))

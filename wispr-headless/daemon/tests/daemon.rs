@@ -87,6 +87,7 @@ impl Daemon {
             if v["op"] == "log"
                 || (v["op"] == "hideKeys" && op != "hideKeys")
                 || (v["op"] == "cloudStart" && op != "cloudStart")
+                || (v["op"] == "cloudEmpty" && op != "cloudEmpty")
                 || (v["op"] == "chunk" && op == "wisprKey")
             {
                 continue;
@@ -172,6 +173,9 @@ fn fake_model_server() {
         .unwrap();
     }
     let listener = UnixListener::bind(socket).unwrap();
+    let transcript = serde_json::json!({"text": std::env::var("WISPR_TEST_MODEL_TEXT")
+        .unwrap_or_else(|_| "local words".into())})
+    .to_string();
     for stream in listener.incoming() {
         let mut stream = stream.unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -201,7 +205,7 @@ fn fake_model_server() {
                 }
             }
             std::thread::sleep(Duration::from_millis(200));
-            r#"{"text":"local words"}"#
+            &transcript
         } else {
             "{}"
         };
@@ -284,6 +288,64 @@ fn overlapping_local_dictations_share_one_model_process() {
         1,
         "the weights are loaded only once"
     );
+}
+
+#[test]
+fn empty_cloud_result_preserves_an_in_flight_local_attempt() {
+    let (_tone, path, _) = tone_file(16000);
+    let (model, config, _) = working_asr_config();
+    let gate = model.path().join("release");
+    let mut daemon = Daemon::start_with_env(
+        &format!("cat {path}"),
+        &["--asr-config", &config],
+        &[("WISPR_TEST_TRANSCRIPTION_GATE", gate.to_str().unwrap())],
+    );
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = daemon.next_op("cloudStart")["id"].as_u64().unwrap();
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"start","uuid":"cloud-empty-local-pending"}"#);
+    daemon.next_op("started");
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    daemon.send(r#"{"op":"cloudEmpty","uuid":"cloud-empty-local-pending"}"#);
+    assert_eq!(daemon.next_op("cloudEmpty")["id"], id);
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
+    std::fs::write(gate, "release").unwrap();
+    assert_eq!(daemon.next_op("insertTranscript")["text"], "local words");
+    assert_eq!(daemon.next_op("transcript")["text"], "local words");
+    daemon.send(r#"{"op":"cloudTranscript","request":"duplicate","uuid":"cloud-empty-local-pending","text":"late"}"#);
+    assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
+}
+
+#[test]
+fn empty_local_alternative_does_not_discard_words_still_processing_in_cloud() {
+    let (_tone, path, _) = tone_file(16000);
+    let (_model, config, _) = working_asr_config();
+    let mut daemon = Daemon::start_with_env(
+        &format!("cat {path}"),
+        &["--asr-config", &config],
+        &[("WISPR_TEST_MODEL_TEXT", "")],
+    );
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = daemon.next_op("cloudStart")["id"].as_u64().unwrap();
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"start","uuid":"local-empty-cloud-pending"}"#);
+    daemon.next_op("started");
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    assert_eq!(daemon.next_op("cloudEmpty")["id"], id);
+    daemon.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    daemon.quiet(300);
+    daemon.send(r#"{"op":"cloudTranscript","request":"cloud-words","uuid":"local-empty-cloud-pending","text":"actual words"}"#);
+    assert_eq!(daemon.next_op("cloudDelivery")["fallback"], true);
 }
 
 #[test]
@@ -557,6 +619,77 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
         .send(r#"{"op":"cloudTranscript","request":"empty","uuid":"empty-transcript","text":" "}"#);
     assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty));
     assert_eq!(lifecycle.next_op("cloudDelivery")["applied"], true);
+
+    // Wispr can finish without ever issuing PasteText. Its exact terminal
+    // signal must cancel the accepted route even after its earlier idle.
+    lifecycle.send(r#"{"op":"cloudState","value":"idle"}"#);
+    lifecycle.send(r#"{"op":"start","uuid":"empty-without-paste"}"#);
+    lifecycle.next_op("started");
+    let empty = offer(&c);
+    c.respond(&empty, true, AudioFeatures::default()).unwrap();
+    lifecycle.send(r#"{"op":"stop"}"#);
+    lifecycle.next_op("done");
+    lifecycle.send(r#"{"op":"cloudState","value":"idle"}"#);
+    lifecycle.send(r#"{"op":"cloudEmpty","uuid":"empty-without-paste"}"#);
+    lifecycle.next_op("cloudEmpty");
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty));
+    lifecycle.send(r#"{"op":"cloudTranscript","request":"retired-empty","uuid":"empty-without-paste","text":"late duplicate"}"#);
+    assert_eq!(lifecycle.next_op("cloudDelivery")["applied"], true);
+
+    // A recording with no captured samples also terminates through local
+    // recognition, without sending an empty Transcript/submit to the app.
+    lifecycle.send(r#"{"op":"dictate","backend":"local"}"#);
+    let empty_local = offer(&c);
+    c.respond(&empty_local, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"dictateEnd"}"#);
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty_local));
+    assert_eq!(lifecycle.next_op("transcript")["text"], "");
+
+    lifecycle.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = lifecycle.next_op("cloudStart")["id"].as_u64().unwrap();
+    lifecycle.next_op("wisprKey");
+    let empty_retry = offer(&c);
+    c.respond(&empty_retry, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"start","uuid":"empty-local-retry"}"#);
+    lifecycle.next_op("started");
+    lifecycle.send(r#"{"op":"dictateEnd"}"#);
+    lifecycle.next_op("wisprKey");
+    lifecycle.send(r#"{"op":"stop"}"#);
+    lifecycle.next_op("done");
+    lifecycle.send(r#"{"op":"cloudState","value":"retrying"}"#);
+    lifecycle.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    assert_eq!(lifecycle.next_op("cloudEmpty")["id"], id);
+    // The shim stops retrying once the local recognizer confirms no words.
+    lifecycle.send(&format!(
+        r#"{{"op":"cloudState","value":"empty","id":{id}}}"#
+    ));
+    lifecycle.next_op("cloudEmpty");
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty_retry));
+    lifecycle.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    lifecycle.quiet(300);
+
+    // The same empty local attempt is terminal when Wispr already went idle
+    // without a paste. No follow-up cloud status is needed to clear the app.
+    lifecycle.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = lifecycle.next_op("cloudStart")["id"].as_u64().unwrap();
+    lifecycle.next_op("wisprKey");
+    let empty_after_idle = offer(&c);
+    c.respond(&empty_after_idle, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"start","uuid":"empty-after-idle"}"#);
+    lifecycle.next_op("started");
+    lifecycle.send(r#"{"op":"dictateEnd"}"#);
+    lifecycle.next_op("wisprKey");
+    lifecycle.send(r#"{"op":"stop"}"#);
+    lifecycle.next_op("done");
+    lifecycle.send(r#"{"op":"cloudState","value":"idle"}"#);
+    lifecycle.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    assert_eq!(lifecycle.next_op("cloudEmpty")["id"], id);
+    assert!(
+        matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty_after_idle)
+    );
 }
 
 impl Drop for Daemon {

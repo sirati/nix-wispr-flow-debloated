@@ -124,6 +124,9 @@ to 30 seconds between attempts. With local recognition configured, cloud
 processing bubbles also have a green circular-arrow button. It runs local
 recognition on the retained audio while Wispr continues. The first nonempty
 transcript wins one delivery; later results cannot insert a duplicate.
+When recognition finishes without words, the session closes without inserting
+or submitting anything. Empty local results do not offer repeated local
+retries; an already running cloud request may still supply a transcript.
 Audio is released when cloud processing finishes. An active local attempt
 owns its own audio copy until it finishes.
 

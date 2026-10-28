@@ -243,6 +243,21 @@ app.whenReady().then(async () => {
     check(retained, "an undelivered dictation keeps its processing bubble and local action after Wispr goes idle");
   }
 
+  // An explicit empty result must remove these retained processing rows,
+  // even though neither produced a helper paste after going idle.
+  const emptyEvents = daemonEvents.length;
+  globalThis.wisprHeadlessEmpty("stack-1");
+  globalThis.wisprHeadlessEmpty("stack-2");
+  await until("empty jobs closed", () => daemonEvents.slice(emptyEvents).filter((event) => event.op === "cloudEmpty").length === 2);
+  check(daemonEvents.slice(emptyEvents).filter((event) => event.op === "cloudEmpty").length === 2, "no-output completion closes both retained processing jobs");
+  if (xdotool) {
+    await wait(150);
+    const before = daemonEvents.length;
+    execSync(`${xdotool} mousemove 688 721 click 1`);
+    await wait(300);
+    check(!daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed")), "a finished empty dictation no longer offers a local retry");
+  }
+
   // A notification needs the real status page.
   status.webContents.send("notification:show", { type: "tip" });
   await until("status loaded", () => loaded.includes("status"));

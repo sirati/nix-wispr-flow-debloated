@@ -23,6 +23,8 @@ pub struct Job<T> {
     pub stopped: bool,
     pub claimed: bool,
     pub local_running: bool,
+    pub local_empty: bool,
+    pub cloud_empty: bool,
     pub cloud_done: bool,
     pub retrying: bool,
     pub external: bool,
@@ -64,6 +66,8 @@ impl<T> Queue<T> {
                 stopped: false,
                 claimed: false,
                 local_running: false,
+                local_empty: false,
+                cloud_empty: false,
                 cloud_done: false,
                 retrying: false,
                 external: false,
@@ -192,6 +196,13 @@ impl<T> Queue<T> {
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.cloud_done = true;
                 job.completed_at = Some(Instant::now());
+                if job.local_empty && !job.claimed {
+                    // Both attempts have ended without a transcript. Do not
+                    // retain a no-speech job for a later paste or local retry.
+                    job.claimed = true;
+                    job.cancelled = true;
+                    job.destination = None;
+                }
                 // Idle releases Wispr's slot, but its final paste may still
                 // be pending. Keep audio and the local alternative until a
                 // transcript has actually claimed this job.
@@ -229,7 +240,11 @@ impl<T> Queue<T> {
                 job.sent = 0;
             }
         } else {
-            self.jobs.remove(&id);
+            if let Some(job) = self.jobs.remove(&id) {
+                if let Some(uuid) = job.uuid {
+                    self.retired.insert(uuid);
+                }
+            }
         }
     }
 }
@@ -314,5 +329,19 @@ mod tests {
         queue.prune();
         assert!(queue.jobs.is_empty());
         assert!(queue.handled("empty-result"));
+    }
+
+    #[test]
+    fn idle_after_an_empty_local_result_finishes_the_job_immediately() {
+        let mut queue = Queue::default();
+        queue.add(1, "app");
+        queue.next();
+        queue.bind("no-words".into());
+        queue.jobs.get_mut(&1).unwrap().local_empty = true;
+        queue.available();
+        assert!(queue.jobs.is_empty());
+        assert!(queue.handled("no-words"));
+        queue.add(2, "next app");
+        assert_eq!(queue.next(), Some(2));
     }
 }

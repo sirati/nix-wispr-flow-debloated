@@ -19,6 +19,10 @@ pub enum Command {
         #[serde(default)]
         id: Option<u64>,
     },
+    /// Wispr completed without text and therefore made no paste request.
+    CloudEmpty {
+        uuid: String,
+    },
     LocalAlternative {
         id: u64,
     },
@@ -193,6 +197,10 @@ pub struct Timing {
 pub enum Event {
     Ready,
     CloudStart {
+        id: u64,
+    },
+    /// No recognizer output. Stop offering/retrying this logical dictation.
+    CloudEmpty {
         id: u64,
     },
     CloudDelivery {

@@ -298,10 +298,14 @@ function createPasteRouter(send, alive, timeout = 65_000) {
 }
 
 function createCloudRetry(send, callback, delay = 1000) {
-  let active = null, timer = null, attempt = 0, notification = null, retrying = false, started = false;
+  let active = null, timer = null, attempt = 0, notification = null, retrying = false, started = false, empty = false;
   const clear = () => { if (timer) clearTimeout(timer); timer = null; };
+  const release = (value) => {
+    const id = active; clear(); active = null; retrying = false;
+    send({ op: "cloudState", value, id });
+  };
   const retry = () => {
-    if (active === null || timer) return;
+    if (active === null || timer || empty) return;
     retrying = true;
     send({ op: "cloudState", value: "retrying", id: active });
     timer = setTimeout(() => {
@@ -315,21 +319,34 @@ function createCloudRetry(send, callback, delay = 1000) {
   };
   return {
     get active() { return active; },
-    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; started = false; },
+    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; started = false; empty = false; },
     recording() { started = true; },
+    noSpeech(id) {
+      if (active !== id) return;
+      empty = true;
+      clear();
+      // An error already ended Wispr's attempt. Otherwise let its current
+      // processing finish, without starting another retry afterwards.
+      if (retrying) release("empty");
+    },
     status(value) {
       if (active === null) return;
-      if (value === "error") retry();
+      if (value === "error") { if (empty) release("empty"); else retry(); }
       else if (["initializing", "listening", "stopping", "processing", "retrying"].includes(value)) { retrying = false; clear(); }
       else if (value === "idle" || value === "dismissed") {
         // A duplicate terminal status from the preceding job can arrive
         // after the next start was requested but before its audioStart.
         if (!started) return;
-        const id = active; clear(); active = null; send({ op: "cloudState", value, id });
+        release(value);
       }
     },
     notice(payload) {
+      if (active !== null && started && payload?.type === "TranscriptionEmpty") { release("empty"); return true; }
       if (active === null || !["TranscriptionError", "NoInternet", "TranscriptCurrentlyProcessing", "ProcessingDelayNotification"].includes(payload?.type)) return false;
+      if (empty) {
+        if (payload.type === "TranscriptionError" || payload.type === "NoInternet") release("empty");
+        return true;
+      }
       if (payload.type === "TranscriptionError" || payload.type === "NoInternet") { notification = payload.type === "TranscriptionError" ? payload : null; retry(); }
       return true;
     },
@@ -368,6 +385,16 @@ function patchWisprBundle(source) {
   source = source.replace(formatter, "$&let __wisprDeferredCopy=false;");
   source = source.replace(voidCall, (call, state, module, text) => call.replace(`(0,${module}.sendVoidDictationNotification)(${text})`, "__wisprDeferredCopy=true"));
   source = source.replace(formatted, (value, text, submit) => `__wisprDeferredCopy&&(0,${copyModule}.sendVoidDictationNotification)(${text},void 0,${copyState}.ZZ.uuid,${submit});${value}`);
+  // Empty dictations bypass both paste paths. Observe Wispr's terminal
+  // no-output branch itself, before its generic idle status loses the UUID.
+  const empty = /\w+\|\|\w+\.status===\w+\.nf\.Empty\?\(/g;
+  if ([...source.matchAll(empty)].length !== 1) throw new Error("unsupported Wispr empty result");
+  source = source.replace(empty, (branch) => `${branch}globalThis.wisprHeadlessEmpty?.(${copyState}.ZZ.uuid),`);
+  // A very quick release with zero audio returns before transcription and
+  // formatting. Settle it before Wispr clears that dictation's state too.
+  const noAudio = /return (?=\w+\(\)\.warn\("No audio data received, skipping recording done"\))/g;
+  if ([...source.matchAll(noAudio)].length !== 1) throw new Error("unsupported Wispr no-audio result");
+  source = source.replace(noAudio, `return globalThis.wisprHeadlessEmpty?.(${copyState}.ZZ.uuid),`);
   const paste = /(\w+)=\((\w+),(\w+),(\w+),(\w+)\)=>\{\w+\.RA\.lastTranscriptionStatus=\w+/.exec(source);
   if (!paste) throw new Error("unsupported Wispr final paste");
   const owner = paste[4], uuid = paste[5];
@@ -659,6 +686,9 @@ function build(electron) {
     emitFrom(byRole.get("status"), "notification:callback", { callback: action?.callback ?? "retry_last_text", type: payload.type, callbackOperationId: payload.callbackOperationId });
     emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
   });
+  globalThis.wisprHeadlessEmpty = (uuid) => {
+    if (typeof uuid === "string") daemon?.send({ op: "cloudEmpty", uuid });
+  };
   pasteGate = (payload, done) => brokerPastes.route(payload, (result) => {
     if (!result.fallback && !result.applied) daemon?.send({ op: "recover", text: String(payload.text ?? ""), local: false });
     done(result);
@@ -896,6 +926,9 @@ function build(electron) {
         brokerPastes.delivered(msg);
         break;
       }
+      case "cloudEmpty":
+        cloudRetry.noSpeech(msg.id);
+        break;
       case "copyTranscript":
         try { electron.clipboard.writeText(String(msg.text)); }
         catch (error) {
