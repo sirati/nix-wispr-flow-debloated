@@ -45,14 +45,22 @@ impl Session {
                     return;
                 }
             };
-            let outcome = run(&provider, &rx, &levels, id, move |id, icon| {
-                *resolved_icon.lock().unwrap() = icon.clone();
-                destination(id, icon);
-            });
+            let mut completion = None;
+            let outcome = run(
+                &provider,
+                &rx,
+                &levels,
+                &mut completion,
+                id,
+                move |id, icon| {
+                    *resolved_icon.lock().unwrap() = icon.clone();
+                    destination(id, icon);
+                },
+            );
             // Close explicitly, including on timeouts, to release the captured target.
             let _ = provider.connection().close();
             if let Err(error) = outcome {
-                if let Ok((_, _, reply)) = rx.recv() {
+                if let Some((_, _, reply)) = completion.or_else(|| rx.recv().ok()) {
                     let _ = reply.send(Err(error));
                 }
             }
@@ -95,6 +103,7 @@ fn run(
     provider: &Provider,
     commands: &mpsc::Receiver<Completion>,
     levels: &Mutex<Option<f32>>,
+    completion: &mut Option<Completion>,
     id: u64,
     destination: impl FnOnce(u64, Option<Arc<crate::icon::Icon>>),
 ) -> Result<(), String> {
@@ -105,7 +114,6 @@ fn run(
         })
         .map_err(|e| e.to_string())?;
     let ready_by = Instant::now() + Duration::from_secs(7);
-    let mut completion = None;
     let (application, audio) = loop {
         if Instant::now() >= ready_by {
             return Err("dictation broker did not resolve the destination".into());
@@ -126,7 +134,7 @@ fn run(
         }
         if completion.is_none() {
             match commands.try_recv() {
-                Ok(command) => completion = Some(command),
+                Ok(command) => *completion = Some(command),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let _ = provider.cancel(&session);
                     return Ok(());
@@ -143,7 +151,7 @@ fn run(
     destination(id, icon);
     if !routed {
         let _ = provider.connection().close();
-        if let Some((_, _, reply)) = completion {
+        if let Some((_, _, reply)) = completion.take() {
             let _ = reply.send(Ok(false));
         } else {
             fallback(commands);
@@ -172,7 +180,7 @@ fn run(
         }
         if delivered.is_none() {
             let level = levels.lock().unwrap().take();
-            if let Some(level) = level {
+            if let Some(level) = level.filter(|_| audio.level) {
                 provider
                     .audio(
                         &session,
@@ -235,6 +243,7 @@ mod tests {
         Rejected,
         Disconnect,
         LostOffer,
+        CancelledOffer,
         PendingOffer,
         SlowOffer,
         SlowAudio,
@@ -320,6 +329,19 @@ mod tests {
                             }
                             if matches!(scenario, Scenario::SlowOffer) {
                                 std::thread::sleep(Duration::from_millis(100));
+                            }
+                            if matches!(scenario, Scenario::CancelledOffer) {
+                                std::thread::sleep(Duration::from_millis(100));
+                                send(
+                                    &mut stream,
+                                    Message::Event {
+                                        event: Event::Cancelled {
+                                            session: "captured".into(),
+                                            reason: "offer withdrawn".into(),
+                                        },
+                                    },
+                                );
+                                return;
                             }
                             send(&mut stream, Message::Event { event: Event::Ready {
                                 session: "captured".into(),
@@ -434,11 +456,17 @@ mod tests {
             Scenario::Rejected,
             Scenario::Disconnect,
             Scenario::LostOffer,
+            Scenario::CancelledOffer,
         ] {
             let broker = Broker::new(scenario);
             let (session, _) = broker.session();
-            assert!(session
-                .complete("keep out of other windows", false)
+            let (done, completed) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = done.send(session.complete("keep out of other windows", false));
+            });
+            assert!(completed
+                .recv_timeout(Duration::from_secs(3))
+                .expect("a failed offer must resolve even if completion arrived before Ready")
                 .is_err());
         }
     }

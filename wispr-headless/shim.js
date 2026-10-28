@@ -165,6 +165,9 @@ const NOTICE_TEXT = {
   transcript_cancelled_detailed_action_undo: "Undo",
 };
 function nativeNotice(p, locale) {
+  if (p?.component === "voidDictation" && typeof p.body === "string") {
+    return { op: "recover", text: p.body, local: false };
+  }
   if (!/^en/i.test(locale) || p?.variant !== "condensed" || p.titleWrap || p.selfDismiss === false) return null;
   if (p.icon || p.badge || p.badgeIcon) return null;
   const text = (t) => (typeof t === "string" ? t : t?.values ? undefined : NOTICE_TEXT[t?.key]);
@@ -242,7 +245,7 @@ function startDaemon(resourcesPath, onEvent, onExit) {
 // Correlate only actual dictations, never unrelated helper pastes. An absent
 // broker permits the original paste; uncertain delivery fails closed.
 function createPasteRouter(send, alive, timeout = 65_000) {
-  const sessions = new Set();
+  const sessions = new Map();
   const requests = new Map();
   let next = 0;
   return {
@@ -250,25 +253,36 @@ function createPasteRouter(send, alive, timeout = 65_000) {
       if (typeof uuid !== "string") return;
       // Remember retired sessions too. A late result must fail closed rather
       // than becoming an unrelated native paste after its route expires.
-      sessions.add(uuid);
+      if (!sessions.has(uuid)) sessions.set(uuid, { waiting: [] });
     },
     route(payload, done) {
       const uuid = payload.transcriptEntityUUID ?? payload.logAttributes?.transcriptEntityUuid;
       if (typeof uuid !== "string" || !sessions.has(uuid)) return false;
+      const session = sessions.get(uuid);
+      if (session.result) { done(session.result); return true; }
+      session.waiting.push(done);
+      if (session.pending) return true;
+      session.pending = true;
+      const finish = (result) => {
+        session.result = result;
+        for (const callback of session.waiting.splice(0)) callback(result);
+      };
       if (!alive()) {
-        process.nextTick(() => done({ applied: false, error: "dictation daemon disconnected" }));
+        process.nextTick(() => finish({ applied: false, error: "dictation daemon disconnected" }));
         return true;
       }
       const request = `paste-${++next}`;
       const timer = setTimeout(() => {
         requests.delete(request);
-        done({ applied: false, error: "dictation delivery timed out" });
+        finish({ applied: false, error: "dictation delivery timed out" });
       }, timeout);
-      requests.set(request, (result) => { clearTimeout(timer); done(result); });
+      requests.set(request, (result) => { clearTimeout(timer); finish(result); });
+      trace({ ev: "broker.route", request, uuid, chars: String(payload.text ?? "").length });
       send({ op: "cloudTranscript", request, uuid, text: String(payload.text ?? ""), submit: Boolean(payload.submit ?? payload.logAttributes?.dictationSubmit) });
       return true;
     },
     delivered(message) {
+      trace({ ev: "broker.delivered", request: message.request, applied: message.applied, fallback: message.fallback, error: message.error });
       const done = requests.get(message.request);
       requests.delete(message.request);
       done?.(message);
@@ -278,6 +292,34 @@ function createPasteRouter(send, alive, timeout = 65_000) {
       requests.clear();
     },
   };
+}
+
+// These releases omit the UUID on ordinary helper pastes and on their custom
+// copy notification. Add it where Wispr still owns the exact dictation state.
+function patchWisprBundle(source) {
+  const module = (exportName) => {
+    const exports = new RegExp(String.raw`\d+\(e,t,n\)\{"use strict";(?:n\.r\(t\),)?n\.d\(t,\{[^}]*\b${exportName}:\(\)=>(\w+)[^}]*\}\);`).exec(source);
+    if (!exports) throw new Error(`missing Wispr export ${exportName}`);
+    const after = source.slice(exports.index + exports[0].length);
+    const end = /\},\d+\(e,t,n\)\{/.exec(after);
+    if (!end) throw new Error(`missing Wispr module boundary ${exportName}`);
+    return { start: exports.index, end: exports.index + exports[0].length + end.index, name: exports[1] };
+  };
+  const notices = module("sendVoidDictationNotification");
+  const body = source.slice(notices.start, notices.end);
+  const state = /appName:(\w+)\.ZZ\.appName/.exec(body)?.[1];
+  const notification = /\{\.\.\.\w+\.L\[\w+\.Eg\.VoidDictation\],body:\w+\}/g;
+  if (!state || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
+  source = source.slice(0, notices.start) + body.replace(notification, (value) => value.slice(0, -1) + `,callbackOperationId:${state}.ZZ.uuid}`) + source.slice(notices.end);
+  const paste = /(\w+)=\((\w+),(\w+),(\w+),(\w+)\)=>\{\w+\.RA\.lastTranscriptionStatus=\w+/.exec(source);
+  if (!paste) throw new Error("unsupported Wispr final paste");
+  const owner = paste[4], uuid = paste[5];
+  const correlation = `${uuid}?{transcriptEntityUuid:${uuid}}:void 0`;
+  if (source.split(correlation).length !== 2) throw new Error("unsupported Wispr paste correlation");
+  source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid}}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID}:void 0`);
+  const helper = module("getTextBoxInfo");
+  source = source.slice(0, helper.end) + `;globalThis.wisprHeadlessTextBoxInfo=${helper.name};` + source.slice(helper.end);
+  return source;
 }
 
 // ---------------------------------------------------------------- the hook
@@ -466,6 +508,19 @@ function install() {
   watchHelper();
   const Module = require("module");
   const realLoad = Module._load;
+  const realJs = Module._extensions[".js"];
+  Module._extensions[".js"] = function (mod, filename) {
+    if (!/[\\/]\.webpack[\\/]main[\\/]index\.js$/.test(filename)) return realJs(mod, filename);
+    const source = fs.readFileSync(filename, "utf8");
+    let patched = source;
+    try {
+      patched = patchWisprBundle(source);
+      trace({ ev: "broker.bundlePatched" });
+    } catch (error) {
+      trace({ ev: "broker.bundlePatchFailed", error: String(error) });
+    }
+    mod._compile(patched, filename);
+  };
   let proxied = null;
   Module._load = function (request) {
     const mod = realLoad.apply(this, arguments);
@@ -507,7 +562,21 @@ function build(electron) {
   }
 
   const brokerPastes = createPasteRouter((message) => daemon.send(message), () => Boolean(daemon?.alive));
-  pasteGate = (payload, done) => brokerPastes.route(payload, done);
+  pasteGate = (payload, done) => brokerPastes.route(payload, (result) => {
+    if (!result.fallback && !result.applied) daemon?.send({ op: "recover", text: String(payload.text ?? ""), local: false });
+    done(result);
+  });
+
+  function copyNotice(payload) {
+    const recovery = nativeNotice(payload, electron.app.getLocale());
+    if (recovery?.op !== "recover" || !daemon?.alive) return false;
+    const show = (result) => {
+      if (!result.applied) daemon.send(recovery);
+      emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
+    };
+    if (!brokerPastes.route({ transcriptEntityUUID: payload.callbackOperationId, text: recovery.text }, show)) show({ applied: false });
+    return true;
+  }
 
   // Wispr's resting bar is shown unless hidden for good or snoozed (its own
   // rule: prefs.user.hideFlowBarPermanently, clickableBubbleSnoozeUntil).
@@ -718,6 +787,20 @@ function build(electron) {
         brokerPastes.delivered(msg);
         break;
       }
+      case "copyTranscript":
+        try { electron.clipboard.writeText(String(msg.text)); }
+        catch (error) {
+          trace({ ev: "clipboard.failed", error: String(error) });
+          daemon?.send({ op: "recover", text: String(msg.text), local: true });
+        }
+        break;
+      case "insertTranscript":
+        // The broker already declined this session. Reuse Wispr's editable
+        // input check before ordinary typing so a transcript cannot disappear.
+        Promise.resolve().then(() => globalThis.wisprHeadlessTextBoxInfo?.()).then((info) => {
+          daemon?.send({ op: info?.isEditable && !info.couldNotGetTextBoxInfo ? "typeTranscript" : "recover", text: String(msg.text), local: true });
+        }, () => daemon?.send({ op: "recover", text: String(msg.text), local: true }));
+        break;
       case "ready":
         trace({ ev: "daemon.ready" });
         break;
@@ -935,6 +1018,7 @@ function build(electron) {
           if (!this.remindersActive) return true;
         }
         if (ch === "notification:show") {
+          if (copyNotice(a)) return true;
           const n = daemon && nativeNotice(a, electron.app.getLocale());
           if (n) {
             notice = a;
@@ -971,6 +1055,7 @@ function build(electron) {
       updateBar(args[0].state);
     }
     if (lazy.role === "status") {
+      if (ch === "notification:show" && copyNotice(args[0])) return true;
       sawStatus(ch, args[0]);
       const cmd = barCommand(ch, args[0]);
       if (cmd) daemon?.send(cmd);

@@ -436,10 +436,32 @@ struct Local {
     destination: destination::Session,
 }
 
-/// The bar's notice for a cancelled local dictation, while it shows: the
-/// dictation, until its Undo is clicked.
+/// A native notice owns either an unfinished recording for Undo or completed
+/// text for Copy, for either backend.
 struct LocalNotice {
     dictation: Option<(asr::Dictation, destination::Session)>,
+    text: Option<String>,
+}
+
+fn recover(
+    text: String,
+    local: bool,
+    notice: &mut Option<LocalNotice>,
+    pill: &mpsc::Sender<PillCommand>,
+) {
+    if text.trim().is_empty() {
+        return;
+    }
+    *notice = Some(LocalNotice {
+        dictation: None,
+        text: Some(text),
+    });
+    let _ = pill.send(PillCommand::Notify {
+        title: "Copy dictation?".into(),
+        actions: vec!["Copy".into()],
+        timeout: Duration::ZERO,
+        local,
+    });
 }
 
 /// How long the notice of a cancelled local dictation offers its Undo (the
@@ -468,17 +490,23 @@ fn transcribe(
     let commands = commands.clone();
     std::thread::spawn(move || {
         let id = destination.id;
-        let mut routed = false;
-        let result = dictation.finish().and_then(|text| {
-            routed = destination.complete(&text, false)?;
-            Ok(text)
-        });
+        let result =
+            deliver_transcript(dictation.finish(), |text| destination.complete(text, false));
         let _ = commands.send(Some(Command::Transcribed {
             result,
-            routed,
             destination: id,
         }));
     });
+}
+
+fn deliver_transcript(
+    result: Result<String, String>,
+    deliver: impl FnOnce(&str) -> destination::Delivery,
+) -> Result<(String, destination::Delivery), String> {
+    result.map(|text| {
+        let delivery = deliver(&text);
+        (text, delivery)
+    })
 }
 
 /// The broker, exclusively, chooses a destination. Late replies from an older
@@ -492,7 +520,11 @@ fn begin_destination(commands: &mpsc::Sender<Option<Command>>) -> destination::S
 
 /// A thread that types the transcripts sent to it, in order (a paste on
 /// macOS waits half a second to put the clipboard back).
-fn typing_thread(cfg: &Config, out: &Out) -> Option<mpsc::Sender<String>> {
+fn typing_thread(
+    cfg: &Config,
+    out: &Out,
+    commands: mpsc::Sender<Option<Command>>,
+) -> Option<mpsc::Sender<String>> {
     let log_out = Out(out.0.clone());
     let log: typing::Log = Arc::new(move |msg| log_out.send(&Event::Log { msg }));
     let mut typist = match typing::Typist::new(cfg.typing.clone(), log.clone()) {
@@ -506,7 +538,7 @@ fn typing_thread(cfg: &Config, out: &Out) -> Option<mpsc::Sender<String>> {
     std::thread::spawn(move || {
         for text in rx {
             if let Err(e) = typist.type_text(&text) {
-                log(format!("typing the transcript: {e}"));
+                let _ = commands.send(Some(Command::InsertionFailed { text, error: e }));
             }
         }
     });
@@ -806,7 +838,9 @@ fn serve(
 
     // Types what the local model heard; set up now, as a uinput keyboard
     // needs a moment before the compositor takes keys from it.
-    let typist = asr.as_ref().and_then(|_| typing_thread(cfg, out));
+    let typist = asr
+        .as_ref()
+        .and_then(|_| typing_thread(cfg, out, internal.clone()));
 
     {
         let log_out = Out(out.0.clone());
@@ -1039,10 +1073,30 @@ fn serve(
                     let _ = pill_tx.send(PillCommand::NotifyClear);
                 }
             }
+            Ok(Some(Command::Recover { text, local })) => {
+                recover(text, local, &mut local_notice, pill_tx);
+            }
+            Ok(Some(Command::TypeTranscript { text })) => {
+                if let Some(typist) = &typist {
+                    if let Err(error) = typist.send(text) {
+                        recover(error.0, true, &mut local_notice, pill_tx);
+                    }
+                } else {
+                    recover(text, true, &mut local_notice, pill_tx);
+                }
+            }
+            Ok(Some(Command::InsertionFailed { text, error })) => {
+                log(format!("inserting local dictation failed: {error}"));
+                recover(text, true, &mut local_notice, pill_tx);
+            }
             Ok(Some(Command::NoticeAction { index })) => match &local_notice {
                 Some(n) => {
                     if n.dictation.is_some() {
                         pending.push_back(control::Input::Undo);
+                    } else if index == 0 {
+                        if let Some(text) = &n.text {
+                            out.send(&Event::CopyTranscript { text: text.clone() });
+                        }
                     }
                 }
                 None => out.send(&Event::NoticeAction { index }),
@@ -1101,7 +1155,6 @@ fn serve(
             }
             Ok(Some(Command::Transcribed {
                 result,
-                routed,
                 destination,
             })) => {
                 if shown_destination == Some(destination) {
@@ -1110,10 +1163,13 @@ fn serve(
                 }
                 pending.push_back(control::Input::Transcribed { ok: result.is_ok() });
                 match result {
-                    Ok(text) => {
-                        if !routed {
-                            if let Some(typist) = &typist {
-                                let _ = typist.send(text.clone());
+                    Ok((text, delivery)) => {
+                        match delivery {
+                            Ok(true) => {}
+                            Ok(false) => out.send(&Event::InsertTranscript { text: text.clone() }),
+                            Err(error) => {
+                                log(format!("delivering local dictation failed: {error}"));
+                                recover(text.clone(), true, &mut local_notice, pill_tx);
                             }
                         }
                         out.send(&Event::Transcript { text });
@@ -1316,6 +1372,7 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
             if let Some(l) = e.local.take() {
                 *e.local_notice = Some(LocalNotice {
                     dictation: Some(stop_local(l)),
+                    text: None,
                 });
                 let _ = e.pill_tx.send(PillCommand::Notify {
                     title: "Transcript cancelled".into(),
@@ -1394,6 +1451,35 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_delivery_keeps_the_successful_transcript_for_copy() {
+        let result = deliver_transcript(Ok("Testing one two three.".into()), |_| {
+            Err("The original input is no longer available.".into())
+        });
+        let (text, delivery) = result.expect("delivery failure is not an ASR failure");
+        assert_eq!(text, "Testing one two three.");
+        assert_eq!(
+            delivery,
+            Err("The original input is no longer available.".into())
+        );
+        let (pill, commands) = mpsc::channel();
+        let mut notice = None;
+        recover(text, true, &mut notice, &pill);
+        assert_eq!(
+            notice.unwrap().text.as_deref(),
+            Some("Testing one two three.")
+        );
+        assert!(
+            matches!(commands.recv().unwrap(), PillCommand::Notify { timeout, actions, local: true, .. } if timeout.is_zero() && actions == ["Copy"])
+        );
+        assert!(
+            deliver_transcript(Err("no speech model".into()), |_| panic!(
+                "no insertion without text"
+            ))
+            .is_err()
+        );
+    }
 
     fn cfg(capture: &str, target: Option<&str>) -> Config {
         Config {

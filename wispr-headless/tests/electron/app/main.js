@@ -3,7 +3,7 @@
 // exits non-zero on the first failure.
 "use strict";
 
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, clipboard } = require("electron");
 const { execSync } = require("child_process");
 const path = require("path");
 
@@ -169,6 +169,29 @@ app.whenReady().then(async () => {
   });
   await until("timeout", () => cleared !== null, 3_000);
   check(cleared?.reason === "timeout", `an untouched notification times out (${cleared?.reason})`);
+
+  // Wispr's custom copy prompt and local insertion without an editable
+  // target both retain text in the Rust bubble, including after idle IPC.
+  status.webContents.send("notification:show", {
+    type: "VoidDictation", component: "voidDictation", variant: "custom",
+    body: "cloud recovery text", callbackOperationId: "dict-1", timeout: 3000,
+  });
+  await wait(400);
+  check(renderers() === 0, "Wispr's custom copy prompt stays in Rust");
+  if (xdotool) {
+    execSync(`${xdotool} mousemove 710 766 click 1`);
+    await until("cloud copied", () => clipboard.readText() === "cloud recovery text");
+    check(clipboard.readText() === "cloud recovery text", "Copy recovers the Wispr transcript");
+    await wait(800);
+    globalThis.wisprHeadlessDaemonEvent({ op: "insertTranscript", text: "local recovery text" });
+    await wait(300);
+    status.webContents.send("status:dictationStatus", "idle");
+    execSync(`${xdotool} mousemove 710 766 click 1`);
+    await until("local copied", () => clipboard.readText() === "local recovery text");
+    check(clipboard.readText() === "local recovery text", "Copy recovers a local transcript without an editable input");
+    await wait(800);
+    check(renderers() === 0, "both Copy actions leave the status renderer unloaded");
+  }
 
   // A notification needs the real status page.
   status.webContents.send("notification:show", { type: "tip" });

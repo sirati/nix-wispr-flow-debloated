@@ -14,11 +14,49 @@ const context = vm.createContext({ require, Buffer, setTimeout, clearTimeout, se
   process: { env: { XDG_CACHE_HOME: cache }, nextTick: process.nextTick, pid: process.pid } });
 const source = fs.readFileSync(path.join(__dirname, "../shim.js"), "utf8");
 vm.runInContext(source.slice(0, source.indexOf("// Nothing here may stop Wispr")) + `
-  globalThis.testing = { createPasteRouter, gateHelper, escapeHelper, unescapeHelper,
+  globalThis.testing = { createPasteRouter, gateHelper, escapeHelper, unescapeHelper, patchWisprBundle, nativeNotice,
     setGate(gate) { pasteGate = gate; } };
 `, context);
 const { testing } = context;
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Boolean)) {
+  test(`the shipped bundle retains correlation on both insertion paths: ${bundle}`, () => {
+    const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
+    new vm.Script(patched);
+    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:(\w+)\.ZZ\.uuid\}/.exec(patched);
+    assert.ok(payload, "the copy message carries the exact originating UUID");
+    const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", [payload[4]]: { ZZ: { uuid: "original-session" } } };
+    const notice = vm.runInNewContext(`(${payload[0]})`, env);
+    assert.equal(notice.callbackOperationId, "original-session");
+    assert.equal(notice.body, "completed text");
+    const correlation = /(\w+)\?\{transcriptEntityUuid:\1\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\2\.transcriptEntityUUID\}:void 0/.exec(patched);
+    assert.ok(correlation, "ordinary helper pastes carry their owner's UUID");
+    const attributes = vm.runInNewContext(correlation[0], { [correlation[1]]: undefined, [correlation[2]]: { kind: "dictation", transcriptEntityUUID: "original-session" } });
+    assert.equal(attributes.transcriptEntityUuid, "original-session");
+    assert.match(patched, /globalThis\.wisprHeadlessTextBoxInfo=\w+;/);
+  });
+}
+
+test("Wispr's custom copy notification preserves its transcript for the Rust UI", () => {
+  const notice = testing.nativeNotice({ type: "VoidDictation", variant: "custom", component: "voidDictation", body: "kept text" }, "en-US");
+  assert.equal(notice.op, "recover");
+  assert.equal(notice.text, "kept text");
+});
+
+test("a failed helper paste and its subsequent copy prompt deliver only once", () => {
+  const sent = [], results = [];
+  const router = testing.createPasteRouter((message) => sent.push(message), () => true);
+  router.start("dict-1");
+  router.route({ transcriptEntityUUID: "dict-1", text: "kept" }, (result) => results.push(result));
+  router.route({ transcriptEntityUUID: "dict-1", text: "kept" }, (result) => results.push(result));
+  assert.equal(sent.length, 1);
+  router.delivered({ request: sent[0].request, applied: false, error: "Original input closed" });
+  assert.equal(results.length, 2);
+  router.route({ transcriptEntityUUID: "dict-1", text: "kept" }, (result) => results.push(result));
+  assert.equal(sent.length, 1);
+  assert.equal(results[2].error, "Original input closed");
+});
 
 test("only correlated dictations go through the broker and retain submit intent", () => {
   const sent = [], results = [];

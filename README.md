@@ -75,8 +75,10 @@ processing. No raw audio goes through this API. The provider currently offers
 level visualization; spectrum visualization is not advertised.
 
 Without a broker, or when no app accepts, dictation uses its usual insertion
-method. Once an app accepts, a delivery failure reports an error without
-pasting into another window. Local cancellation keeps the captured session
+method. Once an app accepts, failed delivery keeps the transcript in the Rust
+bubble with a Copy button. Wispr's copy prompt and local dictation without an
+editable input use the same native notice. It stays until copied or the next
+dictation starts. Local cancellation keeps the captured session
 for Undo; dismissing or expiring the notice cancels that session. Supported
 icon formats are PNG, JPEG, WebP, ICO and static SVG, supplied as a data URL
 or an absolute filename.

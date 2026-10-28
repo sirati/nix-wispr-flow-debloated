@@ -31,6 +31,14 @@ pub enum Command {
     },
     /// `notification:clear` from main.
     NotifyClear,
+    /// Preserve a completed transcript in the native Copy notice.
+    Recover {
+        text: String,
+        #[serde(default)]
+        local: bool,
+    },
+    /// Ordinary insertion after the shim checked Wispr's editable input info.
+    TypeTranscript { text: String },
     /// Wispr's microphone ranking (`prefs.user.rankedAudioDevices`).
     Mics { ranked: Vec<crate::mics::Ranked> },
     /// The dictation shortcut went down: start recording ahead of Wispr.
@@ -56,10 +64,11 @@ pub enum Command {
     /// Internal: a local dictation's text, or why there is none.
     #[serde(skip)]
     Transcribed {
-        result: Result<String, String>,
-        routed: bool,
+        result: Result<(String, crate::destination::Delivery), String>,
         destination: u64,
     },
+    #[serde(skip)]
+    InsertionFailed { text: String, error: String },
     /// Final Wispr transcript, intercepted before the helper can paste it.
     CloudTranscript {
         request: String,
@@ -170,6 +179,14 @@ pub enum Event {
     },
     /// The text of a dictation transcribed here.
     Transcript {
+        text: String,
+    },
+    /// Check ordinary insertion, only after the broker declined the session.
+    InsertTranscript {
+        text: String,
+    },
+    /// Copy without typing or restoring the previous clipboard.
+    CopyTranscript {
         text: String,
     },
     /// A dictation to the local model failed: no model, no microphone, or
