@@ -23,6 +23,9 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ./Cargo.lock;
+  cargoLock.outputHashes = {
+    "dictation-api-0.1.0" = "sha256-kJU5cXKYHC7grvzajgwCavFKMKzOio7QjjjnMv4ftVE=";
+  };
 
   # The unit tests and the binary's own tests (a stand-in microphone) run
   # here; the indicator is skipped without a display. Typing through XTEST

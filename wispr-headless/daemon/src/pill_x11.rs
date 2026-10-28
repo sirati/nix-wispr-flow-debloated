@@ -370,6 +370,37 @@ impl Surface {
                 self.fill_rotated(s, origin, fill);
             }
         }
+        if let Some(icon) = &f.icon {
+            let pixels = image::imageops::resize(
+                &icon.pixels,
+                px(18.0, g.scale) as u32,
+                px(18.0, g.scale) as u32,
+                image::imageops::FilterType::Lanczos3,
+            );
+            let data: Vec<u8> = pixels
+                .pixels()
+                .flat_map(|p| {
+                    let value = argb(over(p.0, pill));
+                    if self.lsb {
+                        value.to_le_bytes()
+                    } else {
+                        value.to_be_bytes()
+                    }
+                })
+                .collect();
+            let _ = self.conn.put_image(
+                ImageFormat::Z_PIXMAP,
+                self.buffer,
+                self.gc,
+                pixels.width() as u16,
+                pixels.height() as u16,
+                (origin.0 + 8.0 * g.scale).round() as i16,
+                (origin.1 + 6.0 * g.scale).round() as i16,
+                0,
+                32,
+                &data,
+            );
+        }
         for t in &f.texts {
             self.draw_text(t, origin);
         }

@@ -14,7 +14,9 @@
 mod asr;
 mod bar;
 mod control;
+mod destination;
 mod hotkey;
+mod icon;
 mod log;
 #[cfg(target_os = "macos")]
 mod mic_mac;
@@ -431,12 +433,13 @@ struct Local {
     dictation: asr::Dictation,
     /// The bar's level for this dictation's audio.
     level: bar::LevelScale,
+    destination: destination::Session,
 }
 
 /// The bar's notice for a cancelled local dictation, while it shows: the
 /// dictation, until its Undo is clicked.
 struct LocalNotice {
-    dictation: Option<asr::Dictation>,
+    dictation: Option<(asr::Dictation, destination::Session)>,
 }
 
 /// How long the notice of a cancelled local dictation offers its Undo (the
@@ -445,24 +448,46 @@ const UNDO_FOR: Duration = Duration::from_secs(5);
 
 /// Stops a local dictation's recording; the rest of its audio goes to the
 /// model.
-fn stop_local(local: Local) -> asr::Dictation {
+fn stop_local(local: Local) -> (asr::Dictation, destination::Session) {
     let Local {
         recording,
         mut dictation,
+        destination,
         ..
     } = local;
     dictation.feed(&recording.finish_pcm());
-    dictation
+    (dictation, destination)
 }
 
 /// The text of a stopped local dictation comes back as
 /// Command::Transcribed.
-fn transcribe(dictation: asr::Dictation, commands: &mpsc::Sender<Option<Command>>) {
+fn transcribe(
+    (dictation, destination): (asr::Dictation, destination::Session),
+    commands: &mpsc::Sender<Option<Command>>,
+) {
     let commands = commands.clone();
     std::thread::spawn(move || {
-        let result = dictation.finish();
-        let _ = commands.send(Some(Command::Transcribed { result }));
+        let id = destination.id;
+        let mut routed = false;
+        let result = dictation.finish().and_then(|text| {
+            routed = destination.complete(&text, false)?;
+            Ok(text)
+        });
+        let _ = commands.send(Some(Command::Transcribed {
+            result,
+            routed,
+            destination: id,
+        }));
     });
+}
+
+/// The broker, exclusively, chooses a destination. Late replies from an older
+/// session are ignored by serve when another dictation owns the bubble.
+fn begin_destination(commands: &mpsc::Sender<Option<Command>>) -> destination::Session {
+    let commands = commands.clone();
+    destination::Session::begin(move |id, icon| {
+        let _ = commands.send(Some(Command::Destination { id, icon }));
+    })
 }
 
 /// A thread that types the transcripts sent to it, in order (a paste on
@@ -739,7 +764,11 @@ fn serve(
                 }
             }
             let for_wispr = |b: &hotkey::Binding| {
-                b.backend.as_deref().and_then(Backend::parse).unwrap_or(backend) == Backend::Wispr
+                b.backend
+                    .as_deref()
+                    .and_then(Backend::parse)
+                    .unwrap_or(backend)
+                    == Backend::Wispr
             };
             hidden = bindings
                 .iter()
@@ -757,7 +786,11 @@ fn serve(
                 cfg.double_press,
                 source,
                 move |events, binding| {
-                    let b = binding.backend.as_deref().and_then(Backend::parse).unwrap_or(backend);
+                    let b = binding
+                        .backend
+                        .as_deref()
+                        .and_then(Backend::parse)
+                        .unwrap_or(backend);
                     let names: Vec<&str> = events.iter().map(|e| e.name()).collect();
                     log::write(&format!("shortcut: {} ({b:?})", names.join(" ")));
                     let _ = to_serve.send(Some(Command::Hotkey(hotkey_inputs(events, b))));
@@ -814,6 +847,9 @@ fn serve(
     let mut local: Option<Local> = None;
     // The bar's notice is a cancelled local dictation's, not Wispr's.
     let mut local_notice: Option<LocalNotice> = None;
+    let mut shown_destination = None;
+    let mut cloud_destinations: std::collections::HashMap<String, (destination::Session, Instant)> =
+        std::collections::HashMap::new();
     let chosen = |ranked: &[mics::Ranked]| {
         let inputs = inputs.lock().expect("inputs lock poisoned");
         mics::choose(ranked, &inputs).cloned()
@@ -825,6 +861,8 @@ fn serve(
             Duration::from_millis(5)
         } else if early.is_some() {
             Duration::from_millis(25)
+        } else if !cloud_destinations.is_empty() {
+            Duration::from_secs(1)
         } else {
             Duration::from_secs(3600)
         };
@@ -866,7 +904,26 @@ fn serve(
                     };
                     match started {
                         Ok(r) => {
-                            out.send(&Event::Started { uuid });
+                            out.send(&Event::Started { uuid: uuid.clone() });
+                            if cloud_destinations.len() >= 256 {
+                                if let Some(oldest) = cloud_destinations
+                                    .iter()
+                                    .min_by_key(|(_, (_, until))| *until)
+                                    .map(|(uuid, _)| uuid.clone())
+                                {
+                                    cloud_destinations.remove(&oldest);
+                                }
+                            }
+                            let destination = begin_destination(&internal);
+                            shown_destination = Some(destination.id);
+                            let _ = pill_tx.send(PillCommand::Destination(None));
+                            cloud_destinations.insert(
+                                uuid,
+                                (
+                                    destination,
+                                    Instant::now() + cfg.max_dictation + Duration::from_secs(60),
+                                ),
+                            );
                             recording = Some(r);
                         }
                         Err(error) => out.send(&Event::MicFailed { uuid, error }),
@@ -927,6 +984,11 @@ fn serve(
             }
             // Wispr's indicator: only while its dictation has the bar.
             Ok(Some(Command::Level { value })) => {
+                if let Some(r) = recording.as_ref() {
+                    if let Some((destination, _)) = cloud_destinations.get(r.uuid()) {
+                        destination.level(value);
+                    }
+                }
                 if ctl.wispr_owns_bar() {
                     let _ = pill_tx.send(PillCommand::Level(value));
                 }
@@ -1007,14 +1069,52 @@ fn serve(
             }
             Ok(Some(Command::DictateEnd)) => pending.push_back(control::Input::End),
             Ok(Some(Command::DictateCancel)) => pending.push_back(control::Input::Cancel),
-            Ok(Some(Command::Transcribed { result })) => {
-                pending.push_back(control::Input::Transcribed {
-                    ok: result.is_ok(),
+            Ok(Some(Command::Destination { id, icon })) => {
+                if shown_destination == Some(id) {
+                    let _ = pill_tx.send(PillCommand::Destination(icon));
+                }
+            }
+            Ok(Some(Command::CloudTranscript {
+                request,
+                uuid,
+                text,
+                submit,
+            })) => {
+                let destination = cloud_destinations
+                    .remove(&uuid)
+                    .map(|(destination, _)| destination);
+                let commands = internal.clone();
+                std::thread::spawn(move || {
+                    let result = destination
+                        .ok_or_else(|| "no captured dictation session".to_string())
+                        .and_then(|destination| destination.complete(&text, submit));
+                    let _ = commands.send(Some(Command::CloudDelivered { request, result }));
                 });
+            }
+            Ok(Some(Command::CloudDelivered { request, result })) => {
+                out.send(&Event::CloudDelivery {
+                    request,
+                    fallback: matches!(result, Ok(false)),
+                    applied: matches!(result, Ok(true)),
+                    error: result.err(),
+                });
+            }
+            Ok(Some(Command::Transcribed {
+                result,
+                routed,
+                destination,
+            })) => {
+                if shown_destination == Some(destination) {
+                    shown_destination = None;
+                    let _ = pill_tx.send(PillCommand::Destination(None));
+                }
+                pending.push_back(control::Input::Transcribed { ok: result.is_ok() });
                 match result {
                     Ok(text) => {
-                        if let Some(typist) = &typist {
-                            let _ = typist.send(text.clone());
+                        if !routed {
+                            if let Some(typist) = &typist {
+                                let _ = typist.send(text.clone());
+                            }
                         }
                         out.send(&Event::Transcript { text });
                     }
@@ -1033,6 +1133,7 @@ fn serve(
                     if ctl.local_recording() && !ctl.wispr_owns_bar() {
                         let level = l.level.level(recorder::volume_db(&pcm));
                         let _ = pill_tx.send(PillCommand::Level(level));
+                        l.destination.level(level);
                     }
                     l.dictation.feed(&pcm);
                 }
@@ -1062,6 +1163,7 @@ fn serve(
                 early: &mut early,
                 local: &mut local,
                 local_notice: &mut local_notice,
+                shown_destination: &mut shown_destination,
             };
             run_control(&mut ctl, &mut pending, &mut |a| act(a, &mut effects));
         }
@@ -1070,8 +1172,12 @@ fn serve(
                 let _ = pill_tx.send(p);
             }
         }
+        cloud_destinations.retain(|_, (_, until)| Instant::now() < *until);
         // No request to record followed: stop and forget what it heard.
-        if early.as_ref().is_some_and(|(_, until)| Instant::now() > *until) {
+        if early
+            .as_ref()
+            .is_some_and(|(_, until)| Instant::now() > *until)
+        {
             early = None;
             let _ = relist.send(());
         }
@@ -1083,6 +1189,7 @@ fn serve(
                     }
                 }
                 Progress::Failed(e) => {
+                    cloud_destinations.remove(r.uuid());
                     out.send(&e);
                     recording = None;
                 }
@@ -1110,7 +1217,9 @@ fn run_control(
         let after = ctl.describe();
         if !quiet || !actions.is_empty() {
             if before != after || !actions.is_empty() {
-                log::write(&format!("control: {label}: {before} -> {after}; {actions:?}"));
+                log::write(&format!(
+                    "control: {label}: {before} -> {after}; {actions:?}"
+                ));
             }
         }
         for a in actions {
@@ -1137,6 +1246,7 @@ struct Effects<'a> {
     early: &'a mut Option<(Recording, Instant)>,
     local: &'a mut Option<Local>,
     local_notice: &'a mut Option<LocalNotice>,
+    shown_destination: &'a mut Option<u64>,
 }
 
 /// Carries out one of control.rs's answers; may have news for it.
@@ -1171,10 +1281,14 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
             };
             match started {
                 Ok(r) => {
+                    let destination = begin_destination(e.internal);
+                    *e.shown_destination = Some(destination.id);
+                    let _ = e.pill_tx.send(PillCommand::Destination(None));
                     *e.local = Some(Local {
                         recording: r,
                         dictation: asr.start(),
                         level: bar::LevelScale::new(),
+                        destination,
                     });
                     let _ = e.pill_tx.send(PillCommand::Local);
                     let _ = e.pill_tx.send(PillCommand::Status("listening".into()));
@@ -1212,15 +1326,15 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                 let _ = e.relist.send(());
             }
         }
-        Action::UndoLocal => {
-            match e.local_notice.as_mut().and_then(|n| n.dictation.take()) {
-                Some(dictation) => {
-                    let _ = e.pill_tx.send(PillCommand::Local);
-                    transcribe(dictation, e.internal);
-                }
-                None => return Some(control::Input::Transcribed { ok: false }),
+        Action::UndoLocal => match e.local_notice.as_mut().and_then(|n| n.dictation.take()) {
+            Some(dictation) => {
+                *e.shown_destination = Some(dictation.1.id);
+                let _ = e.pill_tx.send(PillCommand::Destination(dictation.1.icon()));
+                let _ = e.pill_tx.send(PillCommand::Local);
+                transcribe(dictation, e.internal);
             }
-        }
+            None => return Some(control::Input::Transcribed { ok: false }),
+        },
         Action::DropCancelled => {
             if e.local_notice.take().is_some() {
                 let _ = e.pill_tx.send(PillCommand::NotifyClear);
@@ -1228,6 +1342,8 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
         }
         Action::FailLocal(error) => {
             *e.local = None;
+            *e.shown_destination = None;
+            let _ = e.pill_tx.send(PillCommand::Destination(None));
             let _ = e.relist.send(());
             e.out.send(&Event::TranscriptFailed { error });
         }
@@ -1274,7 +1390,6 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
     }
     None
 }
-
 
 #[cfg(test)]
 mod tests {

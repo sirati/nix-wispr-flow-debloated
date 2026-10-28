@@ -27,9 +27,14 @@ impl Daemon {
     }
 
     fn start_with(capture: &str, args: &[&str]) -> Daemon {
+        Self::start_with_env(capture, args, &[])
+    }
+
+    fn start_with_env(capture: &str, args: &[&str], env: &[(&str, &str)]) -> Daemon {
         let mut child = Command::new(binary())
             .args(["--capture-cmd", capture])
             .args(args)
+            .envs(env.iter().copied())
             .env_remove("DISPLAY")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -80,6 +85,121 @@ impl Daemon {
             return v;
         }
     }
+}
+
+/// Run against the SDK's real broker, isolated from the user's service:
+/// DICTATION_BROKER_EXE=/path/to/dictation-broker cargo test --test daemon broker_routes -- --ignored
+#[test]
+#[ignore = "requires DICTATION_BROKER_EXE"]
+fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
+    use dictation_api::{Application, AudioFeatures, Client, Event as BrokerEvent};
+    struct Broker(Child);
+    impl Drop for Broker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let _broker = Broker(
+        Command::new(std::env::var_os("DICTATION_BROKER_EXE").expect("broker executable"))
+            .arg("run")
+            .env("DICTATION_API_HOME", home.path())
+            .env("DICTATION_API_NO_NATIVE_FOCUS", "1")
+            .env("DICTATION_API_NO_DBUS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let endpoint = home.path().join("endpoint.json");
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while !endpoint.exists() {
+        assert!(std::time::Instant::now() < until, "broker startup");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let application = |id: &str| {
+        Application {
+        id: id.into(), name: id.into(), process_id: std::process::id(),
+        icon: Some("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><rect width='8' height='8'/></svg>".into()),
+    }
+    };
+    let a = Client::connect(application("a"), Some(&endpoint)).unwrap();
+    let b = Client::connect(application("b"), Some(&endpoint)).unwrap();
+    let event = |client: &Client| {
+        client
+            .next_event(Duration::from_secs(3))
+            .unwrap()
+            .expect("broker event")
+    };
+    let offer = |client: &Client| match event(client) {
+        BrokerEvent::Offer { session, .. } => session,
+        e => panic!("expected offer, got {e:?}"),
+    };
+    let mut daemon = Daemon::start_with_env(
+        "sleep 30",
+        &[],
+        &[("DICTATION_API_HOME", home.path().to_str().unwrap())],
+    );
+    a.activate().unwrap();
+    daemon.send(r#"{"op":"start","uuid":"direct"}"#);
+    daemon.next_op("started");
+    let session = offer(&a);
+    b.activate().unwrap(); // Changing focus cannot retarget the captured session.
+    a.respond(
+        &session,
+        true,
+        AudioFeatures {
+            level: true,
+            spectrum: true,
+        },
+    )
+    .unwrap();
+    daemon.send(r#"{"op":"level","value":0.7}"#);
+    assert!(
+        matches!(event(&a), BrokerEvent::Audio { frame, .. } if frame.level == Some(0.7) && frame.spectrum.is_none())
+    );
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(r#"{"op":"status","value":"idle"}"#);
+    // The next dictation may start before the older transcript arrives.
+    daemon.send(r#"{"op":"start","uuid":"declined"}"#);
+    daemon.next_op("started");
+    b.respond(&offer(&b), false, AudioFeatures::default())
+        .unwrap();
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(r#"{"op":"cloudTranscript","request":"one","uuid":"direct","text":"captured field","submit":true}"#);
+    assert!(
+        matches!(event(&a), BrokerEvent::Transcript { transcript, .. } if transcript.text == "captured field" && transcript.submit)
+    );
+    assert!(b.next_event(Duration::from_millis(50)).unwrap().is_none());
+    a.acknowledge(&session, true, None).unwrap();
+    let result = daemon.next_op("cloudDelivery");
+    assert_eq!(result["applied"], true);
+    assert_eq!(result["fallback"], false);
+    daemon.send(r#"{"op":"status","value":"idle"}"#);
+
+    daemon.send(
+        r#"{"op":"cloudTranscript","request":"two","uuid":"declined","text":"ordinary paste"}"#,
+    );
+    assert_eq!(daemon.next_op("cloudDelivery")["fallback"], true);
+    daemon.send(r#"{"op":"status","value":"idle"}"#);
+
+    daemon.send(r#"{"op":"start","uuid":"failed"}"#);
+    daemon.next_op("started");
+    let session = offer(&b);
+    b.respond(&session, true, AudioFeatures::default()).unwrap();
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(r#"{"op":"cloudTranscript","request":"three","uuid":"failed","text":"keep out of other windows"}"#);
+    assert!(matches!(event(&b), BrokerEvent::Transcript { .. }));
+    b.acknowledge(&session, false, Some("field destroyed".into()))
+        .unwrap();
+    let result = daemon.next_op("cloudDelivery");
+    assert_eq!(result["applied"], false);
+    assert_eq!(result["fallback"], false);
+    assert_eq!(result["error"], "field destroyed");
 }
 
 impl Drop for Daemon {
@@ -430,7 +550,11 @@ fn wispr_s_shortcut_keys_are_hidden_from_wispr() {
     let mut d = Daemon::with_keys("true", &[]);
     let hidden = d.next_op("hideKeys");
     #[cfg(not(target_os = "macos"))]
-    assert_eq!(hidden["keys"], serde_json::json!([0xa5]), "Right Alt's VK code");
+    assert_eq!(
+        hidden["keys"],
+        serde_json::json!([0xa5]),
+        "Right Alt's VK code"
+    );
     #[cfg(target_os = "macos")]
     assert_eq!(hidden["keys"], serde_json::json!([61]));
 }
@@ -564,7 +688,10 @@ fn spamming_both_shortcuts_never_runs_two_model_servers() {
     std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
     let config = dir.path().join("asr.json");
     std::fs::write(&config, format!(r#"{{"server":"{}"}}"#, server.display())).unwrap();
-    let mut d = Daemon::with_keys(&format!("cat {tone}"), &["--asr-config", config.to_str().unwrap()]);
+    let mut d = Daemon::with_keys(
+        &format!("cat {tone}"),
+        &["--asr-config", config.to_str().unwrap()],
+    );
     let alive = || {
         std::fs::read_dir(&pids)
             .unwrap()

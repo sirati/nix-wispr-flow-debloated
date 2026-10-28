@@ -22,14 +22,14 @@ use std::time::Instant;
 
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::{Allocated, Retained};
-use objc2::{define_class, extern_methods, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, extern_methods, AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent, NSFont,
-    NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSImage, NSImageView, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString};
 use objc2_quartz_core::{CALayer, CATransaction};
 
 use crate::bar::{BarEvent, BarState, Frame, Mode, PillCommand, Shape, Text, BOTTOM_MARGIN, FRAME};
@@ -123,6 +123,8 @@ struct Bar {
     /// One layer per shape and one label per text, reused between frames.
     layers: Vec<Retained<CALayer>>,
     labels: Vec<Retained<NSTextField>>,
+    icon_view: Retained<NSImageView>,
+    icon: Option<std::sync::Arc<crate::icon::Icon>>,
     /// Measures text widths.
     measurer: Retained<NSTextField>,
     state: BarState,
@@ -165,6 +167,9 @@ impl Bar {
         canvas.setGeometryFlipped(true);
         view.layer()?.addSublayer(&canvas);
         panel.setContentView(Some(&view));
+        let icon_view = NSImageView::initWithFrame(NSImageView::alloc(mtm), start);
+        view.addSubview(&icon_view);
+        icon_view.setHidden(true);
         Some(Bar {
             mtm,
             panel,
@@ -172,6 +177,8 @@ impl Bar {
             canvas,
             layers: Vec::new(),
             labels: Vec::new(),
+            icon_view,
+            icon: None,
             measurer: NSTextField::labelWithString(&NSString::from_str(""), mtm),
             state: BarState::default(),
             mode: Mode::Hidden,
@@ -271,6 +278,20 @@ impl Bar {
         }
         CATransaction::commit();
 
+        if self.icon.as_ref().map(std::sync::Arc::as_ptr)
+            != f.icon.as_ref().map(std::sync::Arc::as_ptr)
+        {
+            let image = f.icon.as_ref().and_then(|icon| {
+                NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&icon.png))
+            });
+            self.icon_view.setImage(image.as_deref());
+            self.icon = f.icon.clone();
+        }
+        self.icon_view.setHidden(f.icon.is_none());
+        self.icon_view.setFrame(NSRect::new(
+            NSPoint::new(8.0, f.size.1 - 24.0),
+            NSSize::new(18.0, 18.0),
+        ));
         while self.labels.len() < f.texts.len() {
             let label = NSTextField::labelWithString(&NSString::from_str(""), self.mtm);
             self.view.addSubview(&label);

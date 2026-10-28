@@ -55,7 +55,29 @@ pub enum Command {
     DictateCancel,
     /// Internal: a local dictation's text, or why there is none.
     #[serde(skip)]
-    Transcribed { result: Result<String, String> },
+    Transcribed {
+        result: Result<String, String>,
+        routed: bool,
+        destination: u64,
+    },
+    /// Final Wispr transcript, intercepted before the helper can paste it.
+    CloudTranscript {
+        request: String,
+        uuid: String,
+        text: String,
+        #[serde(default)]
+        submit: bool,
+    },
+    #[serde(skip)]
+    CloudDelivered {
+        request: String,
+        result: crate::destination::Delivery,
+    },
+    #[serde(skip)]
+    Destination {
+        id: u64,
+        icon: Option<std::sync::Arc<crate::icon::Icon>>,
+    },
     /// `status:audioLevel`.
     Level { value: f64 },
     /// Whether this process should draw the speech indicator. Off while
@@ -107,6 +129,12 @@ pub struct Timing {
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Event {
     Ready,
+    CloudDelivery {
+        request: String,
+        fallback: bool,
+        applied: bool,
+        error: Option<String>,
+    },
     Started {
         uuid: String,
     },

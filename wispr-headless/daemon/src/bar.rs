@@ -202,6 +202,7 @@ pub fn spinner_alpha(t: f64, i: usize) -> f64 {
 
 /// Commands for the bar.
 pub enum PillCommand {
+    Destination(Option<std::sync::Arc<crate::icon::Icon>>),
     Status(String),
     Popo,
     Level(f64),
@@ -312,6 +313,7 @@ pub struct Frame {
     /// The pill first, then everything on it.
     pub shapes: Vec<Shape>,
     pub texts: Vec<Text>,
+    pub icon: Option<std::sync::Arc<crate::icon::Icon>>,
     /// Whether the next frame differs (animation running).
     pub animated: bool,
     /// For the shim.
@@ -351,6 +353,8 @@ pub struct BarState {
     local_fill: [u8; 3],
     /// The dictation shown goes to the local model.
     local: bool,
+    destination: Option<std::sync::Arc<crate::icon::Icon>>,
+    icon_shown: bool,
 }
 
 impl Default for BarState {
@@ -372,6 +376,8 @@ impl Default for BarState {
             wispr_fill: WISPR_FILL,
             local_fill: LOCAL_FILL,
             local: false,
+            destination: None,
+            icon_shown: false,
         }
     }
 }
@@ -393,6 +399,7 @@ impl BarState {
 
     fn rest(&mut self) {
         self.indicator = Indicator::Rest;
+        self.destination = None;
         self.local = false;
         self.command_mode = false;
         self.mic_active = false;
@@ -401,6 +408,7 @@ impl BarState {
 
     pub fn apply(&mut self, command: PillCommand) {
         match command {
+            PillCommand::Destination(icon) => self.destination = icon,
             PillCommand::Status(s) => match s.as_str() {
                 "initializing" => {
                     // A new dictation closes a notification (main clears it too).
@@ -519,7 +527,7 @@ impl BarState {
             n.clicked = Some((i, Instant::now()));
             return Some(BarEvent::NoticeAction(i));
         }
-        click_action(self.shown, x).map(BarEvent::Click)
+        click_action(self.shown, x - if self.icon_shown { 26.0 } else { 0.0 }).map(BarEvent::Click)
     }
 
     /// Advances the animations to `now` and returns what to draw. `pointer`
@@ -575,9 +583,28 @@ impl BarState {
                 (size, self.content(mode, size, t, &mut shapes))
             }
         };
+        let icon = self.destination.clone().filter(|_| {
+            matches!(
+                mode,
+                Mode::Initializing | Mode::PushToTalk | Mode::HandsFree | Mode::Processing
+            )
+        });
+        self.icon_shown = icon.is_some();
+        let mut size = size;
+        if self.icon_shown {
+            size.0 += 26.0;
+            if let Some(body) = shapes.first_mut() {
+                body.w += 26.0;
+                body.cx += 13.0;
+            }
+            for shape in shapes.iter_mut().skip(1) {
+                shape.cx += 26.0;
+            }
+        }
         Frame {
             mode,
             size,
+            icon,
             shapes,
             texts,
             animated,
@@ -847,6 +874,35 @@ pub fn over(top: [u8; 4], bottom: [u8; 4]) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn destination_icon_expands_content_and_preserves_hands_free_buttons() {
+        let mut state = super::BarState::default();
+        state.apply(super::PillCommand::Popo);
+        let now = std::time::Instant::now();
+        let measure = |_: &str, _: f64, _: bool| 0.0;
+        let plain = state.frame(now, &measure, None);
+        let icon = crate::icon::Icon::load("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><rect width='8' height='8'/></svg>").unwrap();
+        state.apply(super::PillCommand::Destination(Some(std::sync::Arc::new(
+            icon,
+        ))));
+        let routed = state.frame(now, &measure, None);
+        assert_eq!(routed.size.0, plain.size.0 + 26.0);
+        assert!(routed.icon.is_some());
+        let (cancel, accept) = super::buttons();
+        assert_eq!(
+            state.click(cancel + 26.0, 15.0),
+            Some(super::BarEvent::Click("cancel"))
+        );
+        assert_eq!(
+            state.click(accept + 26.0, 15.0),
+            Some(super::BarEvent::Click("stop"))
+        );
+        state.apply(super::PillCommand::Status("processing".into()));
+        assert!(state.frame(now, &measure, None).icon.is_some());
+        state.apply(super::PillCommand::Status("idle".into()));
+        assert!(state.frame(now, &measure, None).icon.is_none());
+    }
+
     use super::*;
 
     /// 8 px per character.

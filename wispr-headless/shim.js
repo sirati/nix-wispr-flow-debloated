@@ -239,6 +239,47 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   };
 }
 
+// Correlate only actual dictations, never unrelated helper pastes. An absent
+// broker permits the original paste; uncertain delivery fails closed.
+function createPasteRouter(send, alive, timeout = 65_000) {
+  const sessions = new Set();
+  const requests = new Map();
+  let next = 0;
+  return {
+    start(uuid) {
+      if (typeof uuid !== "string") return;
+      // Remember retired sessions too. A late result must fail closed rather
+      // than becoming an unrelated native paste after its route expires.
+      sessions.add(uuid);
+    },
+    route(payload, done) {
+      const uuid = payload.transcriptEntityUUID ?? payload.logAttributes?.transcriptEntityUuid;
+      if (typeof uuid !== "string" || !sessions.has(uuid)) return false;
+      if (!alive()) {
+        process.nextTick(() => done({ applied: false, error: "dictation daemon disconnected" }));
+        return true;
+      }
+      const request = `paste-${++next}`;
+      const timer = setTimeout(() => {
+        requests.delete(request);
+        done({ applied: false, error: "dictation delivery timed out" });
+      }, timeout);
+      requests.set(request, (result) => { clearTimeout(timer); done(result); });
+      send({ op: "cloudTranscript", request, uuid, text: String(payload.text ?? ""), submit: Boolean(payload.submit ?? payload.logAttributes?.dictationSubmit) });
+      return true;
+    },
+    delivered(message) {
+      const done = requests.get(message.request);
+      requests.delete(message.request);
+      done?.(message);
+    },
+    disconnected() {
+      for (const done of requests.values()) done({ applied: false, error: "dictation daemon disconnected" });
+      requests.clear();
+    },
+  };
+}
+
 // ---------------------------------------------------------------- the hook
 
 // Wispr's helper reports every key to the main process; the shim reads the
@@ -252,6 +293,7 @@ function startDaemon(resourcesPath, onEvent, onExit) {
 let lastKeyAt = 0;
 let onKey = null; // (pressed: boolean, key: number) => void, set by build()
 let keyGate = null; // (pressed: boolean, key: number) => boolean, true: Wispr does not get it
+let pasteGate = null; // broker delivery for correlated Wispr transcripts
 let helperLink = null; // the running helper's { inject(key, pressed) }, see gateHelper
 
 // The helper's framing: messages separated by "|", with "|" escaped as "+2"
@@ -315,6 +357,22 @@ function gateHelper(child) {
   // cannot read without an ACK, hence the bound).
   const ours = new Set();
   let injectedCount = 0;
+  let suppressPasteKeys = false;
+  const emitMessage = (message) => realEmit.call(fd3, "data", Buffer.from(escapeHelper(JSON.stringify(message)) + "|", "utf8"));
+  const outcome = (request, payload, result) => {
+    emitMessage({ HelperAPIResponse: { uuid: request.uuid, ACK: true } });
+    const uuid = `wispr-headless-${process.pid}-${++injectedCount}`;
+    ours.add(uuid);
+    if (ours.size > 1000) ours.delete(ours.values().next().value);
+    // Successful native pastes can trigger cursor moves and Enter in Wispr.
+    // Those must never be sent globally after broker delivery.
+    suppressPasteKeys = true;
+    emitMessage({ HelperAPIRequest: { uuid, PasteOutcome: { payload: {
+      pasteId: payload.pasteId, success: Boolean(result.applied),
+      reason: result.error || undefined, timeElapsedMs: 0,
+    } } } });
+    setImmediate(() => { suppressPasteKeys = false; });
+  };
   const ackOf = (message) => {
     if (!message.includes("HelperAPIResponse")) return undefined;
     try { return JSON.parse(unescapeHelper(message))?.HelperAPIResponse?.uuid; } catch { return undefined; }
@@ -322,10 +380,24 @@ function gateHelper(child) {
   // Wispr writes each message to the helper's stdin in one call, ending in "|".
   if (stdin && realWrite) stdin.write = function (chunk, ...rest) {
     try {
-      const text = ours.size === 0 ? null : typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : null;
-      if (text?.endsWith("|") && text.includes("HelperAPIResponse")) {
+      const text = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : null;
+      if (text?.endsWith("|")) {
         const messages = text.slice(0, -1).split("|");
-        const keep = messages.filter((m) => !ours.delete(ackOf(m)));
+        const keep = messages.filter((raw) => {
+          if (ours.delete(ackOf(raw))) return false;
+          let request;
+          try { request = JSON.parse(unescapeHelper(raw))?.HelperAPIRequest; } catch { return true; }
+          const payload = request?.PasteText?.payload;
+          if (payload && pasteGate?.(payload, (result) => {
+            if (result.fallback) realWrite.call(stdin, raw + "|");
+            else outcome(request, payload, result);
+          })) return false;
+          if (suppressPasteKeys && request?.SimulateKeyPress) {
+            process.nextTick(() => emitMessage({ HelperAPIResponse: { uuid: request.uuid, ACK: true } }));
+            return false;
+          }
+          return true;
+        });
         if (keep.length === 0) {
           const done = rest.find((a) => typeof a === "function");
           if (done) process.nextTick(done);
@@ -420,6 +492,7 @@ function build(electron) {
   };
 
   const daemon = startDaemon(process.resourcesPath, onDaemonEvent, () => {
+    brokerPastes.disconnected();
     // Wispr must not keep a key held that nobody will release.
     releaseWisprKeys();
     // Without the recorder, Wispr's own windows have to do the work.
@@ -432,6 +505,9 @@ function build(electron) {
     headless = false;
     trace({ ev: "fallback", why: "no daemon" });
   }
+
+  const brokerPastes = createPasteRouter((message) => daemon.send(message), () => Boolean(daemon?.alive));
+  pasteGate = (payload, done) => brokerPastes.route(payload, done);
 
   // Wispr's resting bar is shown unless hidden for good or snoozed (its own
   // rule: prefs.user.hideFlowBarPermanently, clickableBubbleSnoozeUntil).
@@ -638,6 +714,10 @@ function build(electron) {
     const hub = byRole.get("hub");
     const uuid = msg.uuid;
     switch (msg.op) {
+      case "cloudDelivery": {
+        brokerPastes.delivered(msg);
+        break;
+      }
       case "ready":
         trace({ ev: "daemon.ready" });
         break;
@@ -814,6 +894,7 @@ function build(electron) {
       if (this.role === "hub") {
         if (ch === "dictation:audioStart") {
           session = a?.transcriptionEntityUuid ?? null;
+          brokerPastes.start(session);
           trace({ ev: "rec.audioStart" });
           daemon.send({ op: "start", uuid: session });
           if (pendingEnd) {

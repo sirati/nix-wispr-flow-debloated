@@ -66,6 +66,21 @@ its answer. An answer that looks wrong or takes longer than
 green while a dictation goes to the local model (`localAsr.barColor`) and
 black otherwise (`headless.barColor`).
 
+When the [dictation-api broker](https://github.com/sirati/dictation-api) is
+running, the daemon asks it for a destination at the start of each local or
+Wispr dictation. The broker alone selects the application. An accepting app
+captures its insertion target and receives audio levels and the final text
+directly. The Rust bubble shows the app's supplied icon while recording and
+processing. No raw audio goes through this API. The provider currently offers
+level visualization; spectrum visualization is not advertised.
+
+Without a broker, or when no app accepts, dictation uses its usual insertion
+method. Once an app accepts, a delivery failure reports an error without
+pasting into another window. Local cancellation keeps the captured session
+for Undo; dismissing or expiring the notice cancels that session. Supported
+icon formats are PNG, JPEG, WebP, ICO and static SVG, supplied as a data URL
+or an absolute filename.
+
 `headless.hotkeys` makes wispr-headless watch dictation shortcuts itself,
 from /dev/input on any desktop, for example
 `[ "wispr:RightAlt" "local:RightCtrl" ]`: hold Right Alt to dictate with

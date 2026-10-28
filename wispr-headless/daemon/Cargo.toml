@@ -10,6 +10,9 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+dictation-api = { git = "https://github.com/sirati/dictation-api", rev = "c86db0fc9d68bae526b7b6d0c0857c0d85250ee6" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "ico", "webp"] }
+resvg = { version = "0.45", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["shape", "randr", "xkb", "xtest"] }
