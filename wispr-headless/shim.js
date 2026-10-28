@@ -376,15 +376,23 @@ function patchWisprBundle(source) {
   // pastes must not inherit whichever dictation happened most recently.
   const voidCall = /(\w+)\.ZZ\.textboxContents\.couldNotGetTextBoxInfo\|\|!\1\.ZZ\.textboxContents\.isEditable\)&&[^;]{0,200}?\(\(0,(\w+)\.sendVoidDictationNotification\)\((\w+)\)/g;
   const guards = [...source.matchAll(voidCall)];
-  const formatter = /async function \w+\(\w+\)\{(?=const\{transcriptionResult:)/g;
+  const formatter = /async function \w+\(\w+\)\{(?=const\{transcriptionResult:(\w+),)/g;
   const formatted = /return\{textToPaste:(\w+),formatterReturnedEmpty:\w+,statusOverride:\w+,didSubstitution:\w+,shouldPressEnterAfterPaste:(\w+)/g;
-  if (guards.length !== 1 || [...source.matchAll(formatter)].length !== 1 || [...source.matchAll(formatted)].length !== 1) throw new Error("unsupported Wispr pre-helper copy guard");
+  const formatters = [...source.matchAll(formatter)];
+  if (guards.length !== 1 || formatters.length !== 1 || [...source.matchAll(formatted)].length !== 1) throw new Error("unsupported Wispr pre-helper copy guard");
   // This guard runs before Wispr interprets the spoken Enter command. Defer
   // its notice until formatting finishes so both the text and intent agree.
   const [, copyState, copyModule] = guards[0];
   source = source.replace(formatter, "$&let __wisprDeferredCopy=false;");
   source = source.replace(voidCall, (call, state, module, text) => call.replace(`(0,${module}.sendVoidDictationNotification)(${text})`, "__wisprDeferredCopy=true"));
-  source = source.replace(formatted, (value, text, submit) => `__wisprDeferredCopy&&(0,${copyModule}.sendVoidDictationNotification)(${text},void 0,${copyState}.ZZ.uuid,${submit});${value}`);
+  source = source.replace(formatted, (value, text, submit) => {
+    // Wispr also labels successful zero-word results raw_transcript. Its
+    // Empty status and formatterReturnedEmpty flag do not cover that case.
+    // Network/model errors must retain Retry; submit-only commands retain
+    // their Enter intent rather than becoming no-speech cancellations.
+    const noWords = `["empty","raw_transcript","formatted","fallback"].includes(${formatters[0][1]}.status)&&!${submit}&&!String(${text}??"").trim()&&globalThis.wisprHeadlessEmpty?.(${copyState}.ZZ.uuid);`;
+    return `${noWords}__wisprDeferredCopy&&(0,${copyModule}.sendVoidDictationNotification)(${text},void 0,${copyState}.ZZ.uuid,${submit});${value}`;
+  });
   // Empty dictations bypass both paste paths. Observe Wispr's terminal
   // no-output branch itself, before its generic idle status loses the UUID.
   const empty = /\w+\|\|\w+\.status===\w+\.nf\.Empty\?\(/g;
@@ -680,14 +688,20 @@ function build(electron) {
   }
 
   const brokerPastes = createPasteRouter((message) => daemon.send(message), () => Boolean(daemon?.alive));
-  const cloudRetry = createCloudRetry((message) => daemon?.send(message), (payload) => {
+  const cloudRetry = createCloudRetry((message) => {
+    trace({ ev: "cloud.state", value: message.value, id: message.id });
+    daemon?.send(message);
+  }, (payload) => {
     const action = payload.actions?.find((action) => action.callback === "retry_last_text");
     trace({ ev: "cloud.autoRetry" });
     emitFrom(byRole.get("status"), "notification:callback", { callback: action?.callback ?? "retry_last_text", type: payload.type, callbackOperationId: payload.callbackOperationId });
     emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
   });
   globalThis.wisprHeadlessEmpty = (uuid) => {
-    if (typeof uuid === "string") daemon?.send({ op: "cloudEmpty", uuid });
+    if (typeof uuid === "string") {
+      trace({ ev: "cloud.empty", uuid });
+      daemon?.send({ op: "cloudEmpty", uuid });
+    }
   };
   pasteGate = (payload, done) => brokerPastes.route(payload, (result) => {
     if (!result.fallback && !result.applied) daemon?.send({ op: "recover", text: String(payload.text ?? ""), local: false });
@@ -927,6 +941,7 @@ function build(electron) {
         break;
       }
       case "cloudEmpty":
+        trace({ ev: "cloud.emptySettled", id: msg.id });
         cloudRetry.noSpeech(msg.id);
         break;
       case "copyTranscript":

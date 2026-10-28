@@ -150,6 +150,28 @@ for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Bo
       router.delivered({ request: sent[0].request, applied: true });
     }
     assert.match(patched, /globalThis\.wisprHeadlessTextBoxInfo=\w+;/);
+    const noWords = /(\["empty","raw_transcript","formatted","fallback"\]\.includes\((\w+)\.status\)&&!(\w+)&&!String\((\w+)\?\?""\)\.trim\(\)&&globalThis\.wisprHeadlessEmpty\?\.\((\w+)\.ZZ\.uuid\));/.exec(patched);
+    assert.ok(noWords, "successful no-output results are checked by actual text, not just Wispr's status label");
+    for (const [status, text, submit, expected] of [
+      ["raw_transcript", "", false, 1],
+      ["raw_transcript", " \n\t", false, 1],
+      ["formatted", "", false, 1],
+      ["fallback", null, false, 1],
+      ["raw_transcript", "words", false, 0],
+      ["error", "", false, 0],
+      ["timeout", "", false, 0],
+      ["processing", "", false, 0],
+      ["formatted", "", true, 0],
+    ]) {
+      const ended = [];
+      vm.runInNewContext(noWords[1], {
+        [noWords[2]]: { status }, [noWords[3]]: submit, [noWords[4]]: text,
+        [noWords[5]]: { ZZ: { uuid: "raw-empty-session" } },
+        wisprHeadlessEmpty: (uuid) => ended.push(uuid),
+      });
+      assert.equal(ended.length, expected, `status=${status}, text=${JSON.stringify(text)}, submit=${submit}`);
+      if (expected) assert.equal(ended[0], "raw-empty-session");
+    }
     const empty = /(\w+)\|\|(\w+)\.status===(\w+)\.nf\.Empty\?\(globalThis\.wisprHeadlessEmpty\?\.\((\w+)\.ZZ\.uuid\),/.exec(patched);
     assert.ok(empty, "Wispr's actual no-output branch reports its UUID without a paste request");
     for (const [formatterEmpty, status, expected] of [[false, "empty", 1], [true, "formatted", 1], [false, "formatted", 0]]) {
