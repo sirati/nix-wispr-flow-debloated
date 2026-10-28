@@ -25,6 +25,7 @@ test("Wispr's retry notice is handled automatically while queued recording stays
   const retry = testing.createCloudRetry((message) => sent.push(message), (notice) => retried.push(notice), 20);
   assert.equal(retry.notice({ type: "TranscriptionError" }), false);
   retry.start(1);
+  retry.recording();
   const notice = { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] };
   assert.equal(retry.notice(notice), true);
   retry.status("error");
@@ -57,23 +58,50 @@ test("a silent Retry failure tries again, and processing or a new job cancels th
   retry.close();
 });
 
+test("an older idle status cannot release a queued invocation before its recorder starts", () => {
+  const sent = [];
+  const retry = testing.createCloudRetry((event) => sent.push(event), () => {});
+  retry.start(1); retry.recording(); retry.status("idle");
+  retry.start(2); retry.status("idle");
+  assert.equal(retry.active, 2);
+  assert.equal(sent.length, 1);
+  retry.recording(); retry.status("idle");
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].id, 2);
+  retry.close();
+});
+
 for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Boolean)) {
-  test(`the shipped bundle retains correlation on both insertion paths: ${bundle}`, () => {
+  test(`the shipped bundle retains correlation and spoken Enter on both insertion paths: ${bundle}`, () => {
     const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
     new vm.Script(patched);
-    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:__wisprDictationUUID\?\?globalThis\.wisprHeadlessPasteUUID\?\.\(\)\}/.exec(patched);
+    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:__wisprDictationUUID\?\?globalThis\.wisprHeadlessPasteUUID\?\.\(\),dictationSubmit:!!__wisprDictationSubmit\}/.exec(patched);
     assert.ok(payload, "the copy message carries the exact originating UUID");
-    const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", __wisprDictationUUID: "original-session" };
+    const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", __wisprDictationUUID: "original-session", __wisprDictationSubmit: true };
     const notice = vm.runInNewContext(`(${payload[0]})`, env);
     assert.equal(notice.callbackOperationId, "original-session");
     assert.equal(notice.body, "completed text");
+    assert.equal(notice.dictationSubmit, true);
     env.__wisprDictationUUID = undefined;
     assert.equal(vm.runInNewContext(`(${payload[0]})`, env).callbackOperationId, undefined, "unrelated extension pastes cannot reuse a dictation session");
-    assert.match(patched, /sendVoidDictationNotification\)\(\w+,void 0,\w+\.ZZ\.uuid\)/);
-    const correlation = /(\w+)\?\{transcriptEntityUuid:\1\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\2\.transcriptEntityUUID\}:void 0/.exec(patched);
+    const deferred = /__wisprDeferredCopy&&\(0,(\w+)\.sendVoidDictationNotification\)\((\w+),void 0,(\w+)\.ZZ\.uuid,(\w+)\)/.exec(patched);
+    assert.ok(deferred, "pre-helper copy waits for Wispr's final formatted text and Enter decision");
+    let copied;
+    vm.runInNewContext(deferred[0], { __wisprDeferredCopy: true, [deferred[1]]: { sendVoidDictationNotification(...args) { copied = args; } }, [deferred[2]]: "completed text", [deferred[3]]: { ZZ: { uuid: "original-session", shouldPressEnterAfterPaste: false } }, [deferred[4]]: true });
+    assert.deepEqual(copied, ["completed text", undefined, "original-session", true], "copy uses the just-computed decision before Wispr updates its shared state");
+    const correlation = /(\w+)\?\{transcriptEntityUuid:\1,dictationSubmit:!!(\w+)\.ZZ\.shouldPressEnterAfterPaste\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\3\.transcriptEntityUUID,dictationSubmit:!!\2\.ZZ\.shouldPressEnterAfterPaste\}:void 0/.exec(patched);
     assert.ok(correlation, "ordinary helper pastes carry their owner's UUID");
-    const attributes = vm.runInNewContext(correlation[0], { [correlation[1]]: undefined, [correlation[2]]: { kind: "dictation", transcriptEntityUUID: "original-session" } });
-    assert.equal(attributes.transcriptEntityUuid, "original-session");
+    for (const submit of [true, false]) for (const uuid of [undefined, "original-session"]) {
+      const attributes = vm.runInNewContext(correlation[0], { [correlation[1]]: uuid, [correlation[2]]: { ZZ: { shouldPressEnterAfterPaste: submit } }, [correlation[3]]: { kind: "dictation", transcriptEntityUUID: "original-session" } });
+      assert.equal(attributes.transcriptEntityUuid, "original-session");
+      const sent = [];
+      const router = testing.createPasteRouter((message) => sent.push(message), () => true);
+      router.start("original-session");
+      router.route({ text: "completed text", logAttributes: attributes }, () => {});
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].submit, submit, "the actual patched bundle's Enter intent reaches the API request");
+      router.delivered({ request: sent[0].request, applied: true });
+    }
     assert.match(patched, /globalThis\.wisprHeadlessTextBoxInfo=\w+;/);
   });
 }

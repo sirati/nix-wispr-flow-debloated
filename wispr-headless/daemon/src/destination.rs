@@ -3,7 +3,7 @@
 //! microphone and UI threads. Audio levels are coalesced, never queued.
 use dictation_api::{AudioFeatures, AudioFrame, Event, Provider};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ pub struct Session {
     commands: mpsc::Sender<Completion>,
     level: Arc<Mutex<Option<f32>>>,
     icon: Arc<Mutex<Option<Arc<crate::icon::Icon>>>>,
+    processing: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -35,6 +36,8 @@ impl Session {
         let levels = level.clone();
         let icon = Arc::new(Mutex::new(None));
         let resolved_icon = icon.clone();
+        let processing = Arc::new(AtomicBool::new(false));
+        let process_state = processing.clone();
         std::thread::spawn(move || {
             let provider = match Provider::connect("Wispr Flow", endpoint.as_deref()) {
                 Ok(provider) => provider,
@@ -51,6 +54,7 @@ impl Session {
                 &rx,
                 &levels,
                 &mut completion,
+                &process_state,
                 id,
                 move |id, icon| {
                     *resolved_icon.lock().unwrap() = icon.clone();
@@ -70,6 +74,7 @@ impl Session {
             commands: tx,
             level,
             icon,
+            processing,
         }
     }
 
@@ -79,6 +84,12 @@ impl Session {
 
     pub fn icon(&self) -> Option<Arc<crate::icon::Icon>> {
         self.icon.lock().unwrap().clone()
+    }
+
+    /// Capture ended. The worker sends this after Ready, preserving event
+    /// order even for a very short recording or a delayed offer response.
+    pub fn processing(&self) {
+        self.processing.store(true, Ordering::Release);
     }
 
     /// Consumes the captured session. Dropping without completing cancels it,
@@ -104,6 +115,7 @@ fn run(
     commands: &mpsc::Receiver<Completion>,
     levels: &Mutex<Option<f32>>,
     completion: &mut Option<Completion>,
+    processing: &AtomicBool,
     id: u64,
     destination: impl FnOnce(u64, Option<Arc<crate::icon::Icon>>),
 ) -> Result<(), String> {
@@ -159,7 +171,15 @@ fn run(
         return Ok(());
     }
     let mut delivered = None;
+    let mut last_processing = None;
     loop {
+        if delivered.is_none()
+            && processing.load(Ordering::Acquire)
+            && last_processing.is_none_or(|at: Instant| at.elapsed() >= Duration::from_secs(60))
+        {
+            provider.processing(&session).map_err(|e| e.to_string())?;
+            last_processing = Some(Instant::now());
+        }
         match completion
             .take()
             .map(Ok)
@@ -178,7 +198,7 @@ fn run(
             }
             _ => {}
         }
-        if delivered.is_none() {
+        if delivered.is_none() && last_processing.is_none() {
             let level = levels.lock().unwrap().take();
             if let Some(level) = level.filter(|_| audio.level) {
                 provider
@@ -476,6 +496,21 @@ mod tests {
         let broker = Broker::new(Scenario::SlowOffer);
         let (session, _) = broker.session();
         assert_eq!(session.complete("short", false), Ok(true));
+    }
+
+    #[test]
+    fn processing_waits_for_ready_and_precedes_completion_without_more_audio() {
+        let broker = Broker::new(Scenario::SlowOffer);
+        let (session, _) = broker.session();
+        session.processing();
+        session.level(0.9);
+        assert_eq!(session.complete("short", false), Ok(true));
+        assert!(matches!(broker.request(), Request::RegisterProvider { .. }));
+        assert!(matches!(broker.request(), Request::Begin { .. }));
+        assert!(
+            matches!(broker.request(), Request::Processing { session } if session == "captured")
+        );
+        assert!(matches!(broker.request(), Request::Complete { .. }));
     }
 
     #[test]

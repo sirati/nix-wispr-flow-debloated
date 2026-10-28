@@ -427,6 +427,7 @@ impl Control {
                 out.push(Action::StartLocal { hands_free });
             }
             Backend::Wispr => {
+                self.local_bar = false;
                 // Recording from now, for Wispr to adopt when it asks.
                 if !early {
                     out.push(Action::StartEarly);
@@ -494,6 +495,7 @@ impl Control {
                 out.push(Action::WisprClick("cancel"));
                 out.push(Action::DropEarly);
             }
+            Phase::Idle if self.wispr_recording => out.push(Action::WisprClick("cancel")),
             Phase::Idle | Phase::Swallow => {}
         }
         self.release_ptt(out);
@@ -510,6 +512,33 @@ mod tests {
     const COMMAND: Key = 54;
     const ESC: Key = 53;
     const C: Key = 8;
+
+    #[test]
+    fn an_older_local_result_does_not_reset_a_new_cloud_recording() {
+        let mut control = Control::new(Duration::from_secs(600));
+        let now = Instant::now();
+        control.input(
+            Input::Start {
+                backend: Backend::Local,
+                hands_free: false,
+            },
+            now,
+        );
+        control.input(Input::End, now);
+        control.input(
+            Input::Start {
+                backend: Backend::Wispr,
+                hands_free: false,
+            },
+            now,
+        );
+        let actions = control.input(Input::Transcribed { ok: true }, now);
+        assert!(control.wispr_owns_bar());
+        assert!(!actions
+            .iter()
+            .any(|action| matches!(action, Action::BarStatus(_))));
+        assert!(matches!(control.phase, Phase::Wispr { .. }));
+    }
 
     /// The chord and the controller as serve() wires them, with stand-ins
     /// for the recorder, the local model and Wispr, which check the rules:

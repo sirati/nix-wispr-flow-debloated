@@ -71,16 +71,24 @@ running, the daemon asks it for a destination at the start of each local or
 Wispr dictation. The broker alone selects the application. An accepting app
 captures its insertion target and receives audio levels and the final text
 directly. The Rust bubble shows the app's supplied icon while recording and
-processing. No raw audio goes through this API. The provider currently offers
+processing. The provider reports the processing phase as soon as capture ends,
+including while audio waits in Wispr's queue. No raw audio goes through this API.
+The provider currently offers
 level visualization; spectrum visualization is not advertised.
+
+Wispr's spoken "press enter" command follows its own preference and reaches
+the accepting application as the API's `submit` flag. It also works when
+Wispr would otherwise show its copy prompt. Ordinary native insertion keeps
+Wispr's usual Enter behavior.
 
 Without a broker, or when no app accepts, dictation uses its usual insertion
 method. Once an app accepts, failed delivery keeps the transcript in the Rust
 bubble with a Copy button. Wispr's copy prompt and local dictation without an
 editable input use the same native notice. It stays until copied or the next
-dictation starts. Local cancellation keeps the captured session
-for Undo; dismissing or expiring the notice cancels that session. Supported
-icon formats are PNG, JPEG, WebP, ICO and static SVG, supplied as a data URL
+dictation starts. Cancellation immediately closes the captured broker session
+and notifies its application. Local Undo retains audio and starts a new broker
+session when selected. Supported icon formats are PNG, JPEG, WebP, ICO and
+static SVG, supplied as a data URL
 or an absolute filename.
 
 `headless.hotkeys` makes wispr-headless watch dictation shortcuts itself,
@@ -236,14 +244,22 @@ wispr-flow-debloated.lib.macLlamaCpp {
 
 ## Tests
 
-    nix flake check
-    cd wispr-headless/daemon && cargo test
-    # Local transcription with the real model, in real time:
-    WISPR_ASR_SERVER=.../llama-server WISPR_ASR_MODEL=... WISPR_ASR_MMPROJ=... \
-      WISPR_ASR_WAVS=a.wav:b.wav cargo test real_model -- --ignored --nocapture
-    wispr-headless/tests/electron/run.sh <wispr-headless binary>
+    tests/kde-vm/run-queue.sh
     tests/ime-vm/run-wispr-ime.sh
     tests/kde-vm/run.sh
 
 The KDE test runs Plasma on Wayland in a VM with a stand-in keyboard: the
 shortcut from /dev/input and typing through /dev/uinput.
+`run-queue.sh` extends that template with the Rust unit and daemon tests,
+an isolated real broker, JavaScript routing checks, and Electron native-bubble
+tests. It compiles the test executables on the build machine with execution
+disabled, then runs them only in the guest. Use this VM entry point for
+verification on a machine used for dictation. The tests use private broker
+directories even inside the VM.
+Pass the local API checkout to `run-queue.sh /path/to/dictation-api` while
+developing broker changes together. Its protocol, ownership and socket tests
+also run in the guest. Mac packages are cross-built on Linux; live desktops
+are not used as test environments.
+Set `WISPR_TEST_BUNDLES` to colon-separated extracted `.webpack/main/index.js`
+files to verify correlation and spoken Enter against actual Wispr releases.
+The runner copies those files into the guest before executing the checks.

@@ -13,6 +13,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 cp -r "$here/app" "$work/app"
+chmod -R u+w "$work/app"
 mkdir -p "$work/app/wispr-shim"
 printf '{"server":"/nonexistent-wispr-test-model"}\n' > "$work/asr.json"
 sed -e "s#@daemon@#$daemon#" -e "s#@pwcat@#/bin/true#" -e "s#@micTarget@##" \

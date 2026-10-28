@@ -453,6 +453,13 @@ fn finish_cloud(
     let (rest, timing) = capture.recording.finish_retained(clock_ms);
     cloud.feed(capture.id, &rest);
     cloud.end(capture.id, timing);
+    if let Some(destination) = cloud
+        .jobs
+        .get(&capture.id)
+        .and_then(|j| j.destination.as_ref())
+    {
+        destination.processing();
+    }
 }
 
 /// A native notice owns either an unfinished recording for Undo or completed
@@ -465,13 +472,18 @@ fn retain_cloud_event(cloud: &mut cloud::Queue<destination::Session>, id: u64, e
                 cloud.feed(id, &pcm);
             }
         }
-        Event::Done { timing, .. } => cloud.end(id, timing.clone()),
+        Event::Done { timing, .. } => {
+            cloud.end(id, timing.clone());
+            if let Some(destination) = cloud.jobs.get(&id).and_then(|j| j.destination.as_ref()) {
+                destination.processing();
+            }
+        }
         _ => {}
     }
 }
 
 struct LocalNotice {
-    dictation: Option<(asr::Dictation, destination::Session)>,
+    dictation: Option<asr::Dictation>,
     text: Option<String>,
 }
 
@@ -519,6 +531,7 @@ fn transcribe(
     (dictation, destination): (asr::Dictation, destination::Session),
     commands: &mpsc::Sender<Option<Command>>,
 ) {
+    destination.processing();
     let commands = commands.clone();
     std::thread::spawn(move || {
         let id = destination.id;
@@ -1300,6 +1313,26 @@ fn serve(
                 }
                 if matches!(value.as_str(), "idle" | "dismissed") {
                     upstream_busy = false;
+                    if value == "dismissed" {
+                        if let Some(id) = cloud.active {
+                            if cloud_capture
+                                .as_ref()
+                                .is_some_and(|capture| capture.id == id)
+                            {
+                                cloud_capture = None;
+                                pending.push_back(control::Input::CloudStopped);
+                            }
+                            if cloud.jobs.get(&id).is_some_and(|job| job.external) {
+                                recording = None;
+                                pending.push_back(control::Input::CloudStopped);
+                            }
+                            cloud.cancel(id);
+                            if shown_destination == Some(id) {
+                                shown_destination = None;
+                                let _ = pill_tx.send(PillCommand::Destination(None));
+                            }
+                        }
+                    }
                     cloud.available();
                 } else if matches!(value.as_str(), "error" | "retrying") {
                     if let Some(job) = cloud.active.and_then(|id| cloud.jobs.get_mut(&id)) {
@@ -1679,8 +1712,12 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
         }
         Action::CancelLocal => {
             if let Some(l) = e.local.take() {
+                let (dictation, destination) = stop_local(l);
+                // Cancel is terminal for the accepting application. Keep
+                // audio for Undo without keeping that broker session open.
+                drop(destination);
                 *e.local_notice = Some(LocalNotice {
-                    dictation: Some(stop_local(l)),
+                    dictation: Some(dictation),
                     text: None,
                 });
                 let _ = e.pill_tx.send(PillCommand::Notify {
@@ -1694,12 +1731,12 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
         }
         Action::UndoLocal => match e.local_notice.as_mut().and_then(|n| n.dictation.take()) {
             Some(dictation) => {
-                e.local_processing
-                    .insert(dictation.1.id, dictation.1.icon());
-                *e.shown_destination = Some(dictation.1.id);
-                let _ = e.pill_tx.send(PillCommand::Destination(dictation.1.icon()));
+                let destination = begin_destination(e.internal);
+                e.local_processing.insert(destination.id, None);
+                *e.shown_destination = Some(destination.id);
+                let _ = e.pill_tx.send(PillCommand::Destination(None));
                 let _ = e.pill_tx.send(PillCommand::Local);
-                transcribe(dictation, e.internal);
+                transcribe((dictation, destination), e.internal);
             }
             None => return Some(control::Input::Transcribed { ok: false }),
         },
@@ -1758,6 +1795,11 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                     _ => {}
                 }
                 return None;
+            }
+            if action == "cancel" {
+                if let Some(id) = e.cloud.active {
+                    e.cloud.cancel(id);
+                }
             }
             if action == "start" {
                 if let Some((_, until)) = e.early.as_mut() {

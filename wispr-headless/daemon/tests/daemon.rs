@@ -12,6 +12,9 @@ struct Daemon {
     child: Child,
     stdin: ChildStdin,
     lines: Receiver<Value>,
+    // Tests with a real broker explicitly override this private directory.
+    // Fixture transcripts must never reach the user's desktop broker.
+    _broker_home: tempfile::TempDir,
 }
 
 /// The binary under test. Cross-built tests run on another machine than the
@@ -31,9 +34,11 @@ impl Daemon {
     }
 
     fn start_with_env(capture: &str, args: &[&str], env: &[(&str, &str)]) -> Daemon {
+        let broker_home = tempfile::tempdir().unwrap();
         let mut child = Command::new(binary())
             .args(["--capture-cmd", capture])
             .args(args)
+            .env("DICTATION_API_HOME", broker_home.path())
             .envs(env.iter().copied())
             .env_remove("DISPLAY")
             .stdin(Stdio::piped())
@@ -58,6 +63,7 @@ impl Daemon {
             child,
             stdin,
             lines,
+            _broker_home: broker_home,
         };
         assert_eq!(d.next_op("ready")["op"], "ready");
         d
@@ -359,11 +365,14 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     };
     let a = Client::connect(application("a"), Some(&endpoint)).unwrap();
     let b = Client::connect(application("b"), Some(&endpoint)).unwrap();
-    let event = |client: &Client| {
-        client
+    let event = |client: &Client| loop {
+        let event = client
             .next_event(Duration::from_secs(3))
             .unwrap()
-            .expect("broker event")
+            .expect("broker event");
+        if !matches!(event, BrokerEvent::Processing { .. }) {
+            break event;
+        }
     };
     let offer = |client: &Client| match event(client) {
         BrokerEvent::Offer { session, .. } => session,
@@ -472,7 +481,63 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     );
     a.acknowledge(&queued, true, None).unwrap();
     assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
-    assert!(b.next_event(Duration::from_millis(50)).unwrap().is_none());
+    // This app also owns the older busy job, whose capture has now ended.
+    if let Some(event) = b.next_event(Duration::from_millis(50)).unwrap() {
+        assert!(matches!(event, BrokerEvent::Processing { .. }));
+    }
+
+    let c = Client::connect(application("lifecycle"), Some(&endpoint)).unwrap();
+    c.activate().unwrap();
+    let (_model, config, _) = working_asr_config();
+    let mut lifecycle = Daemon::start_with_env(
+        "sleep 30",
+        &["--asr-config", &config],
+        &[("DICTATION_API_HOME", home.path().to_str().unwrap())],
+    );
+    lifecycle.send(r#"{"op":"dictate","backend":"local"}"#);
+    let cancelled_local = offer(&c);
+    c.respond(&cancelled_local, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"dictateCancel"}"#);
+    assert!(
+        matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == cancelled_local)
+    );
+
+    lifecycle.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    lifecycle.next_op("cloudStart");
+    lifecycle.next_op("wisprKey");
+    let processing = offer(&c);
+    c.respond(&processing, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"start","uuid":"processing-lifecycle"}"#);
+    lifecycle.next_op("started");
+    lifecycle.send(r#"{"op":"dictateEnd"}"#);
+    lifecycle.next_op("wisprKey");
+    assert!(
+        matches!(c.next_event(Duration::from_secs(3)).unwrap(), Some(BrokerEvent::Processing { session }) if session == processing)
+    );
+    lifecycle.send(r#"{"op":"stop"}"#);
+    lifecycle.next_op("done");
+
+    lifecycle.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let cancelled_queued = offer(&c);
+    c.respond(&cancelled_queued, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"dictateCancel"}"#);
+    assert!(
+        matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == cancelled_queued)
+    );
+    lifecycle.send(r#"{"op":"cloudState","value":"dismissed"}"#);
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == processing));
+
+    lifecycle.send(r#"{"op":"start","uuid":"external-cancel"}"#);
+    lifecycle.next_op("started");
+    let external = offer(&c);
+    c.respond(&external, true, AudioFeatures::default())
+        .unwrap();
+    lifecycle.send(r#"{"op":"dictateCancel"}"#);
+    lifecycle.next_op("click");
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == external));
 }
 
 impl Drop for Daemon {

@@ -122,7 +122,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 [[package]]
 name = "dictation-api"
 version = "0.1.0"
-source = "git+https://github.com/sirati/dictation-api?rev=c86db0fc9d68bae526b7b6d0c0857c0d85250ee6#c86db0fc9d68bae526b7b6d0c0857c0d85250ee6"
+source = "git+https://github.com/sirati/dictation-api?rev=2f3f91932ba06ff85c1672b6ae25a231248c5da1#2f3f91932ba06ff85c1672b6ae25a231248c5da1"
 dependencies = [
  "dictation-protocol",
  "directories",
@@ -134,7 +134,7 @@ dependencies = [
 [[package]]
 name = "dictation-protocol"
 version = "0.1.0"
-source = "git+https://github.com/sirati/dictation-api?rev=c86db0fc9d68bae526b7b6d0c0857c0d85250ee6#c86db0fc9d68bae526b7b6d0c0857c0d85250ee6"
+source = "git+https://github.com/sirati/dictation-api?rev=2f3f91932ba06ff85c1672b6ae25a231248c5da1#2f3f91932ba06ff85c1672b6ae25a231248c5da1"
 dependencies = [
  "serde",
  "serde_json",

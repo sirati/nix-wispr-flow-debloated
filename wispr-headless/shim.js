@@ -297,7 +297,7 @@ function createPasteRouter(send, alive, timeout = 65_000) {
 }
 
 function createCloudRetry(send, callback, delay = 1000) {
-  let active = null, timer = null, attempt = 0, notification = null, retrying = false;
+  let active = null, timer = null, attempt = 0, notification = null, retrying = false, started = false;
   const clear = () => { if (timer) clearTimeout(timer); timer = null; };
   const retry = () => {
     if (active === null || timer) return;
@@ -314,12 +314,16 @@ function createCloudRetry(send, callback, delay = 1000) {
   };
   return {
     get active() { return active; },
-    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; },
+    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; started = false; },
+    recording() { started = true; },
     status(value) {
       if (active === null) return;
       if (value === "error") retry();
       else if (["initializing", "listening", "stopping", "processing", "retrying"].includes(value)) { retrying = false; clear(); }
       else if (value === "idle" || value === "dismissed") {
+        // A duplicate terminal status from the preceding job can arrive
+        // after the next start was requested but before its audioStart.
+        if (!started) return;
         const id = active; clear(); active = null; send({ op: "cloudState", value, id });
       }
     },
@@ -348,19 +352,31 @@ function patchWisprBundle(source) {
   const notification = /\{\.\.\.\w+\.L\[\w+\.Eg\.VoidDictation\],body:\w+\}/g;
   const signature = new RegExp(String.raw`${notices.name}=\((\w+),(\w+)\)=>\{`);
   if (!signature.test(body) || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
-  const patchedNotice = body.replace(signature, `${notices.name}=($1,$2,__wisprDictationUUID)=>{`).replace(notification, (value) => value.slice(0, -1) + ",callbackOperationId:__wisprDictationUUID??globalThis.wisprHeadlessPasteUUID?.()}");
+  const patchedNotice = body.replace(signature, `${notices.name}=($1,$2,__wisprDictationUUID,__wisprDictationSubmit)=>{`).replace(notification, (value) => value.slice(0, -1) + ",callbackOperationId:__wisprDictationUUID??globalThis.wisprHeadlessPasteUUID?.(),dictationSubmit:!!__wisprDictationSubmit}");
   source = source.slice(0, notices.start) + patchedNotice + source.slice(notices.end);
   // Only this pre-helper call belongs to the final dictation. Extension API
   // pastes must not inherit whichever dictation happened most recently.
-  const voidCall = /(\w+)\.ZZ\.textboxContents\.couldNotGetTextBoxInfo\|\|!\1\.ZZ\.textboxContents\.isEditable\)&&[^;]{0,200}?\(\(0,\w+\.sendVoidDictationNotification\)\((\w+)\)/g;
-  if ([...source.matchAll(voidCall)].length !== 1) throw new Error("unsupported Wispr pre-helper copy guard");
-  source = source.replace(voidCall, (call, state, text) => call.slice(0, -1) + `,void 0,${state}.ZZ.uuid)`);
+  const voidCall = /(\w+)\.ZZ\.textboxContents\.couldNotGetTextBoxInfo\|\|!\1\.ZZ\.textboxContents\.isEditable\)&&[^;]{0,200}?\(\(0,(\w+)\.sendVoidDictationNotification\)\((\w+)\)/g;
+  const guards = [...source.matchAll(voidCall)];
+  const formatter = /async function \w+\(\w+\)\{(?=const\{transcriptionResult:)/g;
+  const formatted = /return\{textToPaste:(\w+),formatterReturnedEmpty:\w+,statusOverride:\w+,didSubstitution:\w+,shouldPressEnterAfterPaste:(\w+)/g;
+  if (guards.length !== 1 || [...source.matchAll(formatter)].length !== 1 || [...source.matchAll(formatted)].length !== 1) throw new Error("unsupported Wispr pre-helper copy guard");
+  // This guard runs before Wispr interprets the spoken Enter command. Defer
+  // its notice until formatting finishes so both the text and intent agree.
+  const [, copyState, copyModule] = guards[0];
+  source = source.replace(formatter, "$&let __wisprDeferredCopy=false;");
+  source = source.replace(voidCall, (call, state, module, text) => call.replace(`(0,${module}.sendVoidDictationNotification)(${text})`, "__wisprDeferredCopy=true"));
+  source = source.replace(formatted, (value, text, submit) => `__wisprDeferredCopy&&(0,${copyModule}.sendVoidDictationNotification)(${text},void 0,${copyState}.ZZ.uuid,${submit});${value}`);
   const paste = /(\w+)=\((\w+),(\w+),(\w+),(\w+)\)=>\{\w+\.RA\.lastTranscriptionStatus=\w+/.exec(source);
   if (!paste) throw new Error("unsupported Wispr final paste");
   const owner = paste[4], uuid = paste[5];
+  const pasteBody = source.slice(paste.index, paste.index + 4000);
+  const pasteState = /app: \$\{(\w+)\.ZZ\.appName\}/.exec(pasteBody)?.[1];
+  if (!pasteState) throw new Error("unsupported Wispr paste submit intent");
+  const submit = `${pasteState}.ZZ.shouldPressEnterAfterPaste`;
   const correlation = `${uuid}?{transcriptEntityUuid:${uuid}}:void 0`;
   if (source.split(correlation).length !== 2) throw new Error("unsupported Wispr paste correlation");
-  source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid}}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID}:void 0`);
+  source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid},dictationSubmit:!!${submit}}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID,dictationSubmit:!!${submit}}:void 0`);
   const helper = module("getTextBoxInfo");
   source = source.slice(0, helper.end) + `;globalThis.wisprHeadlessTextBoxInfo=${helper.name};` + source.slice(helper.end);
   return source;
@@ -652,7 +668,7 @@ function build(electron) {
       if (!result.applied) daemon.send(recovery);
       emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
     };
-    if (!brokerPastes.route({ transcriptEntityUUID: payload.callbackOperationId, text: recovery.text }, show)) show({ applied: false });
+    if (!brokerPastes.route({ transcriptEntityUUID: payload.callbackOperationId, text: recovery.text, submit: payload.dictationSubmit }, show)) show({ applied: false });
     return true;
   }
 
@@ -895,6 +911,7 @@ function build(electron) {
         trace({ ev: "daemon.ready" });
         break;
       case "started":
+        cloudRetry.recording();
         trace({ ev: "rec.started" });
         emitFrom(hub, "dictation:recordingStarted", { transcriptionEntityUuid: uuid });
         break;
@@ -911,6 +928,7 @@ function build(electron) {
         break;
       case "click":
         if (msg.action === "cancel") {
+          cloudRetry.recording(); // A cancel before audioStart is terminal too.
           cloudCancelled = true;
           clearCloudRelease();
         }

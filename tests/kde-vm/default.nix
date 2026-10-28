@@ -9,10 +9,15 @@
 #
 #   tests/kde-vm/run.sh        # needs /dev/kvm
 #   tests/kde-vm/run.sh -i     # interactive driver
-{ pkgs }:
+{
+  pkgs,
+  daemon ? (pkgs.callPackage ../../wispr-headless/daemon { }).overrideAttrs {
+    doCheck = false;
+  },
+  extraPackages ? [ ],
+  extraTestScript ? "",
+}:
 let
-  daemon = pkgs.callPackage ../../wispr-headless/daemon { };
-
   standIn = pkgs.writers.writePython3Bin "stand-in-keyboard" {
     libraries = [ pkgs.python3Packages.evdev ];
   } (builtins.readFile ./stand-in-keyboard.py);
@@ -91,7 +96,8 @@ pkgs.testers.runNixOSTest {
         standInButtons
         captureText
         pkgs.wl-clipboard
-      ];
+      ]
+      ++ extraPackages;
 
       virtualisation = {
         memorySize = 4096;
@@ -104,5 +110,6 @@ pkgs.testers.runNixOSTest {
     DAEMON = "${daemon}/bin/wispr-headless"
     WL_COPY = "${pkgs.wl-clipboard}/bin/wl-copy"
   ''
-  + builtins.readFile ./test.py;
+  + builtins.readFile ./test.py
+  + extraTestScript;
 }

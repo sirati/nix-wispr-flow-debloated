@@ -24,7 +24,7 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ./Cargo.lock;
   cargoLock.outputHashes = {
-    "dictation-api-0.1.0" = "sha256-kJU5cXKYHC7grvzajgwCavFKMKzOio7QjjjnMv4ftVE=";
+    "dictation-api-0.1.0" = "sha256-+UR44Ui6v8jO2HQPnOsqb8TOzbPxrJQVgwrFYhqjKLM=";
   };
 
   # The unit tests and the binary's own tests (a stand-in microphone) run
