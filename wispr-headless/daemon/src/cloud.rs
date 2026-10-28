@@ -192,10 +192,13 @@ impl<T> Queue<T> {
             if let Some(job) = self.jobs.get_mut(&id) {
                 job.cloud_done = true;
                 job.completed_at = Some(Instant::now());
-                // The PCM is needed until Wispr finishes or a local attempt
-                // has taken its own copy. Keep the route for a late paste.
-                job.audio.clear();
-                job.audio.shrink_to_fit();
+                // Idle releases Wispr's slot, but its final paste may still
+                // be pending. Keep audio and the local alternative until a
+                // transcript has actually claimed this job.
+                if job.claimed {
+                    job.audio.clear();
+                    job.audio.shrink_to_fit();
+                }
             }
         }
         self.prune();
@@ -298,14 +301,14 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_job_releases_audio_and_eventually_cancels_an_unused_route() {
+    fn idle_without_a_transcript_keeps_audio_and_eventually_cancels_an_unused_route() {
         let mut queue = Queue::default();
         queue.add(1, "original app");
         queue.next();
         queue.bind("empty-result".into());
         queue.feed(1, &[1; 1280]);
         queue.available();
-        assert!(queue.jobs[&1].audio.is_empty());
+        assert_eq!(queue.jobs[&1].audio, vec![1; 1280]);
         assert_eq!(queue.jobs[&1].destination, Some("original app"));
         queue.jobs.get_mut(&1).unwrap().completed_at = Some(Instant::now() - LATE_PASTE_FOR);
         queue.prune();

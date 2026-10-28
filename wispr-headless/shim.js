@@ -280,7 +280,8 @@ function createPasteRouter(send, alive, timeout = 65_000) {
       }, timeout);
       requests.set(request, (result) => { clearTimeout(timer); finish(result); });
       trace({ ev: "broker.route", request, uuid, chars: String(payload.text ?? "").length });
-      send({ op: "cloudTranscript", request, uuid, text: String(payload.text ?? ""), submit: Boolean(payload.submit ?? payload.logAttributes?.dictationSubmit) });
+      const submit = payload.submit ?? payload.logAttributes?.dictationSubmit;
+      send({ op: "cloudTranscript", request, uuid, text: String(payload.text ?? ""), submit: submit === true || submit === "true" });
       return true;
     },
     delivered(message) {
@@ -376,7 +377,9 @@ function patchWisprBundle(source) {
   const submit = `${pasteState}.ZZ.shouldPressEnterAfterPaste`;
   const correlation = `${uuid}?{transcriptEntityUuid:${uuid}}:void 0`;
   if (source.split(correlation).length !== 2) throw new Error("unsupported Wispr paste correlation");
-  source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid},dictationSubmit:!!${submit}}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID,dictationSubmit:!!${submit}}:void 0`);
+  // Wispr validates logAttributes as a string-to-string map before writing
+  // to the helper. A boolean here rejects the entire paste request.
+  source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid},dictationSubmit:String(!!${submit})}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID,dictationSubmit:String(!!${submit})}:void 0`);
   const helper = module("getTextBoxInfo");
   source = source.slice(0, helper.end) + `;globalThis.wisprHeadlessTextBoxInfo=${helper.name};` + source.slice(helper.end);
   return source;

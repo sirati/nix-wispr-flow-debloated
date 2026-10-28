@@ -236,6 +236,13 @@ app.whenReady().then(async () => {
   status.webContents.send("status:dictationStatus", "idle");
   await wait(300);
 
+  if (xdotool) {
+    const before = daemonEvents.length;
+    execSync(`${xdotool} mousemove 688 721 click 1`);
+    const retained = await until("local alternative after idle", () => daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed")));
+    check(retained, "an undelivered dictation keeps its processing bubble and local action after Wispr goes idle");
+  }
+
   // A notification needs the real status page.
   status.webContents.send("notification:show", { type: "tip" });
   await until("status loaded", () => loaded.includes("status"));

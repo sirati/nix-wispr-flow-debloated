@@ -89,15 +89,27 @@ for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Bo
     let copied;
     vm.runInNewContext(deferred[0], { __wisprDeferredCopy: true, [deferred[1]]: { sendVoidDictationNotification(...args) { copied = args; } }, [deferred[2]]: "completed text", [deferred[3]]: { ZZ: { uuid: "original-session", shouldPressEnterAfterPaste: false } }, [deferred[4]]: true });
     assert.deepEqual(copied, ["completed text", undefined, "original-session", true], "copy uses the just-computed decision before Wispr updates its shared state");
-    const correlation = /(\w+)\?\{transcriptEntityUuid:\1,dictationSubmit:!!(\w+)\.ZZ\.shouldPressEnterAfterPaste\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\3\.transcriptEntityUUID,dictationSubmit:!!\2\.ZZ\.shouldPressEnterAfterPaste\}:void 0/.exec(patched);
+    // Use Wispr's real generated serializer, which rejects non-string values
+    // in logAttributes before anything can reach the helper or paste hook.
+    const converter = /class (\w+)\{static toHelperAPI\(/.exec(patched);
+    assert.ok(converter);
+    const converterBody = patched.slice(converter.index);
+    const converterEnd = /\},\d+\([^)]*\)\{/.exec(converterBody);
+    assert.ok(converterEnd);
+    const native = vm.runInNewContext(converterBody.slice(0, converterEnd.index) + `;${converter[1]};`);
+    const wirePaste = (attributes) => ({ HelperAPIRequest: { uuid: "paste-request", PasteText: { payload: { text: "completed text", pasteId: "paste-id", logAttributes: attributes } } } });
+    assert.throws(() => native.helperAPIToJson(wirePaste({ transcriptEntityUuid: "original-session", dictationSubmit: true })), /Invalid value/);
+    const correlation = /(\w+)\?\{transcriptEntityUuid:\1,dictationSubmit:String\(!!(\w+)\.ZZ\.shouldPressEnterAfterPaste\)\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\3\.transcriptEntityUUID,dictationSubmit:String\(!!\2\.ZZ\.shouldPressEnterAfterPaste\)\}:void 0/.exec(patched);
     assert.ok(correlation, "ordinary helper pastes carry their owner's UUID");
     for (const submit of [true, false]) for (const uuid of [undefined, "original-session"]) {
       const attributes = vm.runInNewContext(correlation[0], { [correlation[1]]: uuid, [correlation[2]]: { ZZ: { shouldPressEnterAfterPaste: submit } }, [correlation[3]]: { kind: "dictation", transcriptEntityUUID: "original-session" } });
       assert.equal(attributes.transcriptEntityUuid, "original-session");
+      const serialized = native.helperAPIToJson(wirePaste(attributes));
+      const payload = JSON.parse(serialized).HelperAPIRequest.PasteText.payload;
       const sent = [];
       const router = testing.createPasteRouter((message) => sent.push(message), () => true);
       router.start("original-session");
-      router.route({ text: "completed text", logAttributes: attributes }, () => {});
+      router.route(payload, () => {});
       assert.equal(sent.length, 1);
       assert.equal(sent[0].submit, submit, "the actual patched bundle's Enter intent reaches the API request");
       router.delivered({ request: sent[0].request, applied: true });

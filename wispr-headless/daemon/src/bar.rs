@@ -717,25 +717,27 @@ impl BarState {
                     let (cx, cy) = (button.cx, button.cy);
                     shapes.push(button);
                     self.retry_buttons.push((job.id, button));
-                    for i in 0..8 {
-                        let a = (i as f64 * 35. + 20.).to_radians();
-                        let b = ((i + 1) as f64 * 35. + 20.).to_radians();
+                    // A smooth, round-capped clockwise arrow. Keep its
+                    // arrowhead on the arc instead of drawing a detached hook.
+                    for i in 0..24 {
+                        let a = (-90. + i as f64 * 270. / 24.).to_radians();
+                        let b = (-90. + (i + 1) as f64 * 270. / 24.).to_radians();
                         shapes.push(Shape::line(
                             (cx + a.cos() * 5., cy + a.sin() * 5.),
                             (cx + b.cos() * 5., cy + b.sin() * 5.),
-                            1.4,
+                            1.5,
                             [0xff; 4],
                         ));
                     }
                     shapes.push(Shape::line(
-                        (cx + 5., cy - 4.),
-                        (cx + 5., cy),
+                        (cx - 7., cy + 2.5),
+                        (cx - 5., cy),
                         1.5,
                         [0xff; 4],
                     ));
                     shapes.push(Shape::line(
-                        (cx + 5., cy),
-                        (cx + 1., cy - 1.),
+                        (cx - 5., cy),
+                        (cx - 3., cy + 2.5),
                         1.5,
                         [0xff; 4],
                     ));

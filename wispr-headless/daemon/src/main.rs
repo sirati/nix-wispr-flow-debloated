@@ -1252,6 +1252,11 @@ fn serve(
             })) => {
                 let managed = cloud.id_for(&uuid);
                 if text.trim().is_empty() || cloud.handled(&uuid) {
+                    if text.trim().is_empty() && !cloud.handled(&uuid) {
+                        if let Some(id) = managed {
+                            cloud.cancel(id);
+                        }
+                    }
                     out.send(&Event::CloudDelivery {
                         request,
                         fallback: false,
@@ -1491,14 +1496,14 @@ fn serve(
                 .iter()
                 .filter(|(&id, job)| {
                     job.timing.is_some()
-                        && (!job.cloud_done || job.local_running)
+                        && (!job.cloud_done || !job.claimed || job.local_running)
                         && cloud_capture.as_ref().is_none_or(|c| c.id != id)
                 })
                 .map(|(&id, job)| bar::Processing {
                     id,
                     local: job.local_running,
                     retry: asr.is_some() && !job.claimed && !job.local_running,
-                    queued: cloud.active != Some(id) && !job.local_running,
+                    queued: !job.cloud_done && cloud.active != Some(id) && !job.local_running,
                     icon: job.icon.clone(),
                 }),
         );

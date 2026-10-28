@@ -538,6 +538,18 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     lifecycle.send(r#"{"op":"dictateCancel"}"#);
     lifecycle.next_op("click");
     assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == external));
+
+    lifecycle.send(r#"{"op":"cloudState","value":"dismissed"}"#);
+    lifecycle.send(r#"{"op":"start","uuid":"empty-transcript"}"#);
+    lifecycle.next_op("started");
+    let empty = offer(&c);
+    c.respond(&empty, true, AudioFeatures::default()).unwrap();
+    lifecycle.send(r#"{"op":"stop"}"#);
+    lifecycle.next_op("done");
+    lifecycle
+        .send(r#"{"op":"cloudTranscript","request":"empty","uuid":"empty-transcript","text":" "}"#);
+    assert!(matches!(event(&c), BrokerEvent::Cancelled { session, .. } if session == empty));
+    assert_eq!(lifecycle.next_op("cloudDelivery")["applied"], true);
 }
 
 impl Drop for Daemon {
