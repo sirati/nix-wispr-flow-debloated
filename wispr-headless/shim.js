@@ -38,6 +38,7 @@ const path = require("path");
 const fs = require("fs");
 const childProcess = require("child_process");
 const readline = require("readline");
+const pasteContext = new (require("async_hooks").AsyncLocalStorage)();
 
 // Filled in by the Nix build; empty when unused (pw-cat and the PipeWire
 // target on Linux, the capture and player commands on macOS, the local
@@ -307,10 +308,16 @@ function patchWisprBundle(source) {
   };
   const notices = module("sendVoidDictationNotification");
   const body = source.slice(notices.start, notices.end);
-  const state = /appName:(\w+)\.ZZ\.appName/.exec(body)?.[1];
   const notification = /\{\.\.\.\w+\.L\[\w+\.Eg\.VoidDictation\],body:\w+\}/g;
-  if (!state || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
-  source = source.slice(0, notices.start) + body.replace(notification, (value) => value.slice(0, -1) + `,callbackOperationId:${state}.ZZ.uuid}`) + source.slice(notices.end);
+  const signature = new RegExp(String.raw`${notices.name}=\((\w+),(\w+)\)=>\{`);
+  if (!signature.test(body) || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
+  const patchedNotice = body.replace(signature, `${notices.name}=($1,$2,__wisprDictationUUID)=>{`).replace(notification, (value) => value.slice(0, -1) + ",callbackOperationId:__wisprDictationUUID??globalThis.wisprHeadlessPasteUUID?.()}");
+  source = source.slice(0, notices.start) + patchedNotice + source.slice(notices.end);
+  // Only this pre-helper call belongs to the final dictation. Extension API
+  // pastes must not inherit whichever dictation happened most recently.
+  const voidCall = /(\w+)\.ZZ\.textboxContents\.couldNotGetTextBoxInfo\|\|!\1\.ZZ\.textboxContents\.isEditable\)&&[^;]{0,200}?\(\(0,\w+\.sendVoidDictationNotification\)\((\w+)\)/g;
+  if ([...source.matchAll(voidCall)].length !== 1) throw new Error("unsupported Wispr pre-helper copy guard");
+  source = source.replace(voidCall, (call, state, text) => call.slice(0, -1) + `,void 0,${state}.ZZ.uuid)`);
   const paste = /(\w+)=\((\w+),(\w+),(\w+),(\w+)\)=>\{\w+\.RA\.lastTranscriptionStatus=\w+/.exec(source);
   if (!paste) throw new Error("unsupported Wispr final paste");
   const owner = paste[4], uuid = paste[5];
@@ -398,9 +405,15 @@ function gateHelper(child) {
   // Our events' uuids until Wispr acknowledges them (Wispr drops a message it
   // cannot read without an ACK, hence the bound).
   const ours = new Set();
+  const pasteSessions = new Map();
   let injectedCount = 0;
   let suppressPasteKeys = false;
-  const emitMessage = (message) => realEmit.call(fd3, "data", Buffer.from(escapeHelper(JSON.stringify(message)) + "|", "utf8"));
+  const emitMessage = (message) => {
+    const pasteId = message?.HelperAPIRequest?.PasteOutcome?.payload?.pasteId;
+    const session = pasteSessions.get(pasteId);
+    if (pasteId) pasteSessions.delete(pasteId);
+    return pasteContext.run(session, () => realEmit.call(fd3, "data", Buffer.from(escapeHelper(JSON.stringify(message)) + "|", "utf8")));
+  };
   const outcome = (request, payload, result) => {
     emitMessage({ HelperAPIResponse: { uuid: request.uuid, ACK: true } });
     const uuid = `wispr-headless-${process.pid}-${++injectedCount}`;
@@ -430,6 +443,11 @@ function gateHelper(child) {
           let request;
           try { request = JSON.parse(unescapeHelper(raw))?.HelperAPIRequest; } catch { return true; }
           const payload = request?.PasteText?.payload;
+          const session = payload?.transcriptEntityUUID ?? payload?.logAttributes?.transcriptEntityUuid;
+          if (payload?.pasteId && typeof session === "string") {
+            pasteSessions.set(payload.pasteId, session);
+            if (pasteSessions.size > 1000) pasteSessions.delete(pasteSessions.keys().next().value);
+          }
           if (payload && pasteGate?.(payload, (result) => {
             if (result.fallback) realWrite.call(stdin, raw + "|");
             else outcome(request, payload, result);
@@ -495,16 +513,24 @@ function gateHelper(child) {
       const raw = pending.subarray(start, bar);
       let handOn = raw;
       try { handOn = gate(raw); } catch (e) { trace({ ev: "keyGate.error", error: String(e).slice(0, 200) }); }
-      if (handOn) out.push(handOn, BAR);
+      if (handOn) out.push(Buffer.concat([handOn, BAR]));
     }
     pending = Buffer.from(pending.subarray(start));
     if (out.length === 0) return false;
-    const data = Buffer.concat(out);
-    return realEmit.call(this, name, typeof chunk === "string" ? data.toString("utf8") : data, ...rest);
+    let emitted = false;
+    for (const data of out) {
+      let pasteId;
+      try { pasteId = JSON.parse(unescapeHelper(data.subarray(0, -1).toString("utf8")))?.HelperAPIRequest?.PasteOutcome?.payload?.pasteId; } catch {}
+      const session = pasteSessions.get(pasteId);
+      if (pasteId) pasteSessions.delete(pasteId);
+      emitted = pasteContext.run(session, () => realEmit.call(this, name, typeof chunk === "string" ? data.toString("utf8") : data, ...rest)) || emitted;
+    }
+    return emitted;
   };
 }
 
 function install() {
+  globalThis.wisprHeadlessPasteUUID = () => pasteContext.getStore();
   watchHelper();
   const Module = require("module");
   const realLoad = Module._load;

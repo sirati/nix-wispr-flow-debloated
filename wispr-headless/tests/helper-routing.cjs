@@ -14,7 +14,7 @@ const context = vm.createContext({ require, Buffer, setTimeout, clearTimeout, se
   process: { env: { XDG_CACHE_HOME: cache }, nextTick: process.nextTick, pid: process.pid } });
 const source = fs.readFileSync(path.join(__dirname, "../shim.js"), "utf8");
 vm.runInContext(source.slice(0, source.indexOf("// Nothing here may stop Wispr")) + `
-  globalThis.testing = { createPasteRouter, gateHelper, escapeHelper, unescapeHelper, patchWisprBundle, nativeNotice,
+  globalThis.testing = { createPasteRouter, gateHelper, escapeHelper, unescapeHelper, patchWisprBundle, nativeNotice, pasteContext,
     setGate(gate) { pasteGate = gate; } };
 `, context);
 const { testing } = context;
@@ -24,12 +24,15 @@ for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Bo
   test(`the shipped bundle retains correlation on both insertion paths: ${bundle}`, () => {
     const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
     new vm.Script(patched);
-    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:(\w+)\.ZZ\.uuid\}/.exec(patched);
+    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:__wisprDictationUUID\?\?globalThis\.wisprHeadlessPasteUUID\?\.\(\)\}/.exec(patched);
     assert.ok(payload, "the copy message carries the exact originating UUID");
-    const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", [payload[4]]: { ZZ: { uuid: "original-session" } } };
+    const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", __wisprDictationUUID: "original-session" };
     const notice = vm.runInNewContext(`(${payload[0]})`, env);
     assert.equal(notice.callbackOperationId, "original-session");
     assert.equal(notice.body, "completed text");
+    env.__wisprDictationUUID = undefined;
+    assert.equal(vm.runInNewContext(`(${payload[0]})`, env).callbackOperationId, undefined, "unrelated extension pastes cannot reuse a dictation session");
+    assert.match(patched, /sendVoidDictationNotification\)\(\w+,void 0,\w+\.ZZ\.uuid\)/);
     const correlation = /(\w+)\?\{transcriptEntityUuid:\1\}:"dictation"===(\w+)\.kind\?\{transcriptEntityUuid:\2\.transcriptEntityUUID\}:void 0/.exec(patched);
     assert.ok(correlation, "ordinary helper pastes carry their owner's UUID");
     const attributes = vm.runInNewContext(correlation[0], { [correlation[1]]: undefined, [correlation[2]]: { kind: "dictation", transcriptEntityUUID: "original-session" } });
@@ -42,6 +45,20 @@ test("Wispr's custom copy notification preserves its transcript for the Rust UI"
   const notice = testing.nativeNotice({ type: "VoidDictation", variant: "custom", component: "voidDictation", body: "kept text" }, "en-US");
   assert.equal(notice.op, "recover");
   assert.equal(notice.text, "kept text");
+});
+
+test("a late native paste failure keeps its UUID across async recovery callbacks", async () => {
+  const helper = new EventEmitter(), fd = new EventEmitter();
+  helper.stdin = { write() { return true; } };
+  helper.stdio = [helper.stdin, null, null, fd];
+  testing.setGate(() => false);
+  testing.gateHelper(helper);
+  const frame = (message) => testing.escapeHelper(JSON.stringify(message)) + "|";
+  helper.stdin.write(frame({ HelperAPIRequest: { uuid: "request", PasteText: { payload: { pasteId: "old-paste", logAttributes: { transcriptEntityUuid: "original-session" }, text: "old text" } } } }));
+  let observed;
+  fd.on("data", () => { observed = Promise.resolve().then(() => testing.pasteContext.getStore()); });
+  fd.emit("data", frame({ HelperAPIRequest: { uuid: "outcome", PasteOutcome: { payload: { pasteId: "old-paste", success: false } } } }));
+  assert.equal(await observed, "original-session");
 });
 
 test("a failed helper paste and its subsequent copy prompt deliver only once", () => {
