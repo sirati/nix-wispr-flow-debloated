@@ -78,13 +78,246 @@ impl Daemon {
     fn next_op(&mut self, op: &str) -> Value {
         loop {
             let v = self.next();
-            if v["op"] == "log" || (v["op"] == "hideKeys" && op != "hideKeys") {
+            if v["op"] == "log"
+                || (v["op"] == "hideKeys" && op != "hideKeys")
+                || (v["op"] == "cloudStart" && op != "cloudStart")
+                || (v["op"] == "chunk" && op == "wisprKey")
+            {
                 continue;
             }
             assert_eq!(v["op"], op, "unexpected message {v}");
             return v;
         }
     }
+}
+
+#[test]
+fn cloud_capture_queues_while_processing_or_retrying_then_replays_every_sample() {
+    let (_tone, path, expected) = tone_file(5000);
+    let mut daemon = Daemon::start(&format!("cat {path}"));
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    assert_eq!(daemon.next_op("wisprKey"), wispr_key("ptt", true));
+    daemon.send(r#"{"op":"start","uuid":"first"}"#);
+    daemon.next_op("started");
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    assert_eq!(daemon.next_op("wisprKey"), wispr_key("ptt", false));
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(r#"{"op":"status","value":"processing"}"#);
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    daemon.quiet(100);
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.send(r#"{"op":"cloudState","value":"retrying"}"#);
+    daemon.quiet(50);
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
+    assert_eq!(daemon.next_op("wisprKey"), wispr_key("ptt", true));
+    daemon.send(r#"{"op":"start","uuid":"second"}"#);
+    daemon.next_op("started");
+    let mut audio = Vec::new();
+    let mut index = 0;
+    loop {
+        let event = daemon.next();
+        match event["op"].as_str() {
+            Some("log") => {}
+            Some("chunk") => {
+                assert_eq!(event["uuid"], "second");
+                assert_eq!(event["index"], index);
+                index += 1;
+                audio.extend(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(event["pcm"].as_str().unwrap())
+                        .unwrap(),
+                );
+            }
+            Some("wisprKey") => {
+                assert_eq!(event, wispr_key("ptt", false));
+                daemon.send(r#"{"op":"stop"}"#);
+            }
+            Some("done") => break,
+            _ => panic!("unexpected queue event {event}"),
+        }
+    }
+    assert_eq!(
+        audio, expected,
+        "all audio recorded while Wispr was busy is replayed exactly once"
+    );
+}
+
+// The test executable doubles as a model server, so target tests need no
+// Python or downloaded model and exercise the real socket/process lifecycle.
+#[test]
+fn fake_model_server() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    let Some(socket) = std::env::var_os("WISPR_TEST_MODEL_SOCKET") else {
+        return;
+    };
+    if let Some(log) = std::env::var_os("WISPR_TEST_MODEL_STARTS") {
+        use std::fs::OpenOptions;
+        writeln!(
+            OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(log)
+                .unwrap(),
+            "{}",
+            std::process::id()
+        )
+        .unwrap();
+    }
+    let listener = UnixListener::bind(socket).unwrap();
+    for stream in listener.incoming() {
+        let mut stream = stream.unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some(n) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = n.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let body = if first.contains("/tokenize") {
+            r#"{"tokens":[1]}"#
+        } else if first.contains("/transcriptions") {
+            std::thread::sleep(Duration::from_millis(200));
+            r#"{"text":"local words"}"#
+        } else {
+            "{}"
+        };
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    }
+}
+
+fn working_asr_config() -> (tempfile::TempDir, String, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let server = dir.path().join("fake-model");
+    let starts = dir.path().join("starts");
+    let executable = std::env::current_exe().unwrap();
+    std::fs::write(&server, format!("#!/bin/sh\nexport WISPR_TEST_MODEL_SOCKET=\"$6\"\nexport WISPR_TEST_MODEL_STARTS='{}'\nexec '{}' --exact fake_model_server --nocapture\n", starts.display(), executable.display())).unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.path().join("asr.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({ "server": server, "idleSeconds": 0 }).to_string(),
+    )
+    .unwrap();
+    let config = config.to_string_lossy().into_owned();
+    let starts = starts.to_string_lossy().into_owned();
+    (dir, config, starts)
+}
+
+#[test]
+fn local_alternative_inserts_once_and_suppresses_the_later_cloud_result() {
+    let (_tone, path, _) = tone_file(16000);
+    let (_model, config, _) = working_asr_config();
+    let mut daemon = Daemon::start_with(&format!("cat {path}"), &["--asr-config", &config]);
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = daemon.next_op("cloudStart")["id"].as_u64().unwrap();
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"start","uuid":"race"}"#);
+    daemon.next_op("started");
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    assert_eq!(daemon.next_op("insertTranscript")["text"], "local words");
+    assert_eq!(daemon.next_op("transcript")["text"], "local words");
+    daemon.send(
+        r#"{"op":"cloudTranscript","request":"late","uuid":"race","text":"later cloud words"}"#,
+    );
+    let delivery = daemon.next_op("cloudDelivery");
+    assert_eq!(delivery["applied"], true);
+    assert_eq!(delivery["fallback"], false);
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
+    daemon.send(
+        r#"{"op":"cloudTranscript","request":"even-later","uuid":"race","text":"duplicate"}"#,
+    );
+    assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
+}
+
+#[test]
+fn overlapping_local_dictations_share_one_model_process() {
+    let (_tone, path, _) = tone_file(16000);
+    let (_model, config, starts) = working_asr_config();
+    let mut daemon = Daemon::start_with(&format!("cat {path}"), &["--asr-config", &config]);
+    for _ in 0..2 {
+        daemon.send(r#"{"op":"dictate","backend":"local"}"#);
+        std::thread::sleep(Duration::from_millis(50));
+        daemon.send(r#"{"op":"dictateEnd"}"#);
+    }
+    for _ in 0..2 {
+        assert_eq!(daemon.next_op("insertTranscript")["text"], "local words");
+        assert_eq!(daemon.next_op("transcript")["text"], "local words");
+    }
+    assert_eq!(
+        std::fs::read_to_string(starts).unwrap().lines().count(),
+        1,
+        "the weights are loaded only once"
+    );
+}
+
+#[test]
+fn cloud_wins_once_while_the_local_alternative_is_still_processing() {
+    let (_tone, path, _) = tone_file(16000);
+    let (_model, config, _) = working_asr_config();
+    let mut daemon = Daemon::start_with(&format!("cat {path}"), &["--asr-config", &config]);
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let id = daemon.next_op("cloudStart")["id"].as_u64().unwrap();
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"start","uuid":"cloud-wins"}"#);
+    daemon.next_op("started");
+    std::thread::sleep(Duration::from_millis(100));
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(&format!(r#"{{"op":"localAlternative","id":{id}}}"#));
+    daemon.send(
+        r#"{"op":"cloudTranscript","request":"winner","uuid":"cloud-wins","text":"cloud words"}"#,
+    );
+    assert_eq!(daemon.next_op("cloudDelivery")["fallback"], true);
+    daemon.send(&format!(
+        r#"{{"op":"cloudState","value":"idle","id":{id}}}"#
+    ));
+    daemon.quiet(500);
+    daemon.send(r#"{"op":"cloudTranscript","request":"duplicate","uuid":"cloud-wins","text":"cloud words"}"#);
+    assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
+}
+
+#[test]
+fn a_cancel_before_wispr_starts_never_delivers_or_holds_its_key() {
+    let (_tone, path, _) = tone_file(1600);
+    let mut daemon = Daemon::start(&format!("cat {path}"));
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"dictateCancel"}"#);
+    assert_eq!(daemon.next_op("click")["action"], "cancel");
+    assert_eq!(daemon.next_op("wisprKey"), wispr_key("ptt", false));
+    daemon.send(r#"{"op":"start","uuid":"cancelled-before-start"}"#);
+    daemon.next_op("started");
+    assert_eq!(daemon.next_op("click")["action"], "cancel");
+    assert_eq!(daemon.next_op("wisprKey"), wispr_key("ptt", false));
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    daemon.send(r#"{"op":"cloudTranscript","request":"cancelled","uuid":"cancelled-before-start","text":"discard"}"#);
+    assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
 }
 
 /// Run against the SDK's real broker, isolated from the user's service:
@@ -161,7 +394,7 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     );
     daemon.send(r#"{"op":"stop"}"#);
     daemon.next_op("done");
-    daemon.send(r#"{"op":"status","value":"idle"}"#);
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
     // The next dictation may start before the older transcript arrives.
     daemon.send(r#"{"op":"start","uuid":"declined"}"#);
     daemon.next_op("started");
@@ -178,7 +411,7 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     let result = daemon.next_op("cloudDelivery");
     assert_eq!(result["applied"], true);
     assert_eq!(result["fallback"], false);
-    daemon.send(r#"{"op":"status","value":"idle"}"#);
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
 
     daemon.send(
         r#"{"op":"cloudTranscript","request":"two","uuid":"declined","text":"ordinary paste"}"#,
@@ -200,6 +433,46 @@ fn broker_routes_to_the_original_app_and_falls_back_only_on_decline() {
     assert_eq!(result["applied"], false);
     assert_eq!(result["fallback"], false);
     assert_eq!(result["error"], "field destroyed");
+
+    daemon.send(r#"{"op":"cloudState","value":"idle"}"#);
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let busy_id = daemon.next_op("cloudStart")["id"].as_u64().unwrap();
+    daemon.next_op("wisprKey");
+    let busy = offer(&b);
+    b.respond(&busy, true, AudioFeatures::default()).unwrap();
+    daemon.send(r#"{"op":"start","uuid":"busy"}"#);
+    daemon.next_op("started");
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    a.activate().unwrap();
+    daemon.send(r#"{"op":"dictate","backend":"wispr"}"#);
+    let queued = offer(&a); // Offered now, before Wispr can start this job.
+    a.respond(&queued, true, AudioFeatures::default()).unwrap();
+    daemon.send(r#"{"op":"dictateEnd"}"#);
+    daemon.quiet(50);
+    b.activate().unwrap();
+    daemon.send(&format!(
+        r#"{{"op":"cloudState","value":"idle","id":{busy_id}}}"#
+    ));
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"start","uuid":"queued"}"#);
+    daemon.next_op("started");
+    daemon.next_op("wisprKey");
+    daemon.send(r#"{"op":"stop"}"#);
+    daemon.next_op("done");
+    // A stale completion cannot release the newer job's Wispr slot.
+    daemon.send(&format!(
+        r#"{{"op":"cloudState","value":"idle","id":{busy_id}}}"#
+    ));
+    daemon.send(r#"{"op":"cloudTranscript","request":"queued-delivery","uuid":"queued","text":"original queued app"}"#);
+    assert!(
+        matches!(event(&a), BrokerEvent::Transcript { transcript, .. } if transcript.text == "original queued app")
+    );
+    a.acknowledge(&queued, true, None).unwrap();
+    assert_eq!(daemon.next_op("cloudDelivery")["applied"], true);
+    assert!(b.next_event(Duration::from_millis(50)).unwrap().is_none());
 }
 
 impl Drop for Daemon {
@@ -413,9 +686,11 @@ fn broken_asr_config() -> (tempfile::TempDir, String) {
 
 #[test]
 fn a_dictation_of_our_own_for_wispr_holds_its_push_to_talk_key() {
-    let mut d = Daemon::start("true");
+    let mut d = Daemon::start("sleep 30");
     d.send(r#"{"op":"dictate","backend":"wispr"}"#);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.send(r#"{"op":"start","uuid":"owned"}"#);
+    d.next_op("started");
     d.send(r#"{"op":"dictateEnd"}"#);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
 }
@@ -561,11 +836,13 @@ fn wispr_s_shortcut_keys_are_hidden_from_wispr() {
 
 #[test]
 fn holding_the_wispr_shortcut_holds_wispr_s_push_to_talk_key() {
-    let mut d = Daemon::with_keys("true", &[]);
+    let mut d = Daemon::with_keys("sleep 30", &[]);
     d.key(RIGHT_ALT, true);
     // Not before the press is a dictation (200 ms).
     d.quiet(120);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.send(r#"{"op":"start","uuid":"owned"}"#);
+    d.next_op("started");
     d.key(RIGHT_ALT, false);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
     // A tap: nothing at all.
@@ -575,12 +852,13 @@ fn holding_the_wispr_shortcut_holds_wispr_s_push_to_talk_key() {
 
 #[test]
 fn a_double_press_presses_wispr_s_hands_free_key_and_any_shortcut_ends_it() {
-    let mut d = Daemon::with_keys("true", &[]);
+    let mut d = Daemon::with_keys("sleep 30", &[]);
     d.tap(RIGHT_ALT);
     std::thread::sleep(Duration::from_millis(80));
     d.key(RIGHT_ALT, true);
-    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", true));
-    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", false));
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.send(r#"{"op":"start","uuid":"owned"}"#);
+    d.next_op("started");
     d.key(RIGHT_ALT, false);
     // Wispr reports its dictation as it would.
     d.send(r#"{"op":"status","value":"initializing"}"#);
@@ -590,8 +868,7 @@ fn a_double_press_presses_wispr_s_hands_free_key_and_any_shortcut_ends_it() {
     // The local shortcut stops it, as Wispr's own key would, and starts
     // nothing of its own.
     d.key(RIGHT_META, true);
-    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", true));
-    assert_eq!(d.next_op("wisprKey"), wispr_key("popo", false));
+    assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
     std::thread::sleep(Duration::from_millis(400));
     d.key(RIGHT_META, false);
     d.send(r#"{"op":"status","value":"processing"}"#);
@@ -632,6 +909,8 @@ fn a_local_dictation_ends_itself_at_the_time_limit() {
     assert!(f["error"].as_str().unwrap().contains("llama-server"), "{f}");
     d.key(RIGHT_ALT, true);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.send(r#"{"op":"start","uuid":"owned"}"#);
+    d.next_op("started");
     d.key(RIGHT_ALT, false);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
 }
@@ -653,6 +932,8 @@ fn the_log_file_records_the_dictations() {
     );
     d.key(RIGHT_ALT, true);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", true));
+    d.send(r#"{"op":"start","uuid":"owned"}"#);
+    d.next_op("started");
     d.key(RIGHT_ALT, false);
     assert_eq!(d.next_op("wisprKey"), wispr_key("ptt", false));
     let text = std::fs::read_to_string(&log).unwrap();

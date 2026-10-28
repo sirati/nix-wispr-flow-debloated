@@ -36,6 +36,7 @@ use crate::wave;
 pub const BOTTOM_MARGIN: f64 = 10.0;
 pub const FRAME: Duration = Duration::from_millis(16);
 /// The largest thing drawn (a notification), for a fixed-size window.
+#[cfg(target_os = "linux")]
 pub const WINDOW_SIZE: (f64, f64) = (NOTICE_MAX_WIDTH, NOTICE_HEIGHT);
 const HANDS_FREE: (f64, f64) = (102.5, 30.0);
 
@@ -105,7 +106,7 @@ impl Mode {
             Mode::HandsFree => HANDS_FREE,
             Mode::Processing => (98.0, 30.0),
             Mode::Error => (91.0, 30.0),
-            Mode::Notice => WINDOW_SIZE,
+            Mode::Notice => (NOTICE_MAX_WIDTH, NOTICE_HEIGHT),
         }
     }
 }
@@ -113,6 +114,7 @@ impl Mode {
 /// Something the bar reports to the shim.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BarEvent {
+    LocalAlternative(u64),
     /// "start", "stop" or "cancel".
     Click(&'static str),
     /// A notification button, by index.
@@ -202,6 +204,7 @@ pub fn spinner_alpha(t: f64, i: usize) -> f64 {
 
 /// Commands for the bar.
 pub enum PillCommand {
+    Processing(Vec<Processing>),
     Destination(Option<std::sync::Arc<crate::icon::Icon>>),
     Status(String),
     Popo,
@@ -236,6 +239,21 @@ pub enum PillCommand {
     },
     /// This dictation goes to the local model: its fill until the bar rests.
     Local,
+}
+
+#[derive(Clone)]
+pub struct Processing {
+    pub id: u64,
+    pub local: bool,
+    pub retry: bool,
+    pub queued: bool,
+    pub icon: Option<std::sync::Arc<crate::icon::Icon>>,
+}
+
+pub struct PlacedIcon {
+    pub icon: std::sync::Arc<crate::icon::Icon>,
+    pub x: f64,
+    pub y: f64,
 }
 
 /// A rectangle with rounded corners, rotated about its centre; CSS pixels,
@@ -313,7 +331,7 @@ pub struct Frame {
     /// The pill first, then everything on it.
     pub shapes: Vec<Shape>,
     pub texts: Vec<Text>,
-    pub icon: Option<std::sync::Arc<crate::icon::Icon>>,
+    pub icons: Vec<PlacedIcon>,
     /// Whether the next frame differs (animation running).
     pub animated: bool,
     /// For the shim.
@@ -355,6 +373,9 @@ pub struct BarState {
     local: bool,
     destination: Option<std::sync::Arc<crate::icon::Icon>>,
     icon_shown: bool,
+    processing: Vec<Processing>,
+    main_origin: (f64, f64),
+    retry_buttons: Vec<(u64, Shape)>,
 }
 
 impl Default for BarState {
@@ -378,6 +399,9 @@ impl Default for BarState {
             local: false,
             destination: None,
             icon_shown: false,
+            processing: Vec::new(),
+            main_origin: (0., 0.),
+            retry_buttons: Vec::new(),
         }
     }
 }
@@ -408,6 +432,7 @@ impl BarState {
 
     pub fn apply(&mut self, command: PillCommand) {
         match command {
+            PillCommand::Processing(jobs) => self.processing = jobs,
             PillCommand::Destination(icon) => self.destination = icon,
             PillCommand::Status(s) => match s.as_str() {
                 "initializing" => {
@@ -518,6 +543,17 @@ impl BarState {
 
     /// A left click at `(x, y)` CSS pixels in the pill drawn last.
     pub fn click(&mut self, x: f64, y: f64) -> Option<BarEvent> {
+        if let Some((id, _)) = self
+            .retry_buttons
+            .iter()
+            .find(|(_, shape)| shape.contains(x, y))
+        {
+            return Some(BarEvent::LocalAlternative(*id));
+        }
+        let (x, y) = (x - self.main_origin.0, y - self.main_origin.1);
+        if y < 0. {
+            return None;
+        }
         if self.shown == Mode::Notice {
             let n = self.notice.as_mut()?;
             if n.clicked.is_some() {
@@ -601,13 +637,123 @@ impl BarState {
                 shape.cx += 26.0;
             }
         }
+        let mut icons = Vec::new();
+        let base_size = size;
+        let row_width = |job: &Processing| {
+            98.0 + if job.icon.is_some() { 26.0 } else { 0.0 } + if job.retry { 30.0 } else { 0.0 }
+        };
+        let width = self.processing.iter().map(row_width).fold(size.0, f64::max);
+        let extra = if self.enabled {
+            self.processing.len() as f64 * 38.0
+        } else {
+            0.0
+        };
+        self.main_origin = ((width - base_size.0) / 2.0, extra);
+        for shape in &mut shapes {
+            shape.cx += self.main_origin.0;
+            shape.cy += extra;
+        }
+        for text in &mut texts {
+            text.x += self.main_origin.0;
+            text.top += extra;
+        }
+        if let Some(icon) = &icon {
+            icons.push(PlacedIcon {
+                icon: icon.clone(),
+                x: self.main_origin.0 + 8.0,
+                y: extra + 6.0,
+            });
+        }
+        self.retry_buttons.clear();
+        if self.enabled {
+            for (index, job) in self.processing.iter().enumerate() {
+                let w = row_width(job);
+                let (x, y) = ((width - w) / 2.0, index as f64 * 38.0);
+                let color = if job.local {
+                    self.local_fill
+                } else {
+                    self.wispr_fill
+                };
+                shapes.push(Shape::rect(
+                    x,
+                    y,
+                    w,
+                    30.,
+                    15.,
+                    [color[0], color[1], color[2], 0xff],
+                ));
+                let inset = if let Some(icon) = &job.icon {
+                    icons.push(PlacedIcon {
+                        icon: icon.clone(),
+                        x: x + 8.,
+                        y: y + 6.,
+                    });
+                    26.
+                } else {
+                    0.
+                };
+                let spinner_x = x + inset + 45.;
+                for i in 0..8 {
+                    let angle = i as f64 * std::f64::consts::PI / 4.;
+                    let alpha = if job.queued {
+                        0x70
+                    } else {
+                        (spinner_alpha(t, i) * 255.) as u8
+                    };
+                    shapes.push(Shape {
+                        cx: spinner_x + angle.cos() * 6.,
+                        cy: y + 15. + angle.sin() * 6.,
+                        w: 3.,
+                        h: 2.,
+                        angle,
+                        radius: 1.,
+                        fill: [SPINNER[0], SPINNER[1], SPINNER[2], alpha],
+                        border: None,
+                    });
+                }
+                if job.retry {
+                    let button =
+                        Shape::rect(x + w - 27., y + 4., 22., 22., 11., [0x15, 0x80, 0x3d, 0xff]);
+                    let (cx, cy) = (button.cx, button.cy);
+                    shapes.push(button);
+                    self.retry_buttons.push((job.id, button));
+                    for i in 0..8 {
+                        let a = (i as f64 * 35. + 20.).to_radians();
+                        let b = ((i + 1) as f64 * 35. + 20.).to_radians();
+                        shapes.push(Shape::line(
+                            (cx + a.cos() * 5., cy + a.sin() * 5.),
+                            (cx + b.cos() * 5., cy + b.sin() * 5.),
+                            1.4,
+                            [0xff; 4],
+                        ));
+                    }
+                    shapes.push(Shape::line(
+                        (cx + 5., cy - 4.),
+                        (cx + 5., cy),
+                        1.5,
+                        [0xff; 4],
+                    ));
+                    shapes.push(Shape::line(
+                        (cx + 5., cy),
+                        (cx + 1., cy - 1.),
+                        1.5,
+                        [0xff; 4],
+                    ));
+                }
+            }
+        }
+        size = (width, base_size.1 + extra);
         Frame {
-            mode,
+            mode: if extra > 0. && mode == Mode::Hidden {
+                Mode::Processing
+            } else {
+                mode
+            },
             size,
-            icon,
+            icons,
             shapes,
             texts,
-            animated,
+            animated: animated || extra > 0.,
             events,
         }
     }
@@ -875,6 +1021,51 @@ pub fn over(top: [u8; 4], bottom: [u8; 4]) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn processing_stacks_above_recording_and_green_buttons_keep_their_job() {
+        use super::*;
+        let mut state = BarState::default();
+        state.apply(PillCommand::Status("listening".into()));
+        state.apply(PillCommand::Processing(vec![
+            Processing {
+                id: 11,
+                local: false,
+                retry: true,
+                queued: false,
+                icon: None,
+            },
+            Processing {
+                id: 12,
+                local: false,
+                retry: false,
+                queued: true,
+                icon: None,
+            },
+            Processing {
+                id: 13,
+                local: true,
+                retry: false,
+                queued: false,
+                icon: None,
+            },
+        ]));
+        let frame = state.frame(Instant::now(), &|_, _, _| 0., None);
+        assert_eq!(frame.size.1, 30. + 3. * 38.);
+        assert_eq!(state.retry_buttons.len(), 1);
+        let button = state.retry_buttons[0].1;
+        assert_eq!(button.fill, [0x15, 0x80, 0x3d, 0xff]);
+        assert_eq!(
+            state.click(button.cx, button.cy),
+            Some(BarEvent::LocalAlternative(11))
+        );
+        assert_eq!(
+            state.click(frame.size.0 / 2., 3. * 38. + 15.),
+            Some(BarEvent::Click("stop"))
+        );
+        assert_eq!(state.click(frame.size.0 / 2., 76. + 15.), None);
+        state.apply(PillCommand::Processing(vec![]));
+        assert_eq!(state.frame(Instant::now(), &|_, _, _| 0., None).size.1, 30.);
+    }
+    #[test]
     fn destination_icon_expands_content_and_preserves_hands_free_buttons() {
         let mut state = super::BarState::default();
         state.apply(super::PillCommand::Popo);
@@ -887,7 +1078,7 @@ mod tests {
         ))));
         let routed = state.frame(now, &measure, None);
         assert_eq!(routed.size.0, plain.size.0 + 26.0);
-        assert!(routed.icon.is_some());
+        assert_eq!(routed.icons.len(), 1);
         let (cancel, accept) = super::buttons();
         assert_eq!(
             state.click(cancel + 26.0, 15.0),
@@ -898,9 +1089,9 @@ mod tests {
             Some(super::BarEvent::Click("stop"))
         );
         state.apply(super::PillCommand::Status("processing".into()));
-        assert!(state.frame(now, &measure, None).icon.is_some());
+        assert_eq!(state.frame(now, &measure, None).icons.len(), 1);
         state.apply(super::PillCommand::Status("idle".into()));
-        assert!(state.frame(now, &measure, None).icon.is_none());
+        assert!(state.frame(now, &measure, None).icons.is_empty());
     }
 
     use super::*;

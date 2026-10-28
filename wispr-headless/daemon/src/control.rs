@@ -40,15 +40,6 @@ pub enum WisprKey {
     Popo,
 }
 
-impl WisprKey {
-    pub fn name(self) -> &'static str {
-        match self {
-            WisprKey::Ptt => "ptt",
-            WisprKey::Popo => "popo",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     /// A hold binding went down: perhaps a dictation, so record silently.
@@ -67,6 +58,8 @@ pub enum Input {
     WisprPopo,
     /// Wispr asks to record (`dictation:audioStart`).
     WisprStart,
+    /// Wispr stopped an owned capture before its shortcut was released.
+    CloudStopped,
     /// The local dictation's microphone or model failed while it recorded.
     LocalFailed(String),
     /// A local dictation's transcription is done.
@@ -88,7 +81,9 @@ pub enum Action {
     /// Drop that recording.
     DropEarly,
     /// Start a local dictation with the early recording, if there is one.
-    StartLocal { hands_free: bool },
+    StartLocal {
+        hands_free: bool,
+    },
     /// Stop recording; transcribe the rest (then Input::Transcribed).
     EndLocal,
     /// Stop the local dictation untranscribed, keeping it for a while for
@@ -124,9 +119,14 @@ enum Phase {
     /// A hold binding is down, not yet a dictation; recording silently.
     Armed,
     /// A local dictation records.
-    Local { hands_free: bool, since: Instant },
+    Local {
+        hands_free: bool,
+        since: Instant,
+    },
     /// Wispr's dictation, started with its shortcut keys by us.
-    Wispr { hands_free: bool },
+    Wispr {
+        hands_free: bool,
+    },
     /// The rest of a gesture that started nothing: its end ends nothing.
     Swallow,
 }
@@ -208,6 +208,12 @@ impl Control {
     pub fn input(&mut self, input: Input, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         match input {
+            Input::CloudStopped => {
+                self.phase = Phase::Idle;
+                self.wispr_recording = false;
+                self.release_ptt(&mut out);
+                out.push(Action::ResetShortcut);
+            }
             Input::Down(_) => match self.phase {
                 Phase::Idle if self.free() => {
                     self.phase = Phase::Armed;
@@ -215,7 +221,9 @@ impl Control {
                 }
                 Phase::Idle => {
                     if self.wispr_recording && self.wispr_hands_free {
-                        out.push(Action::Log("a press stops Wispr's hands-free dictation".into()));
+                        out.push(Action::Log(
+                            "a press stops Wispr's hands-free dictation".into(),
+                        ));
                         self.press_popo(&mut out);
                     } else {
                         out.push(Action::Log("a press while Wispr records: ignored".into()));
@@ -693,7 +701,9 @@ mod tests {
                 BarStatus(s) => self.bar.push(s),
                 BarHandsFree => self.bar.push("handsFree"),
                 ResetShortcut => {
-                    let events = self.chord.key(crate::hotkey::RESET, true, self.at(self.now));
+                    let events = self
+                        .chord
+                        .key(crate::hotkey::RESET, true, self.at(self.now));
                     assert!(events.is_empty());
                 }
                 Log(m) => self.log.push(m),
@@ -927,7 +937,10 @@ mod tests {
         assert_eq!(s.finishing, 1);
         s.down(1_100, COMMAND);
         s.advance(1_400);
-        assert!(s.local, "the next one records while the first is transcribed");
+        assert!(
+            s.local,
+            "the next one records while the first is transcribed"
+        );
         // The first one's text does not take the bar from the second.
         s.transcribed(true);
         assert_eq!(s.bar.last(), Some(&"local"));
@@ -1082,7 +1095,11 @@ mod tests {
         assert_eq!(s.refused, 1);
         assert!(s.clicks.contains(&"cancel"));
         assert!(s.local, "the local dictation goes on");
-        assert_eq!(s.bar.last(), Some(&"local"), "Wispr's status did not take the bar");
+        assert_eq!(
+            s.bar.last(),
+            Some(&"local"),
+            "Wispr's status did not take the bar"
+        );
         s.up(3_000, COMMAND);
         s.settle(4_000);
     }

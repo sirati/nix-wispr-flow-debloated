@@ -40,6 +40,8 @@ const got = [];
 const loaded = [];
 const acks = new Map(); // window id -> count
 const chunks = [];
+const daemonEvents = [];
+globalThis.wisprHeadlessObserveDaemonEvent = (event) => daemonEvents.push(event);
 let started = null;
 let done = null;
 let gone = 0;
@@ -99,13 +101,13 @@ app.whenReady().then(async () => {
   await wait(100);
   check(updateAnswer === "none", `update checks find no update (${updateAnswer})`);
 
-  // A click on the Rust bar reaches the app as Wispr's own start click.
+  // The resting bar begins capture immediately, even before Wispr starts.
   let xdotool = null;
   try { xdotool = execSync("command -v xdotool").toString().trim(); } catch {}
   if (xdotool) {
     execSync(`${xdotool} mousemove 640 786 click 1`); // the resting bar: 40x8 at 10 px above the bottom of the 1280x800 screen
-    await until("click", () => startClicks > 0, 3_000);
-    check(startClicks === 1, `a click on the resting bar arrives as status:startClicked (${startClicks})`);
+    await until("click", () => daemonEvents.some((event) => event.op === "cloudStart"), 3_000);
+    check(daemonEvents.some((event) => event.op === "cloudStart"), "a resting-bar click starts its own retained cloud capture");
   } else {
     console.log("SKIP bar click (no xdotool)");
   }
@@ -174,7 +176,7 @@ app.whenReady().then(async () => {
   // target both retain text in the Rust bubble, including after idle IPC.
   status.webContents.send("notification:show", {
     type: "VoidDictation", component: "voidDictation", variant: "custom",
-    body: "cloud recovery text", callbackOperationId: "dict-1", timeout: 3000,
+    body: "cloud recovery text", callbackOperationId: "unrelated-copy", timeout: 3000,
   });
   await wait(400);
   check(renderers() === 0, "Wispr's custom copy prompt stays in Rust");
@@ -192,6 +194,47 @@ app.whenReady().then(async () => {
     await wait(800);
     check(renderers() === 0, "both Copy actions leave the status renderer unloaded");
   }
+
+  // Two unfinished jobs stay in native processing rows. A green icon starts
+  // local recognition on the retained audio without cancelling cloud work.
+  const command = globalThis.wisprHeadlessDaemonCommand;
+  command({ op: "dictate", backend: "wispr" });
+  await until("queued cloud started", () => daemonEvents.filter((event) => event.op === "cloudStart").length >= 2);
+  hub.webContents.send("dictation:audioStart", { transcriptionEntityUuid: "stack-1" });
+  await until("stack recording", () => started?.transcriptionEntityUuid === "stack-1");
+  await wait(100);
+  command({ op: "dictateEnd" });
+  hub.webContents.send("dictation:audioStop");
+  status.webContents.send("status:dictationStatus", "processing");
+  await until("stack done", () => done?.transcriptionEntityUuid === "stack-1");
+  command({ op: "dictate", backend: "wispr" });
+  await wait(100);
+  command({ op: "dictateEnd" });
+  await wait(300);
+  if (xdotool) {
+    const before = daemonEvents.length;
+    execSync(`${xdotool} mousemove 688 721 click 1`);
+    await until("local alternative", () => daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed")));
+    const attempted = daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed"));
+    check(attempted, "the upper processing bubble's green icon starts local recognition");
+    if (!attempted) console.log("green button diagnostics", JSON.stringify(daemonEvents.slice(before)));
+    check(cancelled === "user_action_cancel_button", "the green icon does not cancel Wispr");
+  }
+  callback = null;
+  status.webContents.send("status:dictationStatus", "error");
+  status.webContents.send("notification:show", { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] });
+  await until("automatic retry", () => callback?.type === "TranscriptionError", 3000);
+  check(callback?.callback === "retry_last_text", "Wispr's error automatically invokes its real Retry action");
+  check(renderers() === 0, "queued processing and Retry keep Chromium unloaded");
+  status.webContents.send("status:dictationStatus", "processing");
+  status.webContents.send("status:dictationStatus", "idle");
+  await until("second queued job", () => daemonEvents.filter((event) => event.op === "cloudStart").length >= 3);
+  hub.webContents.send("dictation:audioStart", { transcriptionEntityUuid: "stack-2" });
+  await until("second replay started", () => started?.transcriptionEntityUuid === "stack-2");
+  hub.webContents.send("dictation:audioStop");
+  await until("second replay finished", () => done?.transcriptionEntityUuid === "stack-2");
+  status.webContents.send("status:dictationStatus", "idle");
+  await wait(300);
 
   // A notification needs the real status page.
   status.webContents.send("notification:show", { type: "tip" });

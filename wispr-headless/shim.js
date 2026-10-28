@@ -234,6 +234,7 @@ function startDaemon(resourcesPath, onEvent, onExit) {
   readline.createInterface({ input: child.stdout }).on("line", (line) => {
     let msg;
     try { msg = JSON.parse(line); } catch { return; }
+    if (process.env.WISPR_HEADLESS_TEST_HOOKS) globalThis.wisprHeadlessObserveDaemonEvent?.(msg);
     if (msg.op === "log") trace({ ev: "daemon.log", msg: String(msg.msg).slice(0, 200) });
     else onEvent(msg);
   });
@@ -292,6 +293,42 @@ function createPasteRouter(send, alive, timeout = 65_000) {
       for (const done of requests.values()) done({ applied: false, error: "dictation daemon disconnected" });
       requests.clear();
     },
+  };
+}
+
+function createCloudRetry(send, callback, delay = 1000) {
+  let active = null, timer = null, attempt = 0, notification = null, retrying = false;
+  const clear = () => { if (timer) clearTimeout(timer); timer = null; };
+  const retry = () => {
+    if (active === null || timer) return;
+    retrying = true;
+    send({ op: "cloudState", value: "retrying", id: active });
+    timer = setTimeout(() => {
+      timer = null;
+      if (active === null) return;
+      const payload = notification ?? { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] };
+      callback(payload);
+      // Wispr may swallow a failed retry without another status event.
+      if (retrying) retry();
+    }, Math.min(30000, delay * 2 ** Math.min(attempt++, 5)));
+  };
+  return {
+    get active() { return active; },
+    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; },
+    status(value) {
+      if (active === null) return;
+      if (value === "error") retry();
+      else if (["initializing", "listening", "stopping", "processing", "retrying"].includes(value)) { retrying = false; clear(); }
+      else if (value === "idle" || value === "dismissed") {
+        const id = active; clear(); active = null; send({ op: "cloudState", value, id });
+      }
+    },
+    notice(payload) {
+      if (active === null || !["TranscriptionError", "NoInternet", "TranscriptCurrentlyProcessing", "ProcessingDelayNotification"].includes(payload?.type)) return false;
+      if (payload.type === "TranscriptionError" || payload.type === "NoInternet") { notification = payload.type === "TranscriptionError" ? payload : null; retry(); }
+      return true;
+    },
+    close() { clear(); active = null; retrying = false; },
   };
 }
 
@@ -565,6 +602,13 @@ function build(electron) {
   let headless = true;
   let session = null; // current dictation uuid
   let notice = null; // the notification the Rust bar shows (Wispr's payload)
+  let cloudStartedAt = 0;
+  let cloudReleaseTimer = null;
+  let cloudCancelled = false;
+  const clearCloudRelease = () => {
+    if (cloudReleaseTimer) clearTimeout(cloudReleaseTimer);
+    cloudReleaseTimer = null;
+  };
 
   const fakeEvent = (wc) => ({ sender: wc, senderFrame: null, frameId: 0, processId: 0, ports: [], returnValue: undefined, reply: () => {} });
   const emitFrom = (lazy, ch, payload) => {
@@ -573,6 +617,8 @@ function build(electron) {
   };
 
   const daemon = startDaemon(process.resourcesPath, onDaemonEvent, () => {
+    clearCloudRelease();
+    cloudRetry.close();
     brokerPastes.disconnected();
     // Wispr must not keep a key held that nobody will release.
     releaseWisprKeys();
@@ -588,6 +634,12 @@ function build(electron) {
   }
 
   const brokerPastes = createPasteRouter((message) => daemon.send(message), () => Boolean(daemon?.alive));
+  const cloudRetry = createCloudRetry((message) => daemon?.send(message), (payload) => {
+    const action = payload.actions?.find((action) => action.callback === "retry_last_text");
+    trace({ ev: "cloud.autoRetry" });
+    emitFrom(byRole.get("status"), "notification:callback", { callback: action?.callback ?? "retry_last_text", type: payload.type, callbackOperationId: payload.callbackOperationId });
+    emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
+  });
   pasteGate = (payload, done) => brokerPastes.route(payload, (result) => {
     if (!result.fallback && !result.applied) daemon?.send({ op: "recover", text: String(payload.text ?? ""), local: false });
     done(result);
@@ -767,6 +819,12 @@ function build(electron) {
     }
   }
   function sawStatus(ch, a) {
+    const previous = cloudRetry.active;
+    if (ch === "status:dictationStatus") cloudRetry.status(String(a));
+    if (previous !== null && cloudRetry.active === null) {
+      clearCloudRelease();
+      releaseWisprKeys();
+    }
     if (ch === "status:dictationStatus" && /^(idle|dismissed|error)$/.test(String(a))) {
       clickedStart = false;
       pendingEnd = null;
@@ -809,6 +867,12 @@ function build(electron) {
     const hub = byRole.get("hub");
     const uuid = msg.uuid;
     switch (msg.op) {
+      case "cloudStart":
+        clearCloudRelease();
+        cloudStartedAt = Date.now();
+        cloudCancelled = false;
+        cloudRetry.start(msg.id);
+        break;
       case "cloudDelivery": {
         brokerPastes.delivered(msg);
         break;
@@ -846,10 +910,24 @@ function build(electron) {
         if (session === uuid) session = null;
         break;
       case "click":
+        if (msg.action === "cancel") {
+          cloudCancelled = true;
+          clearCloudRelease();
+        }
         onClick(msg.action);
         break;
       case "wisprKey":
-        pressWisprKey(msg.action, Boolean(msg.down));
+        if (msg.down) { clearCloudRelease(); clickedStart = true; }
+        if (msg.action === "ptt" && !msg.down && !cloudCancelled && cloudRetry.active !== null && Date.now() - cloudStartedAt < 650) {
+          if (cloudReleaseTimer) clearTimeout(cloudReleaseTimer);
+          // Wispr cancels PTT released inside its double-tap debounce. A
+          // buffered recording has real audio even when replay takes no time.
+          const id = cloudRetry.active;
+          cloudReleaseTimer = setTimeout(() => {
+            cloudReleaseTimer = null;
+            if (cloudRetry.active === id) pressWisprKey("ptt", false);
+          }, Math.max(0, 650 - (Date.now() - cloudStartedAt)));
+        } else pressWisprKey(msg.action, Boolean(msg.down));
         break;
       case "hideKeys":
         hiddenKeys = new Set((Array.isArray(msg.keys) ? msg.keys : []).map(Number).filter(Number.isInteger));
@@ -1002,6 +1080,7 @@ function build(electron) {
       }
       if (this.role === "hub") {
         if (ch === "dictation:audioStart") {
+          cloudStartedAt = Date.now();
           session = a?.transcriptionEntityUuid ?? null;
           brokerPastes.start(session);
           trace({ ev: "rec.audioStart" });
@@ -1044,6 +1123,7 @@ function build(electron) {
           if (!this.remindersActive) return true;
         }
         if (ch === "notification:show") {
+          if (cloudRetry.notice(a)) return true;
           if (copyNotice(a)) return true;
           const n = daemon && nativeNotice(a, electron.app.getLocale());
           if (n) {
@@ -1081,6 +1161,7 @@ function build(electron) {
       updateBar(args[0].state);
     }
     if (lazy.role === "status") {
+      if (ch === "notification:show" && cloudRetry.notice(args[0])) return true;
       if (ch === "notification:show" && copyNotice(args[0])) return true;
       sawStatus(ch, args[0]);
       const cmd = barCommand(ch, args[0]);
@@ -1204,7 +1285,10 @@ function build(electron) {
 
   // Tests only: the stand-in app plays daemon messages the test daemon does
   // not send.
-  if (process.env.WISPR_HEADLESS_TEST_HOOKS) globalThis.wisprHeadlessDaemonEvent = onDaemonEvent;
+  if (process.env.WISPR_HEADLESS_TEST_HOOKS) {
+    globalThis.wisprHeadlessDaemonEvent = onDaemonEvent;
+    globalThis.wisprHeadlessDaemonCommand = (message) => daemon?.send(message);
+  }
 
   const autoUpdater = pinnedUpdater();
   return new Proxy(electron, {

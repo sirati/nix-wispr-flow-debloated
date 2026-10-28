@@ -101,12 +101,35 @@ also ends after `maxDictationSeconds` (600), or with an error if its model
 server dies. wispr-headless logs what it does, without what was said, to
 `~/Library/Logs/wispr-headless.log` on macOS and
 `$XDG_STATE_HOME/wispr-headless/log` on Linux (1 MB, then one older file).
+
+Recording and processing are independent. When Wispr is busy, the next
+cloud dictation records immediately and keeps its audio in memory. The
+daemon sends that audio to Wispr as soon as the previous invocation finishes,
+then streams any audio still being recorded. Finished recordings wait in
+order. Local dictations reuse one speech-model process, including when a
+new recording starts while an older one is still being transcribed.
+
+Each unfinished dictation has a processing bubble above the current
+recording, with its captured application's icon. Wispr's transcription
+errors automatically invoke its Retry action, with increasing delays up
+to 30 seconds between attempts. With local recognition configured, cloud
+processing bubbles also have a green circular-arrow button. It runs local
+recognition on the retained audio while Wispr continues. The first nonempty
+transcript wins one delivery; later results cannot insert a duplicate.
+Audio is released when cloud processing finishes. An active local attempt
+owns its own audio copy until it finishes.
+
+The broker chooses each dictation's destination when recording begins,
+including recordings queued for Wispr. Later focus or conversation changes
+do not retarget it. The receiving application decides how to apply the
+transcript. A failed delivery keeps the text in the native Copy prompt.
+
 On macOS,
 `lib.macWisprFlow` holds Right Option for Wispr and, with `localAsr`, Right
 Command for the local model (`hotkeys` changes that). A `wispr:` shortcut
-drives Wispr through its own push to talk and hands-free, so Wispr shows and
-behaves as on its own shortcut: the shim presses F20 (push to talk) and F19
-(hands-free), keys nobody presses, for Wispr (`wisprPushToTalkKey`,
+records through the daemon and feeds Wispr through its push-to-talk shortcut.
+The daemon handles hands-free recording itself. The shim binds F20 and F19,
+keys nobody presses, for Wispr (`wisprPushToTalkKey`,
 `wisprHandsFreeKey`), and keeps the shortcut keys themselves from Wispr.
 While wispr-headless runs, the shim binds Wispr's push to talk and hands-free
 to those keys in Wispr's settings (`rebindWisprShortcuts`), so Wispr's

@@ -8,20 +8,50 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Command {
     /// Wispr asked its Hub to start recording (`dictation:audioStart`).
-    Start { uuid: String },
+    Start {
+        uuid: String,
+    },
     /// `dictation:audioStop`.
     Stop,
+    /// Wispr released its processing slot, or entered its retry UI.
+    CloudState {
+        value: String,
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    LocalAlternative {
+        id: u64,
+    },
+    #[serde(skip)]
+    AlternativeTranscribed {
+        id: u64,
+        result: Result<String, String>,
+    },
+    #[serde(skip)]
+    AlternativeDelivered {
+        id: u64,
+        text: String,
+        result: crate::destination::Delivery,
+    },
     /// `status:dictationStatus`: initializing, listening, stopping,
     /// processing, retrying, idle, dismissed, error (others are ignored).
-    Status { value: String },
+    Status {
+        value: String,
+    },
     /// `status:popo`: the dictation is hands-free.
     Popo,
     /// `status:micSilence`.
-    Silence { value: bool },
+    Silence {
+        value: bool,
+    },
     /// `status:commandModeStatus`.
-    Commanding { active: bool },
+    Commanding {
+        active: bool,
+    },
     /// `status:setIndicatorState`; only "resting" reaches us.
-    Indicator { state: String },
+    Indicator {
+        state: String,
+    },
     /// Show a simple notification (Wispr's "condensed" layout): title,
     /// button labels, timeout in milliseconds (0: none).
     Notify {
@@ -38,9 +68,13 @@ pub enum Command {
         local: bool,
     },
     /// Ordinary insertion after the shim checked Wispr's editable input info.
-    TypeTranscript { text: String },
+    TypeTranscript {
+        text: String,
+    },
     /// Wispr's microphone ranking (`prefs.user.rankedAudioDevices`).
-    Mics { ranked: Vec<crate::mics::Ranked> },
+    Mics {
+        ranked: Vec<crate::mics::Ranked>,
+    },
     /// The dictation shortcut went down: start recording ahead of Wispr.
     Early,
     /// Another key joined the shortcut before Wispr asked to record: drop
@@ -68,7 +102,10 @@ pub enum Command {
         destination: u64,
     },
     #[serde(skip)]
-    InsertionFailed { text: String, error: String },
+    InsertionFailed {
+        text: String,
+        error: String,
+    },
     /// Final Wispr transcript, intercepted before the helper can paste it.
     CloudTranscript {
         request: String,
@@ -88,19 +125,32 @@ pub enum Command {
         icon: Option<std::sync::Arc<crate::icon::Icon>>,
     },
     /// `status:audioLevel`.
-    Level { value: f64 },
+    Level {
+        value: f64,
+    },
     /// Whether this process should draw the speech indicator. Off while
     /// Wispr's own status window is rendering.
-    Pill { enabled: bool },
+    Pill {
+        enabled: bool,
+    },
     /// Play one of Wispr's sounds: start, stop, paste, achievement, popo.
-    Sound { name: String },
+    Sound {
+        name: String,
+    },
     /// Whether Wispr shows its resting bar when idle.
-    Bar { visible: bool },
+    Bar {
+        visible: bool,
+    },
     /// `status:micActive`.
-    Mic { active: bool },
+    Mic {
+        active: bool,
+    },
     /// Tests (`--hotkey-source stdin`): a key went down or up, as the
     /// keyboard would report it (this platform's code, hotkey/keys.rs).
-    Key { key: u16, down: bool },
+    Key {
+        key: u16,
+        down: bool,
+    },
     /// Internal: what the dictation shortcut did (control.rs).
     #[serde(skip)]
     Hotkey(Vec<crate::control::Input>),
@@ -109,10 +159,14 @@ pub enum Command {
     BarClick(String),
     /// Internal: a click on a button of the bar's notice, by index.
     #[serde(skip)]
-    NoticeAction { index: usize },
+    NoticeAction {
+        index: usize,
+    },
     /// Internal: the bar's notice closed: "timeout" or "action".
     #[serde(skip)]
-    NoticeClosed { reason: String },
+    NoticeClosed {
+        reason: String,
+    },
 }
 
 /// Timing figures Wispr's Hub reports with `dictation:recordingDone`, in
@@ -138,6 +192,9 @@ pub struct Timing {
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum Event {
     Ready,
+    CloudStart {
+        id: u64,
+    },
     CloudDelivery {
         request: String,
         fallback: bool,

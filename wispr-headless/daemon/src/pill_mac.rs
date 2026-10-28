@@ -123,8 +123,10 @@ struct Bar {
     /// One layer per shape and one label per text, reused between frames.
     layers: Vec<Retained<CALayer>>,
     labels: Vec<Retained<NSTextField>>,
-    icon_view: Retained<NSImageView>,
-    icon: Option<std::sync::Arc<crate::icon::Icon>>,
+    icon_views: Vec<(
+        Retained<NSImageView>,
+        Option<std::sync::Arc<crate::icon::Icon>>,
+    )>,
     /// Measures text widths.
     measurer: Retained<NSTextField>,
     state: BarState,
@@ -167,9 +169,6 @@ impl Bar {
         canvas.setGeometryFlipped(true);
         view.layer()?.addSublayer(&canvas);
         panel.setContentView(Some(&view));
-        let icon_view = NSImageView::initWithFrame(NSImageView::alloc(mtm), start);
-        view.addSubview(&icon_view);
-        icon_view.setHidden(true);
         Some(Bar {
             mtm,
             panel,
@@ -177,8 +176,7 @@ impl Bar {
             canvas,
             layers: Vec::new(),
             labels: Vec::new(),
-            icon_view,
-            icon: None,
+            icon_views: Vec::new(),
             measurer: NSTextField::labelWithString(&NSString::from_str(""), mtm),
             state: BarState::default(),
             mode: Mode::Hidden,
@@ -278,20 +276,29 @@ impl Bar {
         }
         CATransaction::commit();
 
-        if self.icon.as_ref().map(std::sync::Arc::as_ptr)
-            != f.icon.as_ref().map(std::sync::Arc::as_ptr)
-        {
-            let image = f.icon.as_ref().and_then(|icon| {
-                NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&icon.png))
-            });
-            self.icon_view.setImage(image.as_deref());
-            self.icon = f.icon.clone();
+        while self.icon_views.len() < f.icons.len() {
+            let view = NSImageView::initWithFrame(NSImageView::alloc(self.mtm), NSRect::default());
+            self.view.addSubview(&view);
+            self.icon_views.push((view, None));
         }
-        self.icon_view.setHidden(f.icon.is_none());
-        self.icon_view.setFrame(NSRect::new(
-            NSPoint::new(8.0, f.size.1 - 24.0),
-            NSSize::new(18.0, 18.0),
-        ));
+        for ((view, saved), placed) in self.icon_views.iter_mut().zip(&f.icons) {
+            if saved.as_ref().map(std::sync::Arc::as_ptr)
+                != Some(std::sync::Arc::as_ptr(&placed.icon))
+            {
+                let image =
+                    NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(&placed.icon.png));
+                view.setImage(image.as_deref());
+                *saved = Some(placed.icon.clone());
+            }
+            view.setHidden(false);
+            view.setFrame(NSRect::new(
+                NSPoint::new(placed.x, f.size.1 - placed.y - 18.),
+                NSSize::new(18., 18.),
+            ));
+        }
+        for (view, _) in &self.icon_views[f.icons.len()..] {
+            view.setHidden(true);
+        }
         while self.labels.len() < f.texts.len() {
             let label = NSTextField::labelWithString(&NSString::from_str(""), self.mtm);
             self.view.addSubview(&label);

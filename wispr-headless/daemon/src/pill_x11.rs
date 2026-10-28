@@ -18,9 +18,9 @@ use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConnectionExt as _, CoordMode,
-    CreateGCAux, CreateWindowAux, EventMask, ImageFormat, ImageOrder, Point, PolyShape, Rectangle,
-    Window, WindowClass,
+    Arc, AtomEnum, ChangeGCAux, ClipOrdering, ColormapAlloc, ConfigureWindowAux,
+    ConnectionExt as _, CoordMode, CreateGCAux, CreateWindowAux, EventMask, ImageFormat,
+    ImageOrder, Point, PolyShape, Rectangle, Window, WindowClass,
 };
 use x11rb::protocol::Event as XEvent;
 use x11rb::rust_connection::RustConnection;
@@ -343,6 +343,29 @@ impl Surface {
     }
 
     fn draw(&mut self, f: &Frame) {
+        let height = px(f.size.1.max(WINDOW_SIZE.1), self.geo.scale);
+        if height != self.geo.height {
+            if let Ok(cookie) = self.conn.get_geometry(self.window) {
+                if let Ok(old) = cookie.reply() {
+                    let _ = self.conn.configure_window(
+                        self.window,
+                        &ConfigureWindowAux::new()
+                            .height(u32::from(height))
+                            .y(i32::from(old.y) + i32::from(self.geo.height) - i32::from(height)),
+                    );
+                    let _ = self.conn.free_pixmap(self.buffer);
+                    let _ = self.conn.create_pixmap(
+                        32,
+                        self.buffer,
+                        self.window,
+                        self.geo.width,
+                        height,
+                    );
+                    self.geo.height = height;
+                    self.input = None;
+                }
+            }
+        }
         let g = self.geo;
         self.color([0; 4]);
         let _ = self.conn.poly_fill_rectangle(
@@ -370,7 +393,8 @@ impl Surface {
                 self.fill_rotated(s, origin, fill);
             }
         }
-        if let Some(icon) = &f.icon {
+        for placed in &f.icons {
+            let icon = &placed.icon;
             let pixels = image::imageops::resize(
                 &icon.pixels,
                 px(18.0, g.scale) as u32,
@@ -394,8 +418,8 @@ impl Surface {
                 self.gc,
                 pixels.width() as u16,
                 pixels.height() as u16,
-                (origin.0 + 8.0 * g.scale).round() as i16,
-                (origin.1 + 6.0 * g.scale).round() as i16,
+                (origin.0 + placed.x * g.scale).round() as i16,
+                (origin.1 + placed.y * g.scale).round() as i16,
                 0,
                 32,
                 &data,
@@ -568,13 +592,13 @@ pub fn run(
         }
         let mut area = Rectangle::default();
         if let Some(s) = surface.as_mut() {
-            area = s.geo.body(f.size);
-            *shown_area.lock().expect("area lock poisoned") = area;
             let show = f.mode != Mode::Hidden;
             s.set_visible(show);
             if show {
                 s.draw(&f);
             }
+            area = s.geo.body(f.size);
+            *shown_area.lock().expect("area lock poisoned") = area;
         }
         last = Some((f.mode, area));
         animated = f.animated;

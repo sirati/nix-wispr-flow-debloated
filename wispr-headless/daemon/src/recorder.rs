@@ -305,6 +305,31 @@ impl Recording {
         rest
     }
 
+    pub fn finish_retained(mut self, clock_ms: f64) -> (Vec<u8>, Timing) {
+        self.source.stop();
+        let mut rest = Vec::new();
+        while let Ok(more) = self.bytes.try_recv() {
+            rest.extend_from_slice(&more);
+        }
+        let timing = Timing {
+            start_time: self.started_at,
+            stop_time: clock_ms,
+            absolute_stop_time: epoch_ms(),
+            audio_device_name: self.device.clone(),
+            mic_acquisition_succeeded: self.first_chunk.is_some() || !rest.is_empty(),
+            media_stream_setup: 0.,
+            worklet_setup: 0.,
+            first_audio_chunk_latency: self
+                .first_chunk
+                .map(|at| at.duration_since(self.started).as_secs_f64() * 1000.)
+                .unwrap_or(0.),
+            recording_time: clock_ms - self.started_at,
+            time_to_receive_last_audio_chunk: 0.,
+            recording_finish: 0.,
+        };
+        (rest, timing)
+    }
+
     fn failure(&mut self, why: &str) -> Event {
         self.source.stop();
         Event::MicFailed {

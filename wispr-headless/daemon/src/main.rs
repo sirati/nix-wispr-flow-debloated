@@ -13,6 +13,7 @@
 
 mod asr;
 mod bar;
+mod cloud;
 mod control;
 mod destination;
 mod hotkey;
@@ -436,8 +437,39 @@ struct Local {
     destination: destination::Session,
 }
 
+struct CloudCapture {
+    recording: Recording,
+    id: u64,
+    hands_free: bool,
+    level: bar::LevelScale,
+    since: Instant,
+}
+
+fn finish_cloud(
+    capture: CloudCapture,
+    cloud: &mut cloud::Queue<destination::Session>,
+    clock_ms: f64,
+) {
+    let (rest, timing) = capture.recording.finish_retained(clock_ms);
+    cloud.feed(capture.id, &rest);
+    cloud.end(capture.id, timing);
+}
+
 /// A native notice owns either an unfinished recording for Undo or completed
 /// text for Copy, for either backend.
+fn retain_cloud_event(cloud: &mut cloud::Queue<destination::Session>, id: u64, event: &Event) {
+    use base64::Engine;
+    match event {
+        Event::Chunk { pcm, .. } => {
+            if let Ok(pcm) = base64::engine::general_purpose::STANDARD.decode(pcm) {
+                cloud.feed(id, &pcm);
+            }
+        }
+        Event::Done { timing, .. } => cloud.end(id, timing.clone()),
+        _ => {}
+    }
+}
+
 struct LocalNotice {
     dictation: Option<(asr::Dictation, destination::Session)>,
     text: Option<String>,
@@ -673,6 +705,9 @@ fn main() {
                     reason: reason.to_string(),
                 }));
             }
+            BarEvent::LocalAlternative(id) => {
+                let _ = clicks.send(Some(Command::LocalAlternative { id }));
+            }
         },
     );
     // The bar only stops once serve() is done and about to exit.
@@ -882,8 +917,10 @@ fn serve(
     // The bar's notice is a cancelled local dictation's, not Wispr's.
     let mut local_notice: Option<LocalNotice> = None;
     let mut shown_destination = None;
-    let mut cloud_destinations: std::collections::HashMap<String, (destination::Session, Instant)> =
-        std::collections::HashMap::new();
+    let mut cloud = cloud::Queue::<destination::Session>::default();
+    let mut cloud_capture: Option<CloudCapture> = None;
+    let mut upstream_busy = false;
+    let mut local_processing = std::collections::BTreeMap::<u64, Option<Arc<icon::Icon>>>::new();
     let chosen = |ranked: &[mics::Ranked]| {
         let inputs = inputs.lock().expect("inputs lock poisoned");
         mics::choose(ranked, &inputs).cloned()
@@ -891,24 +928,35 @@ fn serve(
     // What control.rs is told; its answers may tell it more.
     let mut pending: std::collections::VecDeque<control::Input> = Default::default();
     loop {
-        let wait = if recording.is_some() || local.is_some() {
+        let wait = if recording.is_some() || local.is_some() || cloud_capture.is_some() {
             Duration::from_millis(5)
         } else if early.is_some() {
             Duration::from_millis(25)
-        } else if !cloud_destinations.is_empty() {
+        } else if !cloud.jobs.is_empty() {
             Duration::from_secs(1)
         } else {
             Duration::from_secs(3600)
         };
-        // A start Wispr asked for and control.rs refused.
-        let mut refused = false;
         // Wispr's bar status, for the bar if its dictation has it.
         let mut forward: Option<PillCommand> = None;
         let command = cmd_rx.recv_timeout(wait);
         match command {
             Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Some(Command::Start { uuid })) => {
+                if let Some(id) = cloud.bind(uuid.clone()) {
+                    out.send(&Event::Started { uuid });
+                    if cloud.jobs[&id].cancelled {
+                        out.send(&Event::Click {
+                            action: "cancel".into(),
+                        });
+                    }
+                    for event in cloud.events() {
+                        out.send(&event);
+                    }
+                    continue;
+                }
                 let before = ctl.describe();
+                let mut refused = cloud_capture.is_some();
                 for a in ctl.input(control::Input::WisprStart, Instant::now()) {
                     refused |= a == Action::RefuseWisprStart;
                 }
@@ -938,37 +986,52 @@ fn serve(
                     };
                     match started {
                         Ok(r) => {
-                            out.send(&Event::Started { uuid: uuid.clone() });
-                            if cloud_destinations.len() >= 256 {
-                                if let Some(oldest) = cloud_destinations
-                                    .iter()
-                                    .min_by_key(|(_, (_, until))| *until)
-                                    .map(|(uuid, _)| uuid.clone())
-                                {
-                                    cloud_destinations.remove(&oldest);
-                                }
-                            }
                             let destination = begin_destination(&internal);
-                            shown_destination = Some(destination.id);
+                            let id = destination.id;
+                            cloud.available();
+                            shown_destination = Some(id);
                             let _ = pill_tx.send(PillCommand::Destination(None));
-                            cloud_destinations.insert(
-                                uuid,
-                                (
-                                    destination,
-                                    Instant::now() + cfg.max_dictation + Duration::from_secs(60),
-                                ),
-                            );
+                            cloud.add(id, destination);
+                            cloud.external(id, uuid.clone());
+                            out.send(&Event::CloudStart { id });
+                            out.send(&Event::Started { uuid });
+                            let _ = pill_tx.send(PillCommand::Status("listening".into()));
+                            let _ = pill_tx.send(PillCommand::Mic(true));
                             recording = Some(r);
+                            pending.push_back(control::Input::WisprStatus("listening".into()));
                         }
                         Err(error) => out.send(&Event::MicFailed { uuid, error }),
                     }
                 }
             }
             Ok(Some(Command::Stop)) => {
-                if let Some(r) = recording.take() {
+                if cloud
+                    .active
+                    .is_some_and(|id| !cloud.jobs.get(&id).is_some_and(|j| j.external))
+                {
+                    if cloud_capture
+                        .as_ref()
+                        .is_some_and(|c| Some(c.id) == cloud.active)
+                    {
+                        let capture = cloud_capture.take().unwrap();
+                        finish_cloud(capture, &mut cloud, clock_ms());
+                        pending.push_back(control::Input::CloudStopped);
+                    }
+                    for event in cloud.events() {
+                        out.send(&event);
+                    }
+                    if let Some(event) = cloud.stop() {
+                        out.send(&event);
+                    }
+                } else if let Some(r) = recording.take() {
+                    let id = cloud.id_for(r.uuid());
                     for e in r.stop(clock_ms()) {
+                        if let Some(id) = id {
+                            retain_cloud_event(&mut cloud, id, &e);
+                        }
                         out.send(&e);
                     }
+                    pending.push_back(control::Input::CloudStopped);
                 }
                 let _ = relist.send(());
             }
@@ -977,14 +1040,19 @@ fn serve(
                 let _ = relist.send(());
             }
             Ok(Some(Command::Relisted)) => {
-                if recording.is_none() && local.is_none() {
+                if recording.is_none() && local.is_none() && cloud_capture.is_none() {
                     prepare(&mut ready, &ranked);
                 }
             }
             // Wispr's own shortcut went down (the shim saw it): start ahead
             // of Wispr's request.
             Ok(Some(Command::Early)) => {
-                if recording.is_none() && early.is_none() && local.is_none() && !ctl.busy() {
+                if recording.is_none()
+                    && early.is_none()
+                    && local.is_none()
+                    && cloud_capture.is_none()
+                    && !ctl.busy()
+                {
                     let mic = chosen(&ranked);
                     early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready)
                         .map(|(r, at)| (r, at + EARLY_FOR_WISPR));
@@ -996,54 +1064,75 @@ fn serve(
                 }
             }
             Ok(Some(Command::Status { value })) => {
-                if value == "initializing"
-                    && recording.is_none()
-                    && early.is_none()
-                    && local.is_none()
-                {
-                    let mic = chosen(&ranked);
-                    early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready)
-                        .map(|(r, at)| (r, at + EARLY_FOR_WISPR));
+                if cloud.active.is_none() {
+                    if matches!(
+                        value.as_str(),
+                        "initializing"
+                            | "listening"
+                            | "stopping"
+                            | "processing"
+                            | "retrying"
+                            | "error"
+                    ) {
+                        upstream_busy = true;
+                    } else if matches!(value.as_str(), "idle" | "dismissed") {
+                        upstream_busy = false;
+                    }
+                    if value == "initializing"
+                        && recording.is_none()
+                        && early.is_none()
+                        && local.is_none()
+                    {
+                        let mic = chosen(&ranked);
+                        early = start_early(cfg, mic.as_ref(), clock_ms(), out, &mut ready)
+                            .map(|(r, at)| (r, at + EARLY_FOR_WISPR));
+                    }
+                    if matches!(value.as_str(), "idle" | "dismissed" | "error") && !ctl.busy() {
+                        early = None;
+                    }
+                    pending.push_back(control::Input::WisprStatus(value.clone()));
+                    // After control.rs heard it: Wispr's start takes the bar.
+                    forward = Some(PillCommand::Status(value));
                 }
-                if matches!(value.as_str(), "idle" | "dismissed" | "error") && !ctl.busy() {
-                    early = None;
-                }
-                pending.push_back(control::Input::WisprStatus(value.clone()));
-                // After control.rs heard it: Wispr's start takes the bar.
-                forward = Some(PillCommand::Status(value));
             }
             Ok(Some(Command::Popo)) => {
-                pending.push_back(control::Input::WisprPopo);
-                forward = Some(PillCommand::Popo);
+                if recording.is_some() {
+                    pending.push_back(control::Input::WisprPopo);
+                    forward = Some(PillCommand::Popo);
+                }
             }
             // Wispr's indicator: only while its dictation has the bar.
             Ok(Some(Command::Level { value })) => {
                 if let Some(r) = recording.as_ref() {
-                    if let Some((destination, _)) = cloud_destinations.get(r.uuid()) {
+                    if let Some(destination) = cloud
+                        .id_for(r.uuid())
+                        .and_then(|id| cloud.jobs.get(&id))
+                        .and_then(|job| job.destination.as_ref())
+                    {
                         destination.level(value);
                     }
                 }
-                if ctl.wispr_owns_bar() {
+                if ctl.wispr_owns_bar() && cloud_capture.is_none() && local.is_none() {
                     let _ = pill_tx.send(PillCommand::Level(value));
                 }
             }
             Ok(Some(Command::Mic { active })) => {
-                if ctl.wispr_owns_bar() {
+                if ctl.wispr_owns_bar() && cloud_capture.is_none() && local.is_none() {
                     let _ = pill_tx.send(PillCommand::Mic(active));
                 }
             }
             Ok(Some(Command::Silence { value })) => {
-                if ctl.wispr_owns_bar() {
+                if ctl.wispr_owns_bar() && cloud_capture.is_none() && local.is_none() {
                     let _ = pill_tx.send(PillCommand::Silence(value));
                 }
             }
             Ok(Some(Command::Commanding { active })) => {
-                if ctl.wispr_owns_bar() {
+                if ctl.wispr_owns_bar() && cloud_capture.is_none() && local.is_none() {
                     let _ = pill_tx.send(PillCommand::CommandMode(active));
                 }
             }
             Ok(Some(Command::Indicator { state })) => {
-                if ctl.wispr_owns_bar() {
+                if ctl.wispr_owns_bar() && cloud_capture.is_none() && local.is_none() {
                     let _ = pill_tx.send(PillCommand::Indicator(state));
                 }
             }
@@ -1113,7 +1202,15 @@ fn serve(
             }
             Ok(Some(Command::Hotkey(inputs))) => pending.extend(inputs),
             Ok(Some(Command::BarClick(action))) => {
-                pending.push_back(control::Input::BarClick(action));
+                pending.push_back(match (action.as_str(), cloud_capture.is_some()) {
+                    ("start", false) => control::Input::Start {
+                        backend: Backend::Wispr,
+                        hands_free: true,
+                    },
+                    ("stop", true) => control::Input::End,
+                    ("cancel", true) => control::Input::Cancel,
+                    _ => control::Input::BarClick(action),
+                });
             }
             Ok(Some(Command::Dictate { backend: wanted })) => {
                 pending.push_back(control::Input::Start {
@@ -1124,6 +1221,12 @@ fn serve(
             Ok(Some(Command::DictateEnd)) => pending.push_back(control::Input::End),
             Ok(Some(Command::DictateCancel)) => pending.push_back(control::Input::Cancel),
             Ok(Some(Command::Destination { id, icon })) => {
+                if let Some(job) = cloud.jobs.get_mut(&id) {
+                    job.icon = icon.clone();
+                }
+                if let Some(shown) = local_processing.get_mut(&id) {
+                    *shown = icon.clone();
+                }
                 if shown_destination == Some(id) {
                     let _ = pill_tx.send(PillCommand::Destination(icon));
                 }
@@ -1134,9 +1237,18 @@ fn serve(
                 text,
                 submit,
             })) => {
-                let destination = cloud_destinations
-                    .remove(&uuid)
-                    .map(|(destination, _)| destination);
+                let managed = cloud.id_for(&uuid);
+                if text.trim().is_empty() || cloud.handled(&uuid) {
+                    out.send(&Event::CloudDelivery {
+                        request,
+                        fallback: false,
+                        applied: true,
+                        error: None,
+                    });
+                    continue;
+                }
+                let captured = managed.and_then(|id| cloud.claim(id));
+                let destination = captured;
                 let commands = internal.clone();
                 std::thread::spawn(move || {
                     let result = destination
@@ -1157,6 +1269,7 @@ fn serve(
                 result,
                 destination,
             })) => {
+                local_processing.remove(&destination);
                 if shown_destination == Some(destination) {
                     shown_destination = None;
                     let _ = pill_tx.send(PillCommand::Destination(None));
@@ -1181,6 +1294,97 @@ fn serve(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(Some(Command::CloudState { value, id })) => {
+                if id.is_some() && cloud.active != id {
+                    continue;
+                }
+                if matches!(value.as_str(), "idle" | "dismissed") {
+                    upstream_busy = false;
+                    cloud.available();
+                } else if matches!(value.as_str(), "error" | "retrying") {
+                    if let Some(job) = cloud.active.and_then(|id| cloud.jobs.get_mut(&id)) {
+                        job.retrying = true;
+                    }
+                }
+            }
+            Ok(Some(Command::LocalAlternative { id })) => {
+                if let (Some(asr), Some(job)) = (asr.as_ref(), cloud.jobs.get_mut(&id)) {
+                    if job.timing.is_some() && !job.local_running && !job.claimed {
+                        job.local_running = true;
+                        let mut dictation = asr.start();
+                        dictation.feed(&job.audio);
+                        let commands = internal.clone();
+                        std::thread::spawn(move || {
+                            let result = dictation.finish();
+                            let _ =
+                                commands.send(Some(Command::AlternativeTranscribed { id, result }));
+                        });
+                    }
+                }
+            }
+            Ok(Some(Command::AlternativeTranscribed { id, result })) => {
+                if let Some(job) = cloud.jobs.get_mut(&id) {
+                    job.local_running = false;
+                }
+                match result {
+                    Ok(text) if !text.trim().is_empty() => {
+                        if let Some(destination) = cloud.claim(id) {
+                            let commands = internal.clone();
+                            std::thread::spawn(move || {
+                                let result = destination.complete(&text, false);
+                                let _ = commands.send(Some(Command::AlternativeDelivered {
+                                    id,
+                                    text,
+                                    result,
+                                }));
+                            });
+                        }
+                    }
+                    Err(error) => log(format!("local alternative failed: {error}")),
+                    _ => {}
+                }
+                cloud.prune();
+            }
+            Ok(Some(Command::AlternativeDelivered {
+                id: _,
+                text,
+                result,
+            })) => {
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => out.send(&Event::InsertTranscript { text: text.clone() }),
+                    Err(error) => {
+                        log(format!("delivering local alternative failed: {error}"));
+                        recover(text.clone(), true, &mut local_notice, pill_tx);
+                    }
+                }
+                out.send(&Event::Transcript { text });
+            }
+        }
+        if let Some(capture) = cloud_capture.as_mut() {
+            match capture.recording.poll_pcm(Duration::ZERO) {
+                Ok(pcm) => {
+                    let level = capture.level.level(recorder::volume_db(&pcm));
+                    if !pcm.is_empty() {
+                        cloud.feed(capture.id, &pcm);
+                        let _ = pill_tx.send(PillCommand::Level(level));
+                    }
+                    if let Some(destination) = cloud
+                        .jobs
+                        .get(&capture.id)
+                        .and_then(|j| j.destination.as_ref())
+                    {
+                        destination.level(level);
+                    }
+                }
+                Err(error) => {
+                    log(format!("cloud microphone failed: {error}"));
+                    pending.push_back(control::Input::End);
+                }
+            }
+            if capture.since.elapsed() >= cfg.max_dictation {
+                pending.push_back(control::Input::End);
+            }
         }
         if let Some(l) = local.as_mut() {
             match l.recording.poll_pcm(Duration::from_millis(15)) {
@@ -1220,15 +1424,63 @@ fn serve(
                 local: &mut local,
                 local_notice: &mut local_notice,
                 shown_destination: &mut shown_destination,
+                cloud: &mut cloud,
+                cloud_capture: &mut cloud_capture,
+                local_processing: &mut local_processing,
             };
             run_control(&mut ctl, &mut pending, &mut |a| act(a, &mut effects));
+        }
+        if let Some(id) = (!upstream_busy).then(|| cloud.next()).flatten() {
+            upstream_busy = true;
+            out.send(&Event::CloudStart { id });
+            out.send(&Event::WisprKey {
+                action: "ptt".into(),
+                down: true,
+            });
+        }
+        for event in cloud.events() {
+            out.send(&event);
+        }
+        cloud.prune();
+        let mut processing: Vec<bar::Processing> = local_processing
+            .iter()
+            .map(|(&id, icon)| bar::Processing {
+                id,
+                local: true,
+                retry: false,
+                queued: false,
+                icon: icon.clone(),
+            })
+            .collect();
+        processing.extend(
+            cloud
+                .jobs
+                .iter()
+                .filter(|(&id, job)| {
+                    job.timing.is_some()
+                        && (!job.cloud_done || job.local_running)
+                        && cloud_capture.as_ref().is_none_or(|c| c.id != id)
+                })
+                .map(|(&id, job)| bar::Processing {
+                    id,
+                    local: job.local_running,
+                    retry: asr.is_some() && !job.claimed && !job.local_running,
+                    queued: cloud.active != Some(id) && !job.local_running,
+                    icon: job.icon.clone(),
+                }),
+        );
+        processing.sort_by_key(|job| job.id);
+        let _ = pill_tx.send(PillCommand::Processing(processing));
+        if !local_processing.is_empty() || !cloud.jobs.is_empty() {
+            if local.is_none() && cloud_capture.is_none() && recording.is_none() {
+                let _ = pill_tx.send(PillCommand::Status("idle".into()));
+            }
         }
         if let Some(p) = forward {
             if ctl.wispr_owns_bar() {
                 let _ = pill_tx.send(p);
             }
         }
-        cloud_destinations.retain(|_, (_, until)| Instant::now() < *until);
         // No request to record followed: stop and forget what it heard.
         if early
             .as_ref()
@@ -1241,11 +1493,17 @@ fn serve(
             match r.poll(Duration::from_millis(15)) {
                 Progress::Chunks(events) => {
                     for e in events {
+                        if let Some(id) = cloud.id_for(r.uuid()) {
+                            retain_cloud_event(&mut cloud, id, &e);
+                        }
                         out.send(&e);
                     }
                 }
                 Progress::Failed(e) => {
-                    cloud_destinations.remove(r.uuid());
+                    if let Some(id) = cloud.id_for(r.uuid()) {
+                        cloud.cancel(id);
+                        cloud.available();
+                    }
                     out.send(&e);
                     recording = None;
                 }
@@ -1303,13 +1561,62 @@ struct Effects<'a> {
     local: &'a mut Option<Local>,
     local_notice: &'a mut Option<LocalNotice>,
     shown_destination: &'a mut Option<u64>,
+    cloud: &'a mut cloud::Queue<destination::Session>,
+    cloud_capture: &'a mut Option<CloudCapture>,
+    local_processing: &'a mut std::collections::BTreeMap<u64, Option<Arc<icon::Icon>>>,
+}
+
+fn start_cloud(e: &mut Effects, hands_free: bool) -> Option<control::Input> {
+    let started = match e.early.take() {
+        Some((r, _)) => Ok(r),
+        None => {
+            let mic = (e.chosen)(e.ranked);
+            start_recording(e.cfg, "", mic.as_ref(), e.clock_ms, e.out, e.ready)
+        }
+    };
+    match started {
+        Ok(recording) => {
+            let destination = begin_destination(e.internal);
+            let id = destination.id;
+            e.cloud.add(id, destination);
+            *e.shown_destination = Some(id);
+            *e.cloud_capture = Some(CloudCapture {
+                recording,
+                id,
+                hands_free,
+                level: bar::LevelScale::new(),
+                since: Instant::now(),
+            });
+            let _ = e.pill_tx.send(PillCommand::Destination(None));
+            let _ = e.pill_tx.send(PillCommand::Status("initializing".into()));
+            let _ = e.pill_tx.send(PillCommand::Status("listening".into()));
+            if hands_free {
+                let _ = e.pill_tx.send(PillCommand::Popo);
+            }
+            let _ = e.pill_tx.send(PillCommand::Mic(true));
+        }
+        Err(error) => {
+            e.out.send(&Event::TranscriptFailed { error });
+            return Some(control::Input::Cancel);
+        }
+    }
+    None
+}
+
+fn end_cloud(e: &mut Effects) {
+    if let Some(capture) = e.cloud_capture.take() {
+        finish_cloud(capture, e.cloud, e.clock_ms);
+        let _ = e.pill_tx.send(PillCommand::Status("idle".into()));
+        *e.shown_destination = None;
+        let _ = e.relist.send(());
+    }
 }
 
 /// Carries out one of control.rs's answers; may have news for it.
 fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
     match action {
         Action::StartEarly => {
-            if e.early.is_none() && e.local.is_none() {
+            if e.early.is_none() && e.local.is_none() && e.cloud_capture.is_none() {
                 let mic = (e.chosen)(e.ranked);
                 *e.early = start_early(e.cfg, mic.as_ref(), e.clock_ms, e.out, e.ready)
                     .map(|(r, at)| (r, at + EARLY_FOR_SHORTCUT));
@@ -1364,6 +1671,8 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
                 if let Some(sound) = &e.cfg.local_stop_sound {
                     play_file(e.cfg, sound, e.out);
                 }
+                e.local_processing
+                    .insert(l.destination.id, l.destination.icon());
                 transcribe(stop_local(l), e.internal);
                 let _ = e.relist.send(());
             }
@@ -1385,6 +1694,8 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
         }
         Action::UndoLocal => match e.local_notice.as_mut().and_then(|n| n.dictation.take()) {
             Some(dictation) => {
+                e.local_processing
+                    .insert(dictation.1.id, dictation.1.icon());
                 *e.shown_destination = Some(dictation.1.id);
                 let _ = e.pill_tx.send(PillCommand::Destination(dictation.1.icon()));
                 let _ = e.pill_tx.send(PillCommand::Local);
@@ -1404,20 +1715,50 @@ fn act(action: Action, e: &mut Effects) -> Option<control::Input> {
             let _ = e.relist.send(());
             e.out.send(&Event::TranscriptFailed { error });
         }
-        Action::WisprKey(key, down) => {
-            // Wispr asks to record within a moment; the early recording
-            // waits that long.
-            if down {
-                if let Some((_, until)) = e.early.as_mut() {
-                    *until = Instant::now() + EARLY_FOR_WISPR_KEY;
+        Action::WisprKey(key, down) => match (key, down) {
+            (control::WisprKey::Ptt, true) => return start_cloud(e, false),
+            (control::WisprKey::Ptt, false) => {
+                if e.cloud_capture.as_ref().is_some_and(|c| !c.hands_free) {
+                    end_cloud(e);
                 }
+                return None;
             }
-            e.out.send(&Event::WisprKey {
-                action: key.name().into(),
-                down,
-            });
-        }
+            (control::WisprKey::Popo, true) => {
+                match e.cloud_capture.as_mut() {
+                    Some(capture) if !capture.hands_free => {
+                        capture.hands_free = true;
+                        let _ = e.pill_tx.send(PillCommand::Popo);
+                    }
+                    Some(_) => end_cloud(e),
+                    None => return start_cloud(e, true),
+                }
+                return None;
+            }
+            (control::WisprKey::Popo, false) => return None,
+        },
         Action::WisprClick(action) => {
+            if let Some(capture) = e.cloud_capture.as_ref() {
+                match action {
+                    "cancel" => {
+                        let id = capture.id;
+                        finish_cloud(e.cloud_capture.take().unwrap(), e.cloud, e.clock_ms);
+                        e.cloud.cancel(id);
+                        if e.cloud.active == Some(id) {
+                            e.out.send(&Event::Click {
+                                action: "cancel".into(),
+                            });
+                            e.out.send(&Event::WisprKey {
+                                action: "ptt".into(),
+                                down: false,
+                            });
+                        }
+                        let _ = e.pill_tx.send(PillCommand::Status("idle".into()));
+                    }
+                    "stop" => end_cloud(e),
+                    _ => {}
+                }
+                return None;
+            }
             if action == "start" {
                 if let Some((_, until)) = e.early.as_mut() {
                     *until = Instant::now() + EARLY_FOR_WISPR_KEY;

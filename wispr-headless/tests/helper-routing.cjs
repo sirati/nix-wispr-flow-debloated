@@ -14,11 +14,48 @@ const context = vm.createContext({ require, Buffer, setTimeout, clearTimeout, se
   process: { env: { XDG_CACHE_HOME: cache }, nextTick: process.nextTick, pid: process.pid } });
 const source = fs.readFileSync(path.join(__dirname, "../shim.js"), "utf8");
 vm.runInContext(source.slice(0, source.indexOf("// Nothing here may stop Wispr")) + `
-  globalThis.testing = { createPasteRouter, gateHelper, escapeHelper, unescapeHelper, patchWisprBundle, nativeNotice, pasteContext,
+  globalThis.testing = { createCloudRetry, createPasteRouter, gateHelper, escapeHelper, unescapeHelper, patchWisprBundle, nativeNotice, pasteContext,
     setGate(gate) { pasteGate = gate; } };
 `, context);
 const { testing } = context;
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test("Wispr's retry notice is handled automatically while queued recording stays independent", async () => {
+  const sent = [], retried = [];
+  const retry = testing.createCloudRetry((message) => sent.push(message), (notice) => retried.push(notice), 20);
+  assert.equal(retry.notice({ type: "TranscriptionError" }), false);
+  retry.start(1);
+  const notice = { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] };
+  assert.equal(retry.notice(notice), true);
+  retry.status("error");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(retried.length, 1, "status and notification schedule one retry");
+  assert.equal(retried[0], notice);
+  assert.equal(sent[0].value, "retrying");
+  retry.status("retrying");
+  retry.status("idle");
+  assert.equal(sent.at(-1).value, "idle");
+  retry.start(2); retry.notice(notice); retry.close();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(retried.length, 1, "closing cancels automatic retries");
+});
+
+test("a silent Retry failure tries again, and processing or a new job cancels the old timer", async () => {
+  const retried = [];
+  const retry = testing.createCloudRetry(() => {}, () => {
+    retried.push(retry.active);
+    if (retried.length === 2) retry.status("processing");
+  }, 2);
+  retry.start(1);
+  retry.status("error");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(retried, [1, 1]);
+  retry.status("error");
+  retry.start(2);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(retried, [1, 1]);
+  retry.close();
+});
 
 for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Boolean)) {
   test(`the shipped bundle retains correlation on both insertion paths: ${bundle}`, () => {
