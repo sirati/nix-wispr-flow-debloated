@@ -29,17 +29,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1791957388,
-        "narHash": "sha256-3pNxLUSQgUKEcsAxjfVlHogDm0aQJhoUyKwaxS8zDp0=",
+        "lastModified": 1793189970,
+        "narHash": "sha256-QO19JA+//I3J7UbLD7uiY9tee0hkDt/U2cl4B5m4QrQ=",
         "owner": "wispr-flow-linux",
         "repo": "wispr-flow-linux",
-        "rev": "c7b53b995c2c09e71c6e972bdd62ac19a7557551",
+        "rev": "8866a1785300d1370e2aa6b06af05ee713988dcd",
         "type": "github"
       },
       "original": {
         "owner": "wispr-flow-linux",
         "repo": "wispr-flow-linux",
-        "rev": "c7b53b995c2c09e71c6e972bdd62ac19a7557551",
+        "rev": "8866a1785300d1370e2aa6b06af05ee713988dcd",
         "type": "github"
       }
     }

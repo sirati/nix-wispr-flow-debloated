@@ -194,7 +194,8 @@ let
         # Each script fails by name.
         for p in helper-env linux-window-frame linux-hub-focusable \
                  linux-deeplink linux-early-singleton \
-                 linux-disable-pill-drag linux-main-shortcut-defaults \
+                 linux-disable-pill-drag linux-status-picker-anchor \
+                 linux-main-shortcut-defaults linux-status-compact \
                  linux-xdg-data-dir linux-autostart; do
           bash ${patchDir}/$p.sh "$main_bundle" \
             || { echo "wispr-flow: patch $p failed" >&2; exit 1; }

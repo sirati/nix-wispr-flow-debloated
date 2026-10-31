@@ -15,7 +15,7 @@ let
     owner = "wispr-flow-linux";
     repo = "helper";
     rev = pin;
-    hash = "sha256-VH5rJ2wZd482TcDZKAQZHqeqLk443wkEIStxIjouVlU=";
+    hash = "sha256-6yImRj0KCgoj6TCnIKSY94jF84ZGF2oz4CKpiBuJIJU=";
   };
 in
 rustPlatform.buildRustPackage {

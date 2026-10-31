@@ -9,7 +9,7 @@
     # installer pin and patch scripts must match the rev, so bump the rev
     # deliberately and rebuild before switching.
     wispr-flow-linux = {
-      url = "github:wispr-flow-linux/wispr-flow-linux/c7b53b995c2c09e71c6e972bdd62ac19a7557551";
+      url = "github:wispr-flow-linux/wispr-flow-linux/8866a1785300d1370e2aa6b06af05ee713988dcd";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

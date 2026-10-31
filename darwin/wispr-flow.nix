@@ -190,11 +190,11 @@ let
       }
     )
   );
-  version = "1.6.1174";
+  version = "1.6.1337";
   release = native.fetchurl {
     name = "wispr-flow-darwin-arm64-${version}.zip";
     url = "https://dl.wisprflow.com/wispr-flow/darwin/arm64/Wispr%20Flow-darwin-arm64-${version}.zip";
-    hash = "sha256-uNNqXjUkOS7DCHoI7/cUdzfqAAys6QUD7IjVfkiDUC0=";
+    hash = "sha256-r7o4c6DKONul7xYA4NPJnlq98b+cUWBCjOwsuzXABXM=";
   };
 
   # From the binary cache; the build machine only downloads it.
