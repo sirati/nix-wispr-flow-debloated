@@ -367,10 +367,22 @@ function patchWisprBundle(source) {
   };
   const notices = module("sendVoidDictationNotification");
   const body = source.slice(notices.start, notices.end);
-  const notification = /\{\.\.\.\w+\.L\[\w+\.Eg\.VoidDictation\],body:\w+\}/g;
-  const signature = new RegExp(String.raw`${notices.name}=\((\w+),(\w+)\)=>\{`);
-  if (!signature.test(body) || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
-  const patchedNotice = body.replace(signature, `${notices.name}=($1,$2,__wisprDictationUUID,__wisprDictationSubmit)=>{`).replace(notification, (value) => value.slice(0, -1) + ",callbackOperationId:__wisprDictationUUID??globalThis.wisprHeadlessPasteUUID?.(),dictationSubmit:!!__wisprDictationSubmit}");
+  // 1.6.1337 added a third (granola-blocked) argument and extra fields after
+  // `body` in this object. Match the stable VoidDictation spread/body prefix
+  // and append our fields there, so both the old and new shapes keep working.
+  const notification = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+)(?=,|\})/g;
+  const signature = new RegExp(String.raw`${notices.name}=\(([^)]*)\)=>\{`);
+  const signatureMatch = signature.exec(body);
+  if (!signatureMatch || [...body.matchAll(notification)].length !== 1) throw new Error("unsupported Wispr copy notification");
+  const originalParams = signatureMatch[1].split(",").map((param) => param.trim()).filter(Boolean);
+  const hasGranolaArgument = originalParams.length >= 3;
+  const extraParams = ",__wisprDictationUUID,__wisprDictationSubmit";
+  const normaliseArgs = hasGranolaArgument
+    ? `if(typeof ${originalParams[2].split("=")[0]}==="string"&&typeof __wisprDictationUUID==="boolean"){__wisprDictationSubmit=__wisprDictationUUID;__wisprDictationUUID=${originalParams[2].split("=")[0]};${originalParams[2].split("=")[0]}=false;}`
+    : "";
+  const patchedNotice = body
+    .replace(signature, `${notices.name}=(${signatureMatch[1]}${extraParams})=>{${normaliseArgs}`)
+    .replace(notification, (value) => value + ",callbackOperationId:__wisprDictationUUID??globalThis.wisprHeadlessPasteUUID?.(),dictationSubmit:!!__wisprDictationSubmit");
   source = source.slice(0, notices.start) + patchedNotice + source.slice(notices.end);
   // Only this pre-helper call belongs to the final dictation. Extension API
   // pastes must not inherit whichever dictation happened most recently.

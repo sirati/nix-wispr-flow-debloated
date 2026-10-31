@@ -110,15 +110,19 @@ for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Bo
   test(`the shipped bundle retains correlation and spoken Enter on both insertion paths: ${bundle}`, () => {
     const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
     new vm.Script(patched);
-    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:__wisprDictationUUID\?\?globalThis\.wisprHeadlessPasteUUID\?\.\(\),dictationSubmit:!!__wisprDictationSubmit\}/.exec(patched);
+    // Newer Wispr releases append notification fields after `body`; the
+    // shim's injected fields remain a stable prefix, so close that prefix for
+    // the isolated serializer assertion below.
+    const payload = /\{\.\.\.(\w+)\.L\[(\w+)\.Eg\.VoidDictation\],body:(\w+),callbackOperationId:__wisprDictationUUID\?\?globalThis\.wisprHeadlessPasteUUID\?\.\(\),dictationSubmit:!!__wisprDictationSubmit/.exec(patched);
     assert.ok(payload, "the copy message carries the exact originating UUID");
+    const payloadObject = `${payload[0]}}`;
     const env = { [payload[1]]: { L: { VoidDictation: { component: "voidDictation" } } }, [payload[2]]: { Eg: { VoidDictation: "VoidDictation" } }, [payload[3]]: "completed text", __wisprDictationUUID: "original-session", __wisprDictationSubmit: true };
-    const notice = vm.runInNewContext(`(${payload[0]})`, env);
+    const notice = vm.runInNewContext(`(${payloadObject})`, env);
     assert.equal(notice.callbackOperationId, "original-session");
     assert.equal(notice.body, "completed text");
     assert.equal(notice.dictationSubmit, true);
     env.__wisprDictationUUID = undefined;
-    assert.equal(vm.runInNewContext(`(${payload[0]})`, env).callbackOperationId, undefined, "unrelated extension pastes cannot reuse a dictation session");
+    assert.equal(vm.runInNewContext(`(${payloadObject})`, env).callbackOperationId, undefined, "unrelated extension pastes cannot reuse a dictation session");
     const deferred = /__wisprDeferredCopy&&\(0,(\w+)\.sendVoidDictationNotification\)\((\w+),void 0,(\w+)\.ZZ\.uuid,(\w+)\)/.exec(patched);
     assert.ok(deferred, "pre-helper copy waits for Wispr's final formatted text and Enter decision");
     let copied;
