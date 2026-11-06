@@ -251,7 +251,7 @@ app.whenReady().then(async () => {
 
   if (xdotool) {
     const before = daemonEvents.length;
-    execSync(`${xdotool} mousemove 716 721 click 1`);
+    execSync(`${xdotool} mousemove 688 721 click 1`);
     const retained = await until("local alternative after idle", () => daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed")));
     check(retained, "an undelivered dictation keeps its processing bubble and local action after Wispr goes idle");
   }

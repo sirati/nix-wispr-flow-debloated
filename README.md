@@ -120,12 +120,13 @@ new recording starts while an older one is still being transcribed.
 Each unfinished dictation has a processing bubble above the current
 recording, with its captured application's icon. Wispr's transcription
 errors automatically invoke its Retry action, with increasing delays up
-to 30 seconds between attempts. The bubble shows a countdown such as
-`Retry 2 in 4s`, then `Retry 2` while that attempt runs. A failed or refused
-attempt schedules the next retry. Queued audio waits until Wispr finishes
-the retry's history write and paste, even if it sends an earlier idle event.
-After success the bubble closes when delivery completes, or shows
-`Retry 2 finished` while delivery is still pending.
+to 30 seconds between attempts. Retry progress stays within the original
+processing bubble's dimensions. A static arrow and `2 · 4s` mean attempt 2
+starts in four seconds; a rotating arrow and `2` mean it is running. A green
+check and `2` mean it finished while delivery is still pending. Counts above
+99 display as `99+`. A failed or refused attempt schedules the next retry.
+Queued audio waits until Wispr finishes the retry's history write and paste,
+even if it sends an earlier idle event. The bubble closes after delivery.
 With local recognition configured, cloud
 processing bubbles also have a green circular-arrow button. It runs local
 recognition on the retained audio while Wispr continues. The first nonempty

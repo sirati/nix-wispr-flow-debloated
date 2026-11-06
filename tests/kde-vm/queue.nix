@@ -91,11 +91,21 @@ let
         pkgs.procps
         pkgs.dbus
         pkgs.gnused
+        pkgs.imagemagick
+        pkgs.xsetroot
       ]
     }:$PATH
     export WISPR_HEADLESS_BIN=${daemon}/bin/wispr-headless
+    export WISPR_TEST_FONT_DIR=${pkgs.figtree}/share/fonts/truetype
+    export WISPR_TEST_SCREENSHOTS=/tmp/wispr-retry-layout
     export DICTATION_BROKER_EXE=${broker}/bin/dictation-broker
     export WISPR_TEST_BUNDLES=${pkgs.lib.escapeShellArg (pkgs.lib.concatStringsSep ":" (map toString bundles))}
+    for executable in ${daemon}/libexec/tests/wispr_headless-*; do
+      for scale in 1 2; do
+        WISPR_TEST_SCALE=$scale xvfb-run -a --server-args="-screen 0 1280x800x24" \
+          "$executable" --ignored --exact bar::tests::native_retry_layout_screenshots
+      done
+    done
     for executable in ${broker}/libexec/tests/*; do
       "$executable"
     done
@@ -120,5 +130,7 @@ import ./default.nix {
         finally:
             print(read("/tmp/queue-checks.log"))
             machine.copy_from_vm("/tmp/queue-checks.log")
+            if machine.succeed("test -d /tmp/wispr-retry-layout && echo yes || true").strip():
+                machine.copy_from_vm("/tmp/wispr-retry-layout")
   '';
 }

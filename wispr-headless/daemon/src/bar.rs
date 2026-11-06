@@ -252,12 +252,23 @@ impl RetryStatus {
     fn label(&self, now: Instant) -> String {
         match self {
             Self::Waiting { attempt, at } => {
-                let seconds = at.saturating_duration_since(now).as_millis().div_ceil(1000);
-                format!("Retry {attempt} in {seconds}s")
+                let seconds = at
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .div_ceil(1000)
+                    .min(30);
+                format!("{} · {seconds}s", retry_count(*attempt))
             }
-            Self::Running { attempt } => format!("Retry {attempt}"),
-            Self::Finished { attempt } => format!("Retry {attempt} finished"),
+            Self::Running { attempt } | Self::Finished { attempt } => retry_count(*attempt),
         }
+    }
+}
+
+fn retry_count(attempt: u32) -> String {
+    if attempt > 99 {
+        "99+".into()
+    } else {
+        attempt.to_string()
     }
 }
 
@@ -660,15 +671,10 @@ impl BarState {
         }
         let mut icons = Vec::new();
         let base_size = size;
+        // Retry progress uses the existing 98 px content slot. It must never
+        // move the destination icon, local button, or widen a processing row.
         let row_width = |job: &Processing| {
-            let content = job.retry_status.as_ref().map_or(98.0, |status| {
-                let label = status.label(now);
-                let text_width = measure(&label, 12.0, false).max(label.len() as f64 * 6.6);
-                (text_width + 48.0).max(98.0)
-            });
-            content
-                + if job.icon.is_some() { 26.0 } else { 0.0 }
-                + if job.retry { 30.0 } else { 0.0 }
+            98.0 + if job.icon.is_some() { 26.0 } else { 0.0 } + if job.retry { 30.0 } else { 0.0 }
         };
         let width = self.processing.iter().map(row_width).fold(size.0, f64::max);
         let extra = if self.enabled {
@@ -720,36 +726,79 @@ impl BarState {
                 } else {
                     0.
                 };
-                let spinner_x = x + inset + if job.retry_status.is_some() { 19. } else { 45. };
-                for i in 0..8 {
-                    let angle = i as f64 * std::f64::consts::PI / 4.;
-                    let alpha = if job.queued {
-                        0x70
-                    } else {
-                        (spinner_alpha(t, i) * 255.) as u8
-                    };
-                    shapes.push(Shape {
-                        cx: spinner_x + angle.cos() * 6.,
-                        cy: y + 15. + angle.sin() * 6.,
-                        w: 3.,
-                        h: 2.,
-                        angle,
-                        radius: 1.,
-                        fill: [SPINNER[0], SPINNER[1], SPINNER[2], alpha],
-                        border: None,
-                    });
-                }
                 if let Some(status) = &job.retry_status {
+                    let label = status.label(now);
+                    let width_at = |size: f64| {
+                        measure(&label, size, false)
+                            .max(label.chars().count() as f64 * size * 0.55)
+                            .ceil()
+                            + 2.0 // Native rasterizers reserve a trailing pixel margin.
+                    };
+                    let mut size = 12.0;
+                    let mut text_width = width_at(size);
+                    // Leave 10 px at either edge of the original content slot,
+                    // 16 px for the icon, and a 6 px gap. Measure the actual
+                    // platform font, including on macOS, rather than expanding.
+                    for _ in 0..4 {
+                        if text_width <= 56.0 {
+                            break;
+                        }
+                        size *= 55.5 / text_width;
+                        text_width = width_at(size);
+                    }
+                    let left = x + inset + (98.0 - 22.0 - text_width) / 2.0;
+                    let (cx, cy) = (left + 8.0, y + 15.0);
+                    match status {
+                        RetryStatus::Waiting { .. } => retry_arrow(
+                            cx,
+                            cy,
+                            6.0,
+                            0.0,
+                            [SPINNER[0], SPINNER[1], SPINNER[2], 0xb0],
+                            &mut shapes,
+                        ),
+                        RetryStatus::Running { .. } => retry_arrow(
+                            cx,
+                            cy,
+                            6.0,
+                            t * std::f64::consts::TAU / 1.1,
+                            [SPINNER[0], SPINNER[1], SPINNER[2], 0xff],
+                            &mut shapes,
+                        ),
+                        RetryStatus::Finished { .. } => {
+                            check_icon(cx, cy, 16.0, [0x86, 0xef, 0xac, 0xff], &mut shapes)
+                        }
+                    }
                     texts.push(Text {
-                        x: x + inset + 34.,
+                        x: left + 22.,
                         top: y + 6.,
                         line: 18.,
-                        size: 12.,
+                        size,
                         bold: false,
                         color: TEXT,
                         bg: [color[0], color[1], color[2], 0xff],
-                        text: status.label(now),
+                        text: label,
                     });
+                } else {
+                    let spinner_x = x + inset + 45.;
+                    for i in 0..8 {
+                        let angle = i as f64 * std::f64::consts::PI / 4.;
+                        let alpha = if job.queued {
+                            0x70
+                        } else {
+                            (spinner_alpha(t, i) * 255.) as u8
+                        };
+                        shapes.push(Shape {
+                            cx: spinner_x + angle.cos() * 6.,
+                            cy: y + 15. + angle.sin() * 6.,
+                            w: 3.,
+                            h: 2.,
+                            angle,
+                            radius: 1.,
+                            fill: [SPINNER[0], SPINNER[1], SPINNER[2], alpha],
+                            border: None,
+                        });
+                    }
                 }
                 if job.retry {
                     let button =
@@ -757,30 +806,7 @@ impl BarState {
                     let (cx, cy) = (button.cx, button.cy);
                     shapes.push(button);
                     self.retry_buttons.push((job.id, button));
-                    // A smooth, round-capped clockwise arrow. Keep its
-                    // arrowhead on the arc instead of drawing a detached hook.
-                    for i in 0..24 {
-                        let a = (-90. + i as f64 * 270. / 24.).to_radians();
-                        let b = (-90. + (i + 1) as f64 * 270. / 24.).to_radians();
-                        shapes.push(Shape::line(
-                            (cx + a.cos() * 5., cy + a.sin() * 5.),
-                            (cx + b.cos() * 5., cy + b.sin() * 5.),
-                            1.5,
-                            [0xff; 4],
-                        ));
-                    }
-                    shapes.push(Shape::line(
-                        (cx - 7., cy + 2.5),
-                        (cx - 5., cy),
-                        1.5,
-                        [0xff; 4],
-                    ));
-                    shapes.push(Shape::line(
-                        (cx - 5., cy),
-                        (cx - 3., cy + 2.5),
-                        1.5,
-                        [0xff; 4],
-                    ));
+                    retry_arrow(cx, cy, 5.0, 0.0, [0xff; 4], &mut shapes);
                 }
             }
         }
@@ -1023,6 +1049,43 @@ fn check_icon(cx: f64, cy: f64, size: f64, fill: [u8; 4], shapes: &mut Vec<Shape
     shapes.push(icon_line(cx, cy, size, 2.0, (9.0, 17.0), (4.0, 12.0), fill));
 }
 
+/// Round-capped clockwise retry arrow, shared with the local action button.
+fn retry_arrow(
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    rotation: f64,
+    fill: [u8; 4],
+    shapes: &mut Vec<Shape>,
+) {
+    let point = |x: f64, y: f64| {
+        let (sin, cos) = rotation.sin_cos();
+        (cx + x * cos - y * sin, cy + x * sin + y * cos)
+    };
+    for i in 0..24 {
+        let a = (-90. + i as f64 * 270. / 24.).to_radians();
+        let b = (-90. + (i + 1) as f64 * 270. / 24.).to_radians();
+        shapes.push(Shape::line(
+            point(a.cos() * radius, a.sin() * radius),
+            point(b.cos() * radius, b.sin() * radius),
+            1.5,
+            fill,
+        ));
+    }
+    shapes.push(Shape::line(
+        point(-radius - 2., 2.5),
+        point(-radius, 0.),
+        1.5,
+        fill,
+    ));
+    shapes.push(Shape::line(
+        point(-radius, 0.),
+        point(-radius + 2., 2.5),
+        1.5,
+        fill,
+    ));
+}
+
 /// Wispr's processing spinner: 8 bars of 2x5 px, 6 px from the centre.
 fn spinner(cx: f64, cy: f64, t: f64, command_mode: bool, shapes: &mut Vec<Shape>) {
     let [r, g, b] = if command_mode { COMMAND } else { SPINNER };
@@ -1062,42 +1125,252 @@ pub fn over(top: [u8; 4], bottom: [u8; 4]) -> [u8; 4] {
 
 #[cfg(test)]
 mod tests {
+    fn retry_test_icon() -> std::sync::Arc<crate::icon::Icon> {
+        std::sync::Arc::new(crate::icon::Icon::load("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='18' height='18'><rect width='18' height='18' rx='4' fill='%233b82f6'/><path d='M4 5h10v2h-4v7H8V7H4z' fill='white'/></svg>").unwrap())
+    }
+
     #[test]
-    fn retry_rows_show_countdown_attempt_and_completion_beside_the_local_button() {
-        use super::*;
-        let mut state = BarState::default();
+    fn retry_rows_keep_the_original_size_and_fit_text_icons_and_buttons() {
+        #[cfg(target_os = "linux")]
+        let fonts = std::env::var("WISPR_TEST_FONT_DIR")
+            .ok()
+            .map(|dir| crate::text::Fonts::load(&dir).unwrap());
+        let platform = |label: &str, size: f64, bold: bool| {
+            #[cfg(target_os = "linux")]
+            if let Some(fonts) = &fonts {
+                return fonts.width(label, size, bold);
+            }
+            let _ = bold;
+            label.chars().count() as f64 * size * 0.55
+        };
+        // A font much wider than Figtree also has to fit without row growth.
+        let wide = |label: &str, size: f64, _: bool| label.chars().count() as f64 * size;
         let now = Instant::now();
-        let statuses = [
-            (
-                RetryStatus::Waiting {
-                    attempt: 2,
-                    at: now + Duration::from_millis(1500),
-                },
-                "Retry 2 in 2s",
-            ),
-            (RetryStatus::Running { attempt: 2 }, "Retry 2"),
-            (RetryStatus::Finished { attempt: 2 }, "Retry 2 finished"),
-        ];
-        for (status, label) in statuses {
-            state.apply(PillCommand::Processing(vec![Processing {
-                id: 11,
+        for measure in [&platform as Measure, &wide as Measure] {
+            let mut cancelled = BarState::default();
+            cancelled.apply(PillCommand::Notify {
+                title: "Transcript cancelled".into(),
+                actions: vec!["Undo".into()],
+                timeout: Duration::ZERO,
                 local: false,
-                retry: true,
-                queued: false,
-                retry_status: Some(status),
-                icon: None,
-            }]));
-            let frame = state.frame(now, &|label, size, _| label.len() as f64 * size, None);
-            let text = frame.texts.iter().find(|text| text.text == label).unwrap();
-            let button = state.retry_buttons[0].1;
-            assert!(text.x + label.len() as f64 * text.size < button.cx - button.w / 2.);
-            assert_eq!(
-                state.click(button.cx, button.cy),
-                Some(BarEvent::LocalAlternative(11))
-            );
+            });
+            let cancel_size = cancelled.frame(now, measure, None).size;
+            for with_icon in [false, true] {
+                for with_button in [false, true] {
+                    let mut state = BarState::default();
+                    let mut job = Processing {
+                        id: 11,
+                        local: false,
+                        retry: with_button,
+                        queued: false,
+                        retry_status: None,
+                        icon: with_icon.then(retry_test_icon),
+                    };
+                    state.apply(PillCommand::Processing(vec![job.clone()]));
+                    let baseline = state.frame(now, measure, None).size;
+                    assert_eq!(
+                        baseline.0,
+                        98. + if with_icon { 26. } else { 0. } + if with_button { 30. } else { 0. }
+                    );
+                    for attempt in [1, 2, 99, u32::MAX] {
+                        for status in [
+                            RetryStatus::Waiting {
+                                attempt,
+                                at: now + Duration::from_secs(30),
+                            },
+                            RetryStatus::Waiting {
+                                attempt,
+                                at: now + Duration::from_secs(4),
+                            },
+                            RetryStatus::Waiting { attempt, at: now },
+                            RetryStatus::Running { attempt },
+                            RetryStatus::Finished { attempt },
+                        ] {
+                            let expected = status.label(now);
+                            assert!(!expected.contains("Retry") && !expected.contains("finished"));
+                            job.retry_status = Some(status);
+                            state.apply(PillCommand::Processing(vec![job.clone()]));
+                            let frame = state.frame(now, measure, None);
+                            assert_eq!(frame.size, baseline, "{expected}");
+                            let body = frame.shapes[0];
+                            assert!(body.w <= cancel_size.0 && body.h <= cancel_size.1);
+                            let text = frame
+                                .texts
+                                .iter()
+                                .find(|text| text.text == expected)
+                                .unwrap();
+                            let inset = if with_icon { 26. } else { 0. };
+                            let right = if with_button {
+                                state.retry_buttons[0].1.cx - 11.
+                            } else {
+                                body.w - 10.
+                            };
+                            for scale in [1., 1.25, 1.5, 2., 3.] {
+                                assert!(
+                                    (text.x + measure(&text.text, text.size, text.bold) + 2.)
+                                        * scale
+                                        <= right * scale
+                                );
+                                assert!(text.x >= inset + 10.);
+                                assert!(text.top >= 6. && text.top + text.line <= body.h - 6.);
+                                #[cfg(target_os = "linux")]
+                                if let Some(fonts) = &fonts {
+                                    let (width, _, _) = fonts.render(text, scale);
+                                    assert!(text.x * scale + f64::from(width) <= right * scale);
+                                }
+                            }
+                            for shape in frame.shapes.iter().skip(1) {
+                                let (sin, cos) = shape.angle.sin_cos();
+                                let hw = (shape.w * cos.abs() + shape.h * sin.abs()) / 2.;
+                                let hh = (shape.w * sin.abs() + shape.h * cos.abs()) / 2.;
+                                assert!(shape.cx - hw >= 0. && shape.cx + hw <= body.w);
+                                assert!(shape.cy - hh >= 0. && shape.cy + hh <= body.h);
+                            }
+                            if with_button {
+                                let button = state.retry_buttons[0].1;
+                                assert_eq!(
+                                    state.click(button.cx, button.cy),
+                                    Some(BarEvent::LocalAlternative(11))
+                                );
+                            }
+                        }
+                    }
+                    state.apply(PillCommand::Processing(vec![]));
+                    assert!(state.frame(now, measure, None).texts.is_empty());
+                }
+            }
         }
-        state.apply(PillCommand::Processing(vec![]));
-        assert!(state.frame(now, &|_, _, _| 0., None).texts.is_empty());
+    }
+
+    // This executes only in a private Xvfb inside the KDE VM. It renders the
+    // production X11 pill with real Figtree text, rather than an HTML mockup.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "native screenshots run separately on private Xvfb in the VM"]
+    fn native_retry_layout_screenshots() {
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{AtomEnum, PropMode};
+        use x11rb::wrapper::ConnectionExt;
+        let scale: u32 = std::env::var("WISPR_TEST_SCALE").unwrap().parse().unwrap();
+        let output = std::path::PathBuf::from(std::env::var("WISPR_TEST_SCREENSHOTS").unwrap());
+        std::fs::create_dir_all(&output).unwrap();
+        let fonts = std::env::var("WISPR_TEST_FONT_DIR").unwrap();
+        let (conn, screen) = x11rb::connect(None).unwrap();
+        let root = conn.setup().roots[screen].root;
+        conn.change_property8(
+            PropMode::REPLACE,
+            root,
+            AtomEnum::RESOURCE_MANAGER,
+            AtomEnum::STRING,
+            format!("Xft.dpi: {}\n", 96 * scale).as_bytes(),
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        assert!(std::process::Command::new("xsetroot")
+            .args(["-solid", "#18202b"])
+            .status()
+            .unwrap()
+            .success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pill = std::thread::spawn(move || {
+            crate::pill_x11::run(rx, Some(&fonts), |error| panic!("{error}"), |_| {})
+        });
+        let capture = |name: &str| {
+            std::thread::sleep(Duration::from_millis(150));
+            assert!(std::process::Command::new("import")
+                .args(["-window", "root"])
+                .arg(output.join(format!("{name}-{scale}x.png")))
+                .status()
+                .unwrap()
+                .success());
+        };
+        tx.send(PillCommand::Fills {
+            wispr: [0xc8, 0x14, 0x14],
+            local: LOCAL_FILL,
+        })
+        .unwrap();
+        tx.send(PillCommand::Notify {
+            title: "Transcript cancelled".into(),
+            actions: vec!["Undo".into()],
+            timeout: Duration::ZERO,
+            local: false,
+        })
+        .unwrap();
+        capture("cancel");
+        tx.send(PillCommand::NotifyClear).unwrap();
+        let job = |id, retry_status, icon, retry| Processing {
+            id,
+            local: false,
+            queued: false,
+            retry_status,
+            icon,
+            retry,
+        };
+        tx.send(PillCommand::Processing(vec![job(
+            11,
+            None,
+            Some(retry_test_icon()),
+            true,
+        )]))
+        .unwrap();
+        capture("baseline");
+        tx.send(PillCommand::Processing(vec![job(
+            11,
+            Some(RetryStatus::Waiting {
+                attempt: 2,
+                at: Instant::now() + Duration::from_secs(4),
+            }),
+            Some(retry_test_icon()),
+            true,
+        )]))
+        .unwrap();
+        capture("waiting");
+        tx.send(PillCommand::Processing(vec![job(
+            11,
+            Some(RetryStatus::Waiting {
+                attempt: u32::MAX,
+                at: Instant::now() + Duration::from_secs(30),
+            }),
+            Some(retry_test_icon()),
+            true,
+        )]))
+        .unwrap();
+        capture("waiting-limit");
+        tx.send(PillCommand::Processing(vec![job(
+            11,
+            Some(RetryStatus::Running { attempt: 2 }),
+            Some(retry_test_icon()),
+            true,
+        )]))
+        .unwrap();
+        capture("running");
+        capture("running-next-frame");
+        tx.send(PillCommand::Processing(vec![job(
+            11,
+            Some(RetryStatus::Finished { attempt: 2 }),
+            Some(retry_test_icon()),
+            true,
+        )]))
+        .unwrap();
+        capture("finished");
+        tx.send(PillCommand::Processing(vec![
+            job(
+                11,
+                Some(RetryStatus::Waiting {
+                    attempt: 2,
+                    at: Instant::now() + Duration::from_secs(4),
+                }),
+                Some(retry_test_icon()),
+                true,
+            ),
+            job(12, Some(RetryStatus::Running { attempt: 2 }), None, true),
+            job(13, Some(RetryStatus::Finished { attempt: 2 }), None, false),
+        ]))
+        .unwrap();
+        tx.send(PillCommand::Status("listening".into())).unwrap();
+        capture("stack");
+        drop(tx);
+        pill.join().unwrap();
     }
 
     #[test]
