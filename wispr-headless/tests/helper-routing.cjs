@@ -22,7 +22,11 @@ const tick = () => new Promise((resolve) => setImmediate(resolve));
 
 test("Wispr's retry notice is handled automatically while queued recording stays independent", async () => {
   const sent = [], retried = [];
-  const retry = testing.createCloudRetry((message) => sent.push(message), (notice) => retried.push(notice), 20);
+  let finish;
+  const retry = testing.createCloudRetry((message) => sent.push(message), (notice) => {
+    retried.push(notice);
+    return new Promise((resolve) => { finish = resolve; });
+  }, 20);
   assert.equal(retry.notice({ type: "TranscriptionError" }), false);
   retry.start(1);
   retry.recording();
@@ -32,20 +36,31 @@ test("Wispr's retry notice is handled automatically while queued recording stays
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(retried.length, 1, "status and notification schedule one retry");
   assert.equal(retried[0], notice);
-  assert.equal(sent[0].value, "retrying");
+  assert.equal(sent[0].value, "retryWaiting");
+  assert.equal(sent[0].attempt, 1);
+  assert.equal(sent[0].retryAfterMs, 20);
+  assert.equal(sent.at(-1).value, "retrying");
   retry.status("retrying");
   retry.status("idle");
+  assert.equal(retry.active, 1, "idle before the async paste finishes cannot release queued audio");
+  finish({ status: "formatted", text: "retry result" });
+  await tick();
   assert.equal(sent.at(-1).value, "idle");
+  assert.equal(sent.at(-1).attempt, 1);
   retry.start(2); retry.notice(notice); retry.close();
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(retried.length, 1, "closing cancels automatic retries");
 });
 
-test("a silent Retry failure tries again, and processing or a new job cancels the old timer", async () => {
+test("silent Retry failures repeat, stale processing does not stop Retry, and a new job cancels the timer", async () => {
   const retried = [];
+  let finish;
   const retry = testing.createCloudRetry(() => {}, () => {
     retried.push(retry.active);
-    if (retried.length === 2) retry.status("processing");
+    if (retried.length === 2) return new Promise((resolve) => { finish = resolve; });
+    retry.status("processing");
+    retry.status("idle");
+    return { status: "error", text: "" };
   }, 2);
   retry.start(1);
   retry.status("error");
@@ -53,8 +68,46 @@ test("a silent Retry failure tries again, and processing or a new job cancels th
   assert.deepEqual(retried, [1, 1]);
   retry.status("error");
   retry.start(2);
+  finish({ status: "formatted", text: "late old result" });
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.deepEqual(retried, [1, 1]);
+  retry.close();
+});
+
+test("Retry exceptions recover and successful empty results settle while submit-only intent remains valid", async () => {
+  for (const submit of [false, true]) {
+    const sent = [];
+    let attempts = 0;
+    const retry = testing.createCloudRetry((event) => sent.push(event), async () => {
+      if (++attempts === 1) throw new Error("transient failure");
+      return { status: "formatted", text: "", submit };
+    }, 2);
+    retry.start(1); retry.recording(); retry.status("error");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(attempts, 2);
+    assert.equal(retry.active, null);
+    assert.equal(sent.at(-1).value, submit ? "idle" : "empty");
+    assert.deepEqual(sent.filter((event) => event.value === "retrying").map((event) => event.attempt), [1, 2]);
+    retry.close();
+  }
+});
+
+test("a pending Retry survives late idle and processing statuses and cancellation ignores its late result", async () => {
+  let attempts = 0, finish;
+  const sent = [];
+  const retry = testing.createCloudRetry((event) => sent.push(event), () => {
+    attempts++;
+    return new Promise((resolve) => { finish = resolve; });
+  }, 5);
+  retry.start(1); retry.recording(); retry.status("error");
+  retry.status("processing"); retry.status("idle");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(attempts, 1);
+  retry.status("dismissed");
+  finish({ status: "formatted", text: "cancelled" });
+  await tick();
+  assert.equal(retry.active, null);
+  assert.equal(sent.at(-1).value, "dismissed");
   retry.close();
 });
 
@@ -107,6 +160,35 @@ test("Wispr's empty-transcription notice is terminal and never schedules Retry",
 });
 
 for (const bundle of (process.env.WISPR_TEST_BUNDLES ?? "").split(":").filter(Boolean)) {
+  test(`the shipped Retry button waits for its paste and reports the outcome: ${bundle}`, async () => {
+    const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
+    const handler = /globalThis\.wisprHeadlessRetryLastText=(async\(\)=>\{.*?)(?=,\[[\w$]+\.[\w$]+\.RetryLastTextInHistory\])/.exec(patched);
+    assert.ok(handler, "the actual Retry handler is exposed as an awaitable function");
+    const history = /const\[[\w$]+,[\w$]+\]=await\(0,([\w$]+)\.([\w$]+)\)\(\)/.exec(handler[1]);
+    const paste = /;await\(0,([\w$]+)\.([\w$]+)\)\(/.exec(handler[1]);
+    assert.ok(history); assert.ok(paste);
+    let pasted = false, settled = false, finishPaste;
+    const env = {
+      [history[1]]: { [history[2]]: async () => ["formatted", "retry transcript"] },
+      [paste[1]]: { [paste[2]]: async (status, text) => {
+        assert.equal(status, "formatted"); assert.equal(text, "retry transcript");
+        pasted = true;
+        await new Promise((resolve) => { finishPaste = resolve; });
+      } },
+      wisprHeadlessSubmitIntent: () => true,
+    };
+    const retry = vm.runInNewContext(`(${handler[1]})`, env);
+    const result = retry().then((result) => { settled = true; return result; });
+    await tick();
+    assert.equal(pasted, true);
+    assert.equal(settled, false, "queued audio must wait for the final paste");
+    finishPaste();
+    assert.deepEqual(JSON.parse(JSON.stringify(await result)), { status: "formatted", text: "retry transcript", submit: true });
+    const intent = /globalThis\.wisprHeadlessSubmitIntent=\(\)=>!!([\w$]+)\.ZZ\.shouldPressEnterAfterPaste/.exec(patched);
+    assert.ok(intent, "submit intent is read in the paste module's own scope");
+    assert.equal(vm.runInNewContext(intent[0], { [intent[1]]: { ZZ: { shouldPressEnterAfterPaste: true } } })(), true);
+  });
+
   test(`the shipped bundle retains correlation and spoken Enter on both insertion paths: ${bundle}`, () => {
     const patched = testing.patchWisprBundle(fs.readFileSync(bundle, "utf8"));
     new vm.Script(patched);

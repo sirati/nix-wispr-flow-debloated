@@ -221,13 +221,26 @@ app.whenReady().then(async () => {
     check(cancelled === "user_action_cancel_button", "the green icon does not cancel Wispr");
   }
   callback = null;
+  let finishRetry;
+  globalThis.wisprHeadlessRetryLastText = async () => {
+    callback = { type: "TranscriptionError", callback: "retry_last_text" };
+    status.webContents.send("status:dictationStatus", "retrying");
+    // The real bundle emits idle before its final history write and paste.
+    status.webContents.send("status:dictationStatus", "idle");
+    return new Promise((resolve) => { finishRetry = resolve; });
+  };
   status.webContents.send("status:dictationStatus", "error");
   status.webContents.send("notification:show", { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] });
   await until("automatic retry", () => callback?.type === "TranscriptionError", 3000);
   check(callback?.callback === "retry_last_text", "Wispr's error automatically invokes its real Retry action");
   check(renderers() === 0, "queued processing and Retry keep Chromium unloaded");
+  const startsBeforeRetryFinished = daemonEvents.filter((event) => event.op === "cloudStart").length;
   status.webContents.send("status:dictationStatus", "processing");
   status.webContents.send("status:dictationStatus", "idle");
+  await wait(150);
+  check(daemonEvents.filter((event) => event.op === "cloudStart").length === startsBeforeRetryFinished,
+    "idle during the async Retry does not start queued audio early");
+  finishRetry({ status: "formatted", text: "retry transcript" });
   await until("second queued job", () => daemonEvents.filter((event) => event.op === "cloudStart").length >= 3);
   hub.webContents.send("dictation:audioStart", { transcriptionEntityUuid: "stack-2" });
   await until("second replay started", () => started?.transcriptionEntityUuid === "stack-2");
@@ -238,7 +251,7 @@ app.whenReady().then(async () => {
 
   if (xdotool) {
     const before = daemonEvents.length;
-    execSync(`${xdotool} mousemove 688 721 click 1`);
+    execSync(`${xdotool} mousemove 716 721 click 1`);
     const retained = await until("local alternative after idle", () => daemonEvents.slice(before).some((event) => event.op === "log" && event.msg.includes("local alternative failed")));
     check(retained, "an undelivered dictation keeps its processing bubble and local action after Wispr goes idle");
   }

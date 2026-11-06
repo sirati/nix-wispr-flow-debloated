@@ -242,11 +242,32 @@ pub enum PillCommand {
 }
 
 #[derive(Clone)]
+pub enum RetryStatus {
+    Waiting { attempt: u32, at: Instant },
+    Running { attempt: u32 },
+    Finished { attempt: u32 },
+}
+
+impl RetryStatus {
+    fn label(&self, now: Instant) -> String {
+        match self {
+            Self::Waiting { attempt, at } => {
+                let seconds = at.saturating_duration_since(now).as_millis().div_ceil(1000);
+                format!("Retry {attempt} in {seconds}s")
+            }
+            Self::Running { attempt } => format!("Retry {attempt}"),
+            Self::Finished { attempt } => format!("Retry {attempt} finished"),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Processing {
     pub id: u64,
     pub local: bool,
     pub retry: bool,
     pub queued: bool,
+    pub retry_status: Option<RetryStatus>,
     pub icon: Option<std::sync::Arc<crate::icon::Icon>>,
 }
 
@@ -640,7 +661,14 @@ impl BarState {
         let mut icons = Vec::new();
         let base_size = size;
         let row_width = |job: &Processing| {
-            98.0 + if job.icon.is_some() { 26.0 } else { 0.0 } + if job.retry { 30.0 } else { 0.0 }
+            let content = job.retry_status.as_ref().map_or(98.0, |status| {
+                let label = status.label(now);
+                let text_width = measure(&label, 12.0, false).max(label.len() as f64 * 6.6);
+                (text_width + 48.0).max(98.0)
+            });
+            content
+                + if job.icon.is_some() { 26.0 } else { 0.0 }
+                + if job.retry { 30.0 } else { 0.0 }
         };
         let width = self.processing.iter().map(row_width).fold(size.0, f64::max);
         let extra = if self.enabled {
@@ -692,7 +720,7 @@ impl BarState {
                 } else {
                     0.
                 };
-                let spinner_x = x + inset + 45.;
+                let spinner_x = x + inset + if job.retry_status.is_some() { 19. } else { 45. };
                 for i in 0..8 {
                     let angle = i as f64 * std::f64::consts::PI / 4.;
                     let alpha = if job.queued {
@@ -709,6 +737,18 @@ impl BarState {
                         radius: 1.,
                         fill: [SPINNER[0], SPINNER[1], SPINNER[2], alpha],
                         border: None,
+                    });
+                }
+                if let Some(status) = &job.retry_status {
+                    texts.push(Text {
+                        x: x + inset + 34.,
+                        top: y + 6.,
+                        line: 18.,
+                        size: 12.,
+                        bold: false,
+                        color: TEXT,
+                        bg: [color[0], color[1], color[2], 0xff],
+                        text: status.label(now),
                     });
                 }
                 if job.retry {
@@ -1023,6 +1063,44 @@ pub fn over(top: [u8; 4], bottom: [u8; 4]) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn retry_rows_show_countdown_attempt_and_completion_beside_the_local_button() {
+        use super::*;
+        let mut state = BarState::default();
+        let now = Instant::now();
+        let statuses = [
+            (
+                RetryStatus::Waiting {
+                    attempt: 2,
+                    at: now + Duration::from_millis(1500),
+                },
+                "Retry 2 in 2s",
+            ),
+            (RetryStatus::Running { attempt: 2 }, "Retry 2"),
+            (RetryStatus::Finished { attempt: 2 }, "Retry 2 finished"),
+        ];
+        for (status, label) in statuses {
+            state.apply(PillCommand::Processing(vec![Processing {
+                id: 11,
+                local: false,
+                retry: true,
+                queued: false,
+                retry_status: Some(status),
+                icon: None,
+            }]));
+            let frame = state.frame(now, &|label, size, _| label.len() as f64 * size, None);
+            let text = frame.texts.iter().find(|text| text.text == label).unwrap();
+            let button = state.retry_buttons[0].1;
+            assert!(text.x + label.len() as f64 * text.size < button.cx - button.w / 2.);
+            assert_eq!(
+                state.click(button.cx, button.cy),
+                Some(BarEvent::LocalAlternative(11))
+            );
+        }
+        state.apply(PillCommand::Processing(vec![]));
+        assert!(state.frame(now, &|_, _, _| 0., None).texts.is_empty());
+    }
+
+    #[test]
     fn processing_stacks_above_recording_and_green_buttons_keep_their_job() {
         use super::*;
         let mut state = BarState::default();
@@ -1033,6 +1111,7 @@ mod tests {
                 local: false,
                 retry: true,
                 queued: false,
+                retry_status: None,
                 icon: None,
             },
             Processing {
@@ -1040,6 +1119,7 @@ mod tests {
                 local: false,
                 retry: false,
                 queued: true,
+                retry_status: None,
                 icon: None,
             },
             Processing {
@@ -1047,6 +1127,7 @@ mod tests {
                 local: true,
                 retry: false,
                 queued: false,
+                retry_status: None,
                 icon: None,
             },
         ]));

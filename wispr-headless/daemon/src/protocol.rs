@@ -18,6 +18,10 @@ pub enum Command {
         value: String,
         #[serde(default)]
         id: Option<u64>,
+        #[serde(default)]
+        attempt: u32,
+        #[serde(default, rename = "retryAfterMs")]
+        retry_after_ms: u64,
     },
     /// Wispr completed without text and therefore made no paste request.
     CloudEmpty {
@@ -310,6 +314,19 @@ mod tests {
 
     #[test]
     fn commands_parse() {
+        assert_eq!(
+            parse(r#"{"op":"cloudState","value":"retryWaiting","id":12,"attempt":2,"retryAfterMs":4000}"#).unwrap(),
+            Command::CloudState { value: "retryWaiting".into(), id: Some(12), attempt: 2, retry_after_ms: 4000 }
+        );
+        assert_eq!(
+            parse(r#"{"op":"cloudState","value":"idle"}"#).unwrap(),
+            Command::CloudState {
+                value: "idle".into(),
+                id: None,
+                attempt: 0,
+                retry_after_ms: 0
+            }
+        );
         assert_eq!(
             parse(r#"{"op":"start","uuid":"u1"}"#).unwrap(),
             Command::Start { uuid: "u1".into() }

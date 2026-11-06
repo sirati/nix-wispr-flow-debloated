@@ -298,59 +298,80 @@ function createPasteRouter(send, alive, timeout = 65_000) {
 }
 
 function createCloudRetry(send, callback, delay = 1000) {
-  let active = null, timer = null, attempt = 0, notification = null, retrying = false, started = false, empty = false;
+  let active = null, timer = null, attempt = 0, notification = null;
+  let retrying = false, running = false, started = false, empty = false, generation = 0;
   const clear = () => { if (timer) clearTimeout(timer); timer = null; };
+  const state = (value, extra = {}) => send({ op: "cloudState", value, id: active, attempt, ...extra });
   const release = (value) => {
-    const id = active; clear(); active = null; retrying = false;
-    send({ op: "cloudState", value, id });
+    state(value);
+    clear(); active = null; retrying = false; running = false; generation++;
   };
   const retry = () => {
-    if (active === null || timer || empty) return;
+    if (active === null || timer || running || empty) return;
     retrying = true;
-    send({ op: "cloudState", value: "retrying", id: active });
-    timer = setTimeout(() => {
+    const retryAfterMs = Math.min(30000, delay * 2 ** Math.min(attempt, 5));
+    state("retryWaiting", { attempt: attempt + 1, retryAfterMs });
+    timer = setTimeout(async () => {
       timer = null;
+      const current = generation;
       if (active === null) return;
-      const payload = notification ?? { type: "TranscriptionError", actions: [{ callback: "retry_last_text" }] };
-      callback(payload);
-      // Wispr may swallow a failed retry without another status event.
-      if (retrying) retry();
-    }, Math.min(30000, delay * 2 ** Math.min(attempt++, 5)));
+      const id = active;
+      running = true;
+      const number = ++attempt;
+      state("retrying");
+      let result;
+      try {
+        result = await callback(notification ?? { type: "TranscriptionError" });
+      } catch (error) {
+        trace({ ev: "cloud.retryFailed", id, attempt: number, error: String(error).slice(0, 200) });
+      }
+      if (current !== generation || active === null) return;
+      running = false;
+      // Wispr sends idle before persisting history and pasting the retry's
+      // result. Keep its processing slot until that whole callback settles.
+      // A swallowed error or refused retry must schedule another attempt.
+      if (result && ["empty", "raw_transcript", "formatted", "fallback"].includes(result.status)) {
+        release(!String(result.text ?? "").trim() && !result.submit ? "empty" : "idle");
+      } else if (empty) release("empty");
+      else retry();
+    }, retryAfterMs);
   };
   return {
     get active() { return active; },
-    start(id) { clear(); active = id; attempt = 0; notification = null; retrying = false; started = false; empty = false; },
+    start(id) { clear(); generation++; active = id; attempt = 0; notification = null; retrying = false; running = false; started = false; empty = false; },
     recording() { started = true; },
     noSpeech(id) {
       if (active !== id) return;
       empty = true;
       clear();
-      // An error already ended Wispr's attempt. Otherwise let its current
-      // processing finish, without starting another retry afterwards.
-      if (retrying) release("empty");
+      // Let a cloud attempt already processing return words if it can.
+      if (retrying && !running) release("empty");
     },
     status(value) {
       if (active === null) return;
+      if (value === "dismissed") { if (started) release(value); return; }
+      if (running) return;
       if (value === "error") { if (empty) release("empty"); else retry(); }
-      else if (["initializing", "listening", "stopping", "processing", "retrying"].includes(value)) { retrying = false; clear(); }
-      else if (value === "idle" || value === "dismissed") {
-        // A duplicate terminal status from the preceding job can arrive
-        // after the next start was requested but before its audioStart.
-        if (!started) return;
-        release(value);
-      }
+      else if (["initializing", "listening", "stopping", "processing", "retrying"].includes(value)) {
+        // Duplicate processing IPC from the failed attempt must not cancel
+        // its scheduled Retry. Only the callback can confirm a new attempt.
+        if (!retrying) clear();
+      } else if (value === "idle" && started && !retrying) release(value);
     },
     notice(payload) {
       if (active !== null && started && payload?.type === "TranscriptionEmpty") { release("empty"); return true; }
       if (active === null || !["TranscriptionError", "NoInternet", "TranscriptCurrentlyProcessing", "ProcessingDelayNotification"].includes(payload?.type)) return false;
       if (empty) {
-        if (payload.type === "TranscriptionError" || payload.type === "NoInternet") release("empty");
+        if (!running && (payload.type === "TranscriptionError" || payload.type === "NoInternet")) release("empty");
         return true;
       }
-      if (payload.type === "TranscriptionError" || payload.type === "NoInternet") { notification = payload.type === "TranscriptionError" ? payload : null; retry(); }
+      if (payload.type === "TranscriptionError" || payload.type === "NoInternet") {
+        notification = payload;
+        retry();
+      }
       return true;
     },
-    close() { clear(); active = null; retrying = false; },
+    close() { clear(); generation++; active = null; retrying = false; running = false; },
   };
 }
 
@@ -427,6 +448,19 @@ function patchWisprBundle(source) {
   // Wispr validates logAttributes as a string-to-string map before writing
   // to the helper. A boolean here rejects the entire paste request.
   source = source.replace(correlation, `${uuid}?{transcriptEntityUuid:${uuid},dictationSubmit:String(!!${submit})}:"dictation"===${owner}.kind?{transcriptEntityUuid:${owner}.transcriptEntityUUID,dictationSubmit:String(!!${submit})}:void 0`);
+  const pasteModuleStart = source.search(/\w+=\(\w+,\w+,\w+,\w+\)=>\{\w+\.RA\.lastTranscriptionStatus=\w+/);
+  const pasteModuleEnd = /\},\d+\(e,t,n\)\{/.exec(source.slice(pasteModuleStart));
+  if (!pasteModuleEnd) throw new Error("unsupported Wispr paste module boundary");
+  const pasteEnd = pasteModuleStart + pasteModuleEnd.index;
+  source = source.slice(0, pasteEnd) + `;globalThis.wisprHeadlessSubmitIntent=()=>!!${submit};` + source.slice(pasteEnd);
+  // Use the real Retry button handler, but retain its promise and outcome.
+  // Its IPC listener discards that promise, and Wispr emits idle before its
+  // async history write/paste is done. Starting queued audio there steals
+  // the shared UUID and can lose the previous dictation's result.
+  const retryHandler = /(\[[\w$]+\.[\w$]+\.RetryLastText\]:)(async\(\)=>\{try\{const\[([\w$]+),([\w$]+)\]=await\(0,[\w$]+\.[\w$]+\)\(\);)await(\(0,[\w$]+\.[\w$]+\)\(\3,\4\))/g;
+  if ([...source.matchAll(retryHandler)].length !== 1) throw new Error("unsupported Wispr Retry handler");
+  source = source.replace(retryHandler, (_, key, body, status, text, paste) =>
+    `${key}globalThis.wisprHeadlessRetryLastText=${body}const __wisprRetrySubmit=!!globalThis.wisprHeadlessSubmitIntent?.();await${paste};return{status:${status},text:${text},submit:__wisprRetrySubmit}`);
   const helper = module("getTextBoxInfo");
   source = source.slice(0, helper.end) + `;globalThis.wisprHeadlessTextBoxInfo=${helper.name};` + source.slice(helper.end);
   return source;
@@ -701,13 +735,15 @@ function build(electron) {
 
   const brokerPastes = createPasteRouter((message) => daemon.send(message), () => Boolean(daemon?.alive));
   const cloudRetry = createCloudRetry((message) => {
-    trace({ ev: "cloud.state", value: message.value, id: message.id });
+    trace({ ev: "cloud.state", value: message.value, id: message.id, attempt: message.attempt, retryAfterMs: message.retryAfterMs });
     daemon?.send(message);
-  }, (payload) => {
-    const action = payload.actions?.find((action) => action.callback === "retry_last_text");
+  }, async (payload) => {
+    if (typeof globalThis.wisprHeadlessRetryLastText !== "function") throw new Error("Wispr Retry handler is unavailable");
     trace({ ev: "cloud.autoRetry" });
-    emitFrom(byRole.get("status"), "notification:callback", { callback: action?.callback ?? "retry_last_text", type: payload.type, callbackOperationId: payload.callbackOperationId });
+    const result = await globalThis.wisprHeadlessRetryLastText();
+    trace({ ev: "cloud.retryFinished", status: result?.status ?? "failed" });
     emitFrom(byRole.get("status"), "notification:clear", { type: payload.type, reason: "action" });
+    return result;
   });
   globalThis.wisprHeadlessEmpty = (uuid) => {
     if (typeof uuid === "string") {

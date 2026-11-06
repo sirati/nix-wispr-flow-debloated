@@ -1359,9 +1359,25 @@ fn serve(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(Some(Command::CloudState { value, id })) => {
+            Ok(Some(Command::CloudState {
+                value,
+                id,
+                attempt,
+                retry_after_ms,
+            })) => {
                 if id.is_some() && cloud.active != id {
                     continue;
+                }
+                if let Some(job) = cloud.active.and_then(|id| cloud.jobs.get_mut(&id)) {
+                    job.retry_status = match value.as_str() {
+                        "retryWaiting" => Some(bar::RetryStatus::Waiting {
+                            attempt,
+                            at: Instant::now() + Duration::from_millis(retry_after_ms.min(30000)),
+                        }),
+                        "retrying" => Some(bar::RetryStatus::Running { attempt }),
+                        "idle" if attempt > 0 => Some(bar::RetryStatus::Finished { attempt }),
+                        _ => job.retry_status.take(),
+                    };
                 }
                 if matches!(value.as_str(), "idle" | "dismissed" | "empty") {
                     upstream_busy = false;
@@ -1391,10 +1407,6 @@ fn serve(
                         }
                     }
                     cloud.available();
-                } else if matches!(value.as_str(), "error" | "retrying") {
-                    if let Some(job) = cloud.active.and_then(|id| cloud.jobs.get_mut(&id)) {
-                        job.retrying = true;
-                    }
                 }
             }
             Ok(Some(Command::LocalAlternative { id })) => {
@@ -1560,6 +1572,7 @@ fn serve(
                 local: true,
                 retry: false,
                 queued: false,
+                retry_status: None,
                 icon: icon.clone(),
             })
             .collect();
@@ -1582,6 +1595,7 @@ fn serve(
                         && !job.local_empty
                         && !job.cloud_empty,
                     queued: !job.cloud_done && cloud.active != Some(id) && !job.local_running,
+                    retry_status: job.retry_status.clone(),
                     icon: job.icon.clone(),
                 }),
         );

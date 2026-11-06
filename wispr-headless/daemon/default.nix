@@ -27,11 +27,10 @@ rustPlatform.buildRustPackage {
     "dictation-api-0.1.0" = "sha256-+UR44Ui6v8jO2HQPnOsqb8TOzbPxrJQVgwrFYhqjKLM=";
   };
 
-  # The unit tests and the binary's own tests (a stand-in microphone) run
-  # here; the indicator is skipped without a display. Typing through XTEST
-  # runs against Xvfb, and the D-Bus client against a private dbus-daemon.
-  # The macOS build is cross-compiled on Linux by the caller (see
-  # lib.macWisprFlow); its tests run on the Mac instead.
+  # Compile here; execute tests only in tests/kde-vm/run-queue.sh. Package
+  # builds must not use the developer's live desktop as a test environment.
+  # macOS packages are cross-built on Linux too.
+  doCheck = false;
   nativeCheckInputs = lib.optionals stdenv.hostPlatform.isLinux [
     xvfb
     setxkbmap
